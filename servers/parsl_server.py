@@ -28,7 +28,7 @@ import uuid
 import time
 import tempfile
 from typing import Optional
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # parsl is optional. if installed, tasks route through a real Parsl DataFlowKernel
 # (@python_app). if not, falls back to direct subprocess, same results either way

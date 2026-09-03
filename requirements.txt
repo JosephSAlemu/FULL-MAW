@@ -10,4 +10,4 @@ pypdf>=4.0.0
 pydantic>=2.0.0
 rich>=13.0.0
 ipython>=9.14.0
-mcp>=1.0.0
+fastmcp>=3.4.4
