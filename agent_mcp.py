@@ -16,11 +16,16 @@ Usage:
 (labels the planner inputs actually used this run; see run_archiver.py)
 """
 
+from common.consts import LITERATURE_PATH, SKILLS_PATH, DATA_PATH, RUN_PATH
+from systemprompts.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_SYSTEM_PROMPT_NO_SKILLS
+from systemprompts.planner import PLANNER_PROMPT, PLANNER_PROMPT_NO_SKILLS
+from common.exceptions import exception_message
 import os
 import base64
 import json
 import mimetypes
 import operator
+import argparse
 import re
 import subprocess
 import time
@@ -30,6 +35,7 @@ from typing import Annotated, Literal, Sequence
 from typing_extensions import TypedDict
 from pydantic import BaseModel
 from pypdf import PdfReader
+from pathlib import Path
 warnings.filterwarnings("ignore", module="pypdf")
 from dotenv import load_dotenv
 from rich.console import Console
@@ -98,145 +104,6 @@ class PlannerOutput(BaseModel):
 
 class InstallerOutput(BaseModel):
     requirements_content: str
-
-
-# __ Agent Prompts _____________________________________________________________
-
-ORCHESTRATOR_SYSTEM_PROMPT = """\
-Your agent skill file contains your full operating instructions. Follow them.
-
-Return ONLY a valid JSON object with exactly these keys:
-- reasoning:           str -- your analysis of the current state
-- next:                "planner" | "installer" | "explorer" | "end"
-- feedback:            str -- specific actionable feedback for the receiving agent, or "" if proceeding normally
-- requirements_approved: bool -- true ONLY when approving pending requirements.txt, false in all other cases
-- skill_requests:      list[str] -- skill paths to load (first call only; empty on subsequent calls)
-\
-"""
-
-# condition A prompt, written separate from the skill files on purpose.
-# just roles/tools/task info, no strategy tips baked in like B and C get.
-# keeping it its own thing instead of folding into the shared prompts
-ORCHESTRATOR_SYSTEM_PROMPT_NO_SKILLS = """\
-You are the supervisor orchestrator for a scientific workflow reproduction system. You coordinate
-specialized agents to reproduce a computational workflow from a research paper in a local venv
-environment. After each agent completes, you review its output and decide where to route next.
-
-This is the MCP (tool-calling) approach: instead of generating a complete workflow script, the
-explorer agent executes each task interactively via tool calls against a workflow-engine MCP server.
-
-## Agents Available
-
-| Agent | What it does |
-|---|---|
-| `planner` | Reads the PDF, extracts literature findings, dependency stack, and ordered tasks |
-| `installer` | Sets up the local venv (two-phase: requirements.txt -> pip install) |
-| `explorer` | Executes workflow tasks step by step using tool calls in the local venv |
-| `end` | Signals successful completion |
-
-General flow: planner -> installer -> explorer -> end.
-
-## Two-Phase Installer Protocol
-
-The installer runs in two phases requiring your explicit sign-off:
-- Phase 1: it generates requirements.txt and stops; `current_step` becomes
-  `"installer_requirements_pending_approval"`.
-- Phase 2: it runs `pip install`, but only once you set `requirements_approved=true`.
-
-When `current_step == "installer_requirements_pending_approval"`, decide `requirements_approved`
-by reviewing the `requirements_content` in the state below. In every other situation,
-`requirements_approved` must be `false`.
-
-## State Fields Available to You
-
-| Field | Source | Notes |
-|---|---|---|
-| `goal` | initial | The user's goal |
-| `current_step` | updated each node | What just completed |
-| `literature_findings` | planner | Key findings from the paper |
-| `stack_decision` | planner | Required packages |
-| `tasks` | planner | Ordered implementation steps |
-| `requirements_content` | installer phase 1 | requirements.txt content -- review before approving |
-| `exploration_log` | explorer | Tool call records (accumulated list of dicts) |
-| `planner_revisions` / `installer_revisions` / `explorer_revisions` | orchestrator | Retry counts |
-
-Return ONLY a valid JSON object with exactly these keys:
-- reasoning:           str -- your analysis of the current state
-- next:                "planner" | "installer" | "explorer" | "end"
-- feedback:            str -- specific actionable feedback for the receiving agent, or "" if proceeding normally
-- requirements_approved: bool -- true ONLY when approving pending requirements.txt, false in all other cases
-- skill_requests:      list[str] -- always leave this empty; no skill content is available in this run
-\
-"""
-
-PLANNER_PROMPT = """\
-Your agent skill file contains your full operating instructions. Follow them.
-
-Return ONLY a valid JSON object with exactly these keys:
-- literature_findings: list[str] -- specific, quantitative facts extracted from the paper
-- stack_decision:      list[str] -- packages to install into the local venv
-- tasks:               list[str] -- ordered, Python-API-level implementation steps
-- skill_requests:      list[str] -- skill paths to load (first call only; empty on subsequent calls)
-
-No markdown, no code fences, no explanation outside the JSON.
-
-IMPORTANT CONSTRAINTS ON TASKS:
-- Do NOT include tasks to reproduce performance benchmarks, scaling plots, or timing
-  comparisons from the paper unless the environment knowledge confirms the resources exist.
-- Do NOT include tasks that fabricate or simulate fake benchmark data to mimic the
-  paper's performance results.
-- DO include tasks that reproduce the actual scientific computation (simulation,
-  analysis, visualization) using data generated by the workflow itself.
-- All visualizations must use data produced by the workflow, not hardcoded values
-  from the paper.
-- Follow the environment knowledge injected into your context (local or HPC) for
-  what parallelism, MPI, and job launcher commands are appropriate.
-
-HANDLING ORCHESTRATOR FEEDBACK:
-If the input ends with "Orchestrator feedback", fix every issue raised before returning.\
-"""
-
-# condition A version of the planner prompt, same deal as the orchestrator one above
-PLANNER_PROMPT_NO_SKILLS = """\
-You are a scientific workflow analyst. Given the full text of a research paper and a goal, extract
-everything needed to reproduce the computational workflow described in the paper.
-
-## What Tasks Are in the MCP Approach
-
-Tasks describe what the explorer agent executes via MCP tool calls -- not code to write to a file
-and run. There is no workflow.py, no main(), no bash launcher, no @python_app definitions. The
-explorer calls `submit_task` with inline Python code directly, or a domain-specific tool when the
-goal names one (e.g. a simulation runner).
-
-## Software Available
-
-Depending on the workflow, packages such as LAMMPS, OVITO, Parsl, PyCOMPSs, ADIOS2, numpy, and
-matplotlib may be installed or installable into the local venv. Only request packages that are
-actually needed for this paper's workflow -- never invent packages.
-
-Return ONLY a valid JSON object with exactly these keys:
-- literature_findings: list[str] -- specific, quantitative facts extracted from the paper
-- stack_decision:      list[str] -- packages to install into the local venv
-- tasks:               list[str] -- ordered, Python-API-level implementation steps the explorer will execute
-- skill_requests:      list[str] -- always leave this empty; no skill content is available in this run
-
-No markdown, no code fences, no explanation outside the JSON.
-
-IMPORTANT CONSTRAINTS ON TASKS:
-- Do NOT include tasks to reproduce performance benchmarks, scaling plots, or timing
-  comparisons from the paper unless the environment knowledge confirms the resources exist.
-- Do NOT include tasks that fabricate or simulate fake benchmark data to mimic the
-  paper's performance results.
-- DO include tasks that reproduce the actual scientific computation (simulation,
-  analysis, visualization) using data generated by the workflow itself.
-- All visualizations must use data produced by the workflow, not hardcoded values
-  from the paper.
-- Follow the environment knowledge injected into your context (local or HPC) for
-  what parallelism, MPI, and job launcher commands are appropriate.
-
-HANDLING ORCHESTRATOR FEEDBACK:
-If the input ends with "Orchestrator feedback", fix every issue raised before returning.\
-"""
 
 
 # __ Project layout (injected into context) ____________________________________
@@ -765,9 +632,7 @@ app = graph.compile()
 
 # __ Run _______________________________________________________________________
 
-if __name__ == "__main__":
-    import argparse
-
+def user_input():
     parser = argparse.ArgumentParser(description="MAW -- Multi-Agent Workflow (MCP Approach)")
     parser.add_argument("--paper", type=str, help="Path to the PDF paper or paper index (1-based)")
     parser.add_argument("--image", type=str, help="Path to image file (diagram/figure) to use for planning")
@@ -789,40 +654,40 @@ if __name__ == "__main__":
                         choices=["a", "b", "c", "d"],
                         help="Planner input combination: a=PDF+Image+Desc, "
                              "b=PDF+Desc, c=Image+Desc, d=Desc Only")
-    args = parser.parse_args()
+    
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+
+    # look at user_input to see valid arguments
+    args = user_input()
 
     console.print(Panel(f"[bold blue]MAW -- Multi-Agent Workflow (MCP Approach)[/bold blue]\n[dim]Engine: {args.engine} | Env: {args.env}[/dim]", border_style="blue"))
 
-    lit_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Literature")
-    os.makedirs(lit_dir, exist_ok=True)
+    pdfs = [os.path.join(LITERATURE_PATH, pdf) for pdf in os.listdir(LITERATURE_PATH) if pdf.lower().endswith(".pdf")]
 
-    pdfs = [f for f in os.listdir(lit_dir) if f.lower().endswith(".pdf")]
     if not pdfs:
-        console.print("[red]No PDFs found in the Literature/ folder. Add a paper and try again.[/red]")
-        raise SystemExit(1)
+        exception_message("No PDFs found in the Literature/ folder. Add a paper and try again.")
 
     console.print("\n[bold]Available papers:[/bold]")
     for i, name in enumerate(pdfs, 1):
-        console.print(f"  {i}. {name}")
+        console.print(f"  {i}. {os.path.basename(name)}")
 
     # Handle paper selection
-    if args.paper:
-        choice = args.paper
-        try:
-            pdf_path = os.path.join(lit_dir, pdfs[int(choice) - 1])
-        except (ValueError, IndexError):
-            pdf_path = os.path.join(lit_dir, choice)
-            if not os.path.isfile(pdf_path):
-                console.print(f"[red]Paper not found: {choice}[/red]")
-                raise SystemExit(1)
-    else:
-        choice = input("\nSelect a paper by number: ").strip()
-        try:
-            pdf_path = os.path.join(lit_dir, pdfs[int(choice) - 1])
-        except (ValueError, IndexError):
-            console.print("[red]Invalid selection.[/red]")
-            raise SystemExit(1)
+    paper = None
+    if args.paper and 0 <= args.paper < len(pdfs):
+        paper = args.paper-1
 
+    while not paper:
+        choice = input("\nSelect a paper by number: ").strip()
+        
+        if 0 <= choice < len(pdfs):
+            paper = choice-1
+        else:
+            console.print("[red]Invalid selection. Choose a proper paper[/red]")
+    pdf_path = pdfs[paper]
     console.print(f"[dim]Selected: {os.path.basename(pdf_path)}[/dim]")
 
     # Handle image selection
@@ -899,10 +764,9 @@ if __name__ == "__main__":
         console.print("[red]Goal cannot be empty.[/red]")
         raise SystemExit(1)
 
-    runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
-    os.makedirs(runs_dir, exist_ok=True)
+    os.makedirs(RUN_PATH, exist_ok=True)
     _run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _run_log_path = os.path.join(runs_dir, _run_id + ".jsonl")
+    _run_log_path = os.path.join(RUN_PATH, _run_id + ".jsonl")
     console.print(f"[dim]Run log: {_run_log_path}[/dim]")
 
     initial_state = {
@@ -929,7 +793,7 @@ if __name__ == "__main__":
         "domain":                args.domain,
     }
 
-    trace_path = os.path.join(runs_dir, _run_id + "_trace.json")
+    trace_path = os.path.join(RUN_PATH, _run_id + "_trace.json")
 
     tracer.reset()   # brefor you run it, reset the tracer to clear any previous runs from the dashboard
     tracer.start_run(
