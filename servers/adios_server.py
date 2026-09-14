@@ -50,14 +50,81 @@ REPO_ROOT = os.environ.get(
 
 VENV_PYTHON = os.environ.get("VENV_PYTHON", sys.executable)
 
+
+def _find_lammps_pkg_dir() -> str:
+    """Locate the installed `lammps` package dir (which ships the bundled `lmp`
+    binary) without hardcoding a Python minor version.
+
+    Tries, in order: the site-packages of VENV_PYTHON, then the server's own
+    site-packages, then a glob under REPO_ROOT/venv*/lib/python*/site-packages.
+    Returns "" if it can't be found, so PATH construction stays harmless.
+    """
+    import glob as _glob
+    import sysconfig
+
+    candidates: list[str] = []
+
+    venv_bin = os.path.dirname(VENV_PYTHON)
+    venv_root = os.path.dirname(venv_bin) if venv_bin else ""
+    if venv_root:
+        candidates += _glob.glob(
+            os.path.join(venv_root, "lib", "python*", "site-packages", "lammps")
+        )
+        candidates.append(os.path.join(venv_root, "Lib", "site-packages", "lammps"))
+
+    try:
+        purelib = sysconfig.get_paths().get("purelib", "")
+        if purelib:
+            candidates.append(os.path.join(purelib, "lammps"))
+    except Exception:
+        pass
+
+    candidates += _glob.glob(
+        os.path.join(REPO_ROOT, "venv*", "lib", "python*", "site-packages", "lammps")
+    )
+
+    for path in candidates:
+        if path and os.path.isdir(path):
+            return path
+    return ""
+
+
 DEFAULT_WORK_DIR = os.path.join(REPO_ROOT, "work", "run0")
 DEFAULT_DATA_DIR = os.path.join(REPO_ROOT, "data")
+
+# MPI library paths required for LAMMPS Python API on Swing/Improv (Intel oneAPI MPI)
+_MPI_LIB_PATHS = (
+    "/gpfs/fs1/soft/swing/manual/intel/oneapi/2021.2.0.2883/mpi/2021.2.0/lib/release:"
+    "/gpfs/fs1/soft/improv/software/custom-built/intel-oneapi-toolkit/mpi/2021.15/lib:"
+    "/gpfs/fs1/soft/improv/software/custom-built/intel-oneapi-toolkit/mpi/2021.15/opt/mpi/libfabric/lib"
+)
+_existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
+_ld_library_path = _MPI_LIB_PATHS + (":" + _existing_ld if _existing_ld else "")
+
+# The pip lammps package ships a compiled lmp binary alongside its Python bindings.
+_LMP_BIN_DIR = _find_lammps_pkg_dir()
+_existing_path = os.environ.get("PATH", "")
+_task_path = (_LMP_BIN_DIR + ":" if _LMP_BIN_DIR else "") + _existing_path
 
 TASK_ENV = {
     **os.environ,
     "LIBGL_ALWAYS_SOFTWARE": "1",
     "PYOPENGL_PLATFORM": "osmesa",
     "OVITO_GUI_MODE": "0",
+    "LD_LIBRARY_PATH": _ld_library_path,
+    "PATH": _task_path,
+    # Allow Intel MPI to initialize in a subprocess not launched via mpirun.
+    # Without these, MPI_Init sends SIGTERM (exit 143) when called outside mpirun.
+    "PMI_SIZE": "1",
+    "PMI_RANK": "0",
+    "I_MPI_HYDRA_BOOTSTRAP": "fork",
+    "FI_PROVIDER": "tcp",
+    # Force Intel MPI to shared-memory transport for the single-process Python-API
+    # path. On login nodes (no PBS fabric) the OFI/libfabric netmod's addrinfo()
+    # probe fails with "MPIDI_OFI_mpi_init_hook: No data available", aborting
+    # MPI_Init before LAMMPS runs. shm bypasses OFI entirely. The real mpirun
+    # branch scrubs these vars via `env -u`, so this only affects the local path.
+    "I_MPI_FABRICS": "shm",
 }
 
 # __ ADIOS2 Runtime Detection __________________________________________________

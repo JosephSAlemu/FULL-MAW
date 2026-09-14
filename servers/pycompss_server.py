@@ -57,6 +57,45 @@ REPO_ROOT = os.environ.get(
 
 VENV_PYTHON = os.environ.get("VENV_PYTHON", sys.executable)
 
+
+def _find_lammps_pkg_dir() -> str:
+    """Locate the installed `lammps` package dir (which ships the bundled `lmp`
+    binary) without hardcoding a Python minor version.
+
+    Tries, in order: the site-packages of VENV_PYTHON, then the server's own
+    site-packages, then a glob under REPO_ROOT/venv*/lib/python*/site-packages.
+    Returns "" if it can't be found, so PATH construction stays harmless.
+    """
+    import glob as _glob
+    import sysconfig
+
+    candidates: list[str] = []
+
+    venv_bin = os.path.dirname(VENV_PYTHON)
+    venv_root = os.path.dirname(venv_bin) if venv_bin else ""
+    if venv_root:
+        candidates += _glob.glob(
+            os.path.join(venv_root, "lib", "python*", "site-packages", "lammps")
+        )
+        candidates.append(os.path.join(venv_root, "Lib", "site-packages", "lammps"))
+
+    try:
+        purelib = sysconfig.get_paths().get("purelib", "")
+        if purelib:
+            candidates.append(os.path.join(purelib, "lammps"))
+    except Exception:
+        pass
+
+    candidates += _glob.glob(
+        os.path.join(REPO_ROOT, "venv*", "lib", "python*", "site-packages", "lammps")
+    )
+
+    for path in candidates:
+        if path and os.path.isdir(path):
+            return path
+    return ""
+
+
 DEFAULT_WORK_DIR = os.path.join(REPO_ROOT, "work", "run0")
 DEFAULT_DATA_DIR = os.path.join(REPO_ROOT, "data")
 
@@ -94,7 +133,7 @@ _existing_pythonpath = os.environ.get("PYTHONPATH", "")
 _task_pythonpath = _COMPSS_PYTHON_PATH + (":" + _existing_pythonpath if _existing_pythonpath else "")
 
 # The pip lammps package ships a compiled lmp binary alongside its Python bindings.
-_LMP_BIN_DIR = os.path.join(REPO_ROOT, "venv3", "lib", "python3.11", "site-packages", "lammps")
+_LMP_BIN_DIR = _find_lammps_pkg_dir()
 # COMPSs's CLI tools (runcompss etc) live in Runtime/scripts, never on PATH by
 # default. not used by our own task execution but handy for ad-hoc shell tasks
 _COMPSS_BIN_DIRS = (
@@ -103,7 +142,8 @@ _COMPSS_BIN_DIRS = (
     f"{os.path.join(COMPSS_HOME, 'Bindings', 'c', 'bin')}"
 )
 _existing_path = os.environ.get("PATH", "")
-_task_path = f"{_LMP_BIN_DIR}:{_COMPSS_BIN_DIRS}" + (":" + _existing_path if _existing_path else "")
+_task_path = (f"{_LMP_BIN_DIR}:" if _LMP_BIN_DIR else "") + \
+    f"{_COMPSS_BIN_DIRS}" + (":" + _existing_path if _existing_path else "")
 
 TASK_ENV = {
     **os.environ,
@@ -120,6 +160,12 @@ TASK_ENV = {
     "PMI_RANK": "0",
     "I_MPI_HYDRA_BOOTSTRAP": "fork",
     "FI_PROVIDER": "tcp",
+    # Force Intel MPI to shared-memory transport for the single-process Python-API
+    # path. On login nodes (no PBS fabric) the OFI/libfabric netmod's addrinfo()
+    # probe fails with "MPIDI_OFI_mpi_init_hook: No data available", aborting
+    # MPI_Init before LAMMPS runs. shm bypasses OFI entirely. The real mpirun
+    # branch scrubs these vars via `env -u`, so this only affects the local path.
+    "I_MPI_FABRICS": "shm",
 }
 
 # __ Resource Detection ________________________________________________________

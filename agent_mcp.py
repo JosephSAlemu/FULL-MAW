@@ -19,6 +19,7 @@ Usage:
 from common.consts import LITERATURE_PATH, SKILLS_PATH, DATA_PATH, RUN_PATH
 from systemprompts.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_SYSTEM_PROMPT_NO_SKILLS
 from systemprompts.planner import PLANNER_PROMPT, PLANNER_PROMPT_NO_SKILLS
+from systemprompts.context import PROJECT_LAYOUT
 from common.exceptions import exception_message
 import os
 import base64
@@ -108,32 +109,6 @@ class InstallerOutput(BaseModel):
 
 # __ Project layout (injected into context) ____________________________________
 
-PROJECT_LAYOUT = """\
-Repo directory tree -- the repo root is mapped to /app/ at runtime:
-
-/app/                                  <- repo root
-+-- agent_mcp.py                       <- orchestrator/planner/installer + graph
-+-- mcp_explorer.py                    <- explorer agent (ReAct loop, MCP client)
-+-- servers/                           <- MCP server backends, one per workflow engine
-|   +-- parsl_server.py
-|   +-- pycompss_server.py
-|   +-- adios_server.py
-+-- requirements.txt
-+-- .env
-+-- data/
-|   +-- in.watbox                      <- LAMMPS input script
-|   +-- data.init                      <- LAMMPS initial atom positions
-|   +-- AW.tersoff                     <- LAMMPS force field parameters
-+-- Literature/
-|   +-- *.pdf
-+-- images/
-|   +-- *.png / *.jpg                  <- optional planning diagrams/figures
-+-- builds/                            <- installer-generated requirements
-|   +-- requirements.txt               <- venv package list
-+-- work/                              <- explorer output goes here
-    +-- run0/                          <- default working directory
-\
-"""
 
 HOST_REPO_PATH = os.environ.get("HOST_REPO_PATH", os.path.dirname(os.path.abspath(__file__)))
 
@@ -634,7 +609,7 @@ app = graph.compile()
 
 def user_input():
     parser = argparse.ArgumentParser(description="MAW -- Multi-Agent Workflow (MCP Approach)")
-    parser.add_argument("--paper", type=str, help="Path to the PDF paper or paper index (1-based)")
+    parser.add_argument("--paper", type=int, help="Path to the PDF paper or paper index (1-based)")
     parser.add_argument("--image", type=str, help="Path to image file (diagram/figure) to use for planning")
     parser.add_argument("--goal", type=str, help="Goal for the workflow")
     parser.add_argument("--engine", type=str, default="parsl",
@@ -680,7 +655,7 @@ if __name__ == "__main__":
     if args.paper and 0 <= args.paper < len(pdfs):
         paper = args.paper-1
 
-    while not paper:
+    while paper is None:
         choice = input("\nSelect a paper by number: ").strip()
         
         if 0 <= choice < len(pdfs):
