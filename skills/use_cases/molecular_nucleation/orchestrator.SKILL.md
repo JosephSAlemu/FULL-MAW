@@ -36,7 +36,7 @@ When the explorer reports tool call failures, use these patterns to decide where
 | `exit 143` on run_lammps | explorer | "MPI init failure — run_lammps should handle this automatically via server TASK_ENV. Check that get_resources was called first and in_pbs is true." |
 | `WorkerLost` + `MPI` / `ORTE` | explorer | "LAMMPS MPI init failure. The run_lammps tool handles HPC/local selection — do not use submit_task with Python API for LAMMPS." |
 | `ModuleNotFoundError: No module named 'lammps'` | explorer | "LAMMPS not found. Use `from lammps import lammps` — the source build is at /usr/local/lib. Do not pip install lammps." |
-| `ModuleNotFoundError: No module named 'PIL'` | explorer | "Pillow is installed as 'Pillow' not 'PIL'. Import with `from PIL import Image`." |
+| `ModuleNotFoundError: No module named 'PIL'` | explorer | "pillow is installed as 'pillow' not 'PIL'. Import with `from PIL import Image`." |
 | `frames/step.*.lammpstrj` not found / no frames | explorer | "LAMMPS did not produce dump files. Ensure os.chdir(work_dir) is called BEFORE lammps() and that work_dir/frames/ exists." |
 | `results.csv` missing after exit 0 | explorer | "analyze_with_ovito did not write results.csv. Check the output_csv path and that pipeline.compute() loop runs." |
 | All other failures | explorer | Full stderr content |
@@ -49,7 +49,7 @@ When the installer presents requirements.txt for approval, verify it contains:
 - `ovito`
 - `numpy`
 - `matplotlib`
-- `Pillow`
+- `pillow`
 - The engine-specific package matching `--engine`:
   - `parsl`: `parsl>=2024.0.0` should be present
   - `pycompss`: `pycompss` should NOT be present (never pip-installed — see `systems/pycompss` skill)

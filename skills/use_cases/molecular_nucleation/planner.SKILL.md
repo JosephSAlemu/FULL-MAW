@@ -48,7 +48,7 @@ The venv provides EXACTLY these pip-installable packages. Use only these:
 | ovito | (latest installed) |
 | numpy | (latest installed) |
 | matplotlib | (latest installed) |
-| Pillow | (required for GIF generation) |
+| pillow | (required for GIF generation) |
 
 **Engine-specific package (depends on `--engine`):**
 - `--engine parsl`: add `parsl>=2024.0.0` -- normal pip package, hard requirement.
@@ -95,7 +95,7 @@ Each task maps to one or a few `submit_task` or `submit_shell_task` calls.
 
 ```
 1. "Check that required packages are installed: check_package for ovito, numpy,
-   matplotlib, Pillow."
+   matplotlib, pillow."
 
 2. "Create the run directory structure using submit_shell_task:
    mkdir -p /app/work/run0/frames /app/work/run0/renders"
@@ -124,7 +124,7 @@ Each task maps to one or a few `submit_task` or `submit_shell_task` calls.
    alpha >= 0.6. Use matplotlib.use('Agg') for headless rendering. Save each frame
    as frame_NNNN.png in /app/work/run0/renders/."
 
-8. "Assemble the rendered PNGs into an animated GIF via submit_task using Pillow:
+8. "Assemble the rendered PNGs into an animated GIF via submit_task using pillow:
    load sorted frame_*.png files from /app/work/run0/renders/, save as
    /app/work/run0/renders/animation.gif with loop=0 and duration=100ms per frame."
 
@@ -161,16 +161,16 @@ package per the Stack Decision rules above if a different engine was chosen
     "Ice structure detection via OVITO IdentifyDiamondModifier",
     "Cubic diamond (types 1-3) and hexagonal diamond (types 4-6) tracked per frame"
   ],
-  "stack_decision": ["ovito", "parsl>=2024.0.0", "numpy", "matplotlib", "Pillow"],
+  "stack_decision": ["ovito", "parsl>=2024.0.0", "numpy", "matplotlib", "pillow"],
   "tasks": [
-    "Check that ovito, numpy, matplotlib, Pillow are installed via check_package.",
+    "Check that ovito, numpy, matplotlib, pillow are installed via check_package.",
     "Create /app/work/run0/frames/ and /app/work/run0/renders/ via submit_shell_task.",
     "Copy AW.tersoff, data.init, in.watbox from /app/data/ to /app/work/run0/ via submit_shell_task — always re-copy in.watbox.",
     "Run LAMMPS via run_lammps(script='in.watbox', work_dir='/app/work/run0'). Server picks mpirun+binary or Python API automatically.",
     "Verify frames exist in /app/work/run0/frames/ via list_files before proceeding.",
     "Run OVITO analysis via submit_task: IdentifyDiamondModifier, cubic=types 1+2+3, hexagonal=types 4+5+6, write results.csv.",
     "Render frames via submit_task: matplotlib Agg backend, color by structure type, s=25 min, save PNGs to renders/.",
-    "Assemble GIF via submit_task: Pillow sorted PNGs -> animation.gif.",
+    "Assemble GIF via submit_task: pillow sorted PNGs -> animation.gif.",
     "Plot timeseries via submit_task: results.csv -> nucleation_timeseries.png."
   ]
 }

@@ -71,7 +71,7 @@ for this engine — approve either way; if it's missing and `--engine adios` was
 requested, that's fine, the workflow has a documented numpy-I/O fallback (see
 `systems/adios` skill) rather than a hard requirement.
 
-**Do NOT approve** a requirements.txt that includes `ovito`, `Pillow`, or `lammps` —
+**Do NOT approve** a requirements.txt that includes `ovito`, `pillow`, or `lammps` —
 those belong to the `molecular_nucleation` use case, not this one; their presence
 usually means a stale `requirements.txt` from a previous run leaked through.
 

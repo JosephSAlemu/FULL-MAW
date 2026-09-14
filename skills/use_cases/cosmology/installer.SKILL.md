@@ -38,7 +38,7 @@ fatal: the workflow has a numpy-I/O fallback (see `systems/adios` skill), so do 
 block or fail the run if `adios2` can't be installed. There's no system-level ADIOS2
 build assumed on this cluster for this use case yet.
 
-**Do NOT add:** `ovito`, `Pillow`, `lammps`, `parsl` — those are for
+**Do NOT add:** `ovito`, `pillow`, `lammps`, `parsl` — those are for
 `molecular_nucleation`, not this project. If `builds/requirements.txt` already has
 them from a prior run with a different engine, that's stale — it should be regenerated
 from the current `stack_decision`, not reused as-is.

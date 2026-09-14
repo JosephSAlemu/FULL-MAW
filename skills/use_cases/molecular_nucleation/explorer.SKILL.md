@@ -192,7 +192,7 @@ else:
     print("No frame PNGs found -- render frames first")
 ```
 
-- Requires `Pillow` (PIL) -- it should be in the venv
+- Requires `pillow` (PIL) -- it should be in the venv
 - `duration=100` means 100ms per frame
 - `loop=0` means infinite loop
 

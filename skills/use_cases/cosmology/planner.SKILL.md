@@ -68,7 +68,7 @@ use `adios2.Stream` (write and read back) for its intermediate arrays. If
 from `stack_decision` by default just because it's not strictly required to
 avoid a hard failure.
 
-**Do NOT add:** `ovito`, `Pillow`, `lammps`, `scipy`, `ase`, `h5py`, `pygio` — none of
+**Do NOT add:** `ovito`, `pillow`, `lammps`, `scipy`, `ase`, `h5py`, `pygio` — none of
 these are needed, and `pygio`/HACC binaries are not pip-installable in the first place
 (they're pre-built cluster executables or unbuildable in-tree extensions).
 

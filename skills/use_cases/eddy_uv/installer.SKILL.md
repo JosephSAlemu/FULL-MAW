@@ -40,4 +40,4 @@ hand-parsing it.
   `molecular_nucleation`'s LAMMPS build, everything Nek5000-related is already
   built on the cluster.
 - Don't carry over packages from other use cases (`scipy`, `mpi4py`, `ovito`,
-  `Pillow`, `lammps`, `adios2`) unless the actual task list calls for them.
+  `pillow`, `lammps`, `adios2`) unless the actual task list calls for them.

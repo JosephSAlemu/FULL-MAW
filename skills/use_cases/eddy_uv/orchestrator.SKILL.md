@@ -51,7 +51,7 @@ files and is easy to forget since it's not a household name.
 itself -- it's a pre-built cluster binary, not a Python package.
 
 **Do NOT approve** a stale requirements.txt carrying over packages from other
-use cases (`scipy`, `mpi4py`, `ovito`, `Pillow`, `lammps`, `adios2`) unless the
+use cases (`scipy`, `mpi4py`, `ovito`, `pillow`, `lammps`, `adios2`) unless the
 current task list actually calls for them.
 
 ---

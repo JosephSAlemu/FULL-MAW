@@ -63,7 +63,7 @@ pymech        # the package that reads Nek5000 .f##### field files -- pip
 
 Beyond that, let the rest of `stack_decision` follow from what the actual
 analysis/visualization code ends up needing -- don't pre-load it with packages
-from other use cases (`scipy`, `mpi4py`, `ovito`, `Pillow`, `lammps`,
+from other use cases (`scipy`, `mpi4py`, `ovito`, `pillow`, `lammps`,
 `adios2`) unless the task genuinely calls for them.
 
 ---

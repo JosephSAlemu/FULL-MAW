@@ -10,3 +10,4 @@ wheelhouse/
 /work/
 OLD RUNS/
 SAMPLE RUNS/**/work/.parsl/
+profiler/

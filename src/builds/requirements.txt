@@ -2,4 +2,4 @@ ovito
 parsl>=2024.0.0
 numpy
 matplotlib
-Pillow
+pillow

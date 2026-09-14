@@ -26,7 +26,7 @@ Sets up the local venv with all packages needed for the LAMMPS water crystalliza
 ovito
 numpy
 matplotlib
-Pillow
+pillow
 ```
 
 **Engine-specific package (depends on `--engine`):**
