@@ -18,13 +18,12 @@ from langgraph.graph import StateGraph, END
 from rich.console import Console
 from rich.panel import Panel
 
-console = Console()
+
 from mcp_explorer import _explorer_async
-from states import AgentState
 from trace_logger import tracer, extract_usage, message_to_dict
 from pypdf import PdfReader
-from states import PlannerOutput, InstallerOutput, OrchestratorOutput
-from utility import _list_skills, _env_knowledge, _invoke_structured, _read_skill
+from src.states import PlannerOutput, InstallerOutput, OrchestratorOutput, AgentState, AgentSteps
+from src.utility import _list_skills, _env_knowledge, _invoke_structured, _read_skill
 from systemprompts.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_SYSTEM_PROMPT_NO_SKILLS
 from systemprompts.planner import PLANNER_PROMPT, PLANNER_PROMPT_NO_SKILLS
 from systemprompts.context import PROJECT_LAYOUT
@@ -33,6 +32,7 @@ import os
 import base64
 import mimetypes
 
+console = Console()
 
 class Planner(Agent):
     def __init__(self, model=None):
@@ -139,7 +139,7 @@ class Planner(Agent):
                 "literature_findings": result.literature_findings,
                 "stack_decision":      result.stack_decision,
                 "tasks":               result.tasks,
-                "current_step":        "planner_complete",
+                "current_step":        AgentSteps.PLANNER_COMPLETE,
             }
         except Exception as e:
             console.print(f"[red][planner] ERROR: {e}[/red]")
@@ -171,7 +171,7 @@ class Installer(Agent):
                     console.print("[dim cyan][installer] no packages to install[/dim cyan]")
                     tracer.log_agent_output("installer", {"status": "no packages"})
                     tracer.log_agent_end("installer")
-                    return {"current_step": "installer_complete"}
+                    return {"current_step": AgentSteps.INSTALLER_COMPLETE}
 
                 console.print(f"[dim cyan][installer] pip installing {len(packages)} packages...[/dim cyan]")
                 proc = subprocess.run(
@@ -185,7 +185,7 @@ class Installer(Agent):
 
                 tracer.log_agent_output("installer", {"status": "packages installed", "count": len(packages)})
                 tracer.log_agent_end("installer")
-                return {"current_step": "installer_complete"}
+                return {"current_step": AgentSteps.INSTALLER_COMPLETE}
 
             else:
                 # __ Phase 1: read or generate requirements.txt, send to orchestrator for approval __
@@ -239,7 +239,7 @@ class Installer(Agent):
                 tracer.log_agent_end("installer")
                 return {
                     "requirements_content": content,
-                    "current_step":         "installer_requirements_pending_approval",
+                    "current_step":         AgentSteps.INSTALLER_REQUIREMENTS_PENDING_APPROVAL,
                 }
 
         except Exception as e:
@@ -269,7 +269,7 @@ class Explorer(Agent):
         return explorer
 
     @action
-    async def explorer(self, state: dict) -> dict:
+    async def explorer(self, state: AgentState) -> dict:
         """
         Explorer node -- connects to MCP server and runs a ReAct tool-calling loop
         to execute workflow tasks step by step.
@@ -309,7 +309,6 @@ class Orchestrator(Agent):
         self.agents = agents
         self.run_log = run_log
         self.agent_state = agent_state
-        self.final_state = None
 
     async def agent_on_startup(self) -> None:
         llm = ChatOpenAI(
@@ -424,11 +423,11 @@ class Orchestrator(Agent):
                 ], "orchestrator")
 
         # Hard overrides: lock routing at deterministic transition points
-        if state.get("current_step") == "installer_requirements_pending_approval":
+        if state.get("current_step") == AgentSteps.INSTALLER_REQUIREMENTS_PENDING_APPROVAL:
             result.next = "installer"
-        elif state.get("current_step") == "installer_complete":
+        elif state.get("current_step") == AgentSteps.INSTALLER_COMPLETE:
             result.next = "explorer"
-        elif state.get("current_step") == "explorer_complete":
+        elif state.get("current_step") == AgentSteps.EXPLORER_COMPLETE:
             # After explorer completes, check if key outputs exist before deciding to re-run.
             # If the explorer produced results (even partial), prefer ending over re-running.
             log = state.get("exploration_log", [])

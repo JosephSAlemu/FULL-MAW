@@ -2,6 +2,7 @@ LITERATURE_PATH = "Literature/"
 SKILLS_PATH = "skills/"
 DATA_PATH = "data/"
 RUN_PATH = "runs/"
+IMAGE_PATH = "images/"
 
 ENV_KNOWLEDGE = {
     "local": "knowledge/local",

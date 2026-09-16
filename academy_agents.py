@@ -25,13 +25,10 @@ import os
 import re
 import sys
 import warnings
+
 from datetime import datetime
-
-warnings.filterwarnings("ignore", module="pypdf")
-
-# src/ holds the Academy agent definitions (agents.py, states.py, utility.py) and
-# is imported as top-level modules, so it must be on the path.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+from pathlib import Path
+from src.states import AgentState, AgentSteps, UserInput
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -40,12 +37,12 @@ from rich.panel import Panel
 from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
 
-from common.consts import LITERATURE_PATH, RUN_PATH
+from common.consts import LITERATURE_PATH, RUN_PATH, IMAGE_PATH
 from common.exceptions import exception_message
 from trace_logger import tracer
 from run_archiver import archive_run
 
-from agents import Planner, Installer, Explorer, Orchestrator
+from src.agents import Planner, Installer, Explorer, Orchestrator
 
 load_dotenv()
 
@@ -81,81 +78,88 @@ def user_input():
                         help="Paper domain label, e.g. molecular_nucleation (optional)")
     parser.add_argument("--combination", type=str, required=True,
                         choices=["a", "b", "c", "d"],
-                        help="Planner input combination: a=PDF+Image+Desc, "
-                             "b=PDF+Desc, c=Image+Desc, d=Desc Only")
+                        help="Planner input combination: a=PDF+Image+DataFile+Desc, "
+                             "b=PDF+DataFile+Desc, c=Image+DataFile+Desc, d=DataFile+Desc")
     return parser.parse_args()
 
 
-def collect_inputs(args):
+def collect_inputs(args) -> UserInput:
     """Resolve paper / image / data-file / goal selections (interactive fallbacks)."""
-    pdfs = [os.path.join(LITERATURE_PATH, pdf) for pdf in os.listdir(LITERATURE_PATH)
-            if pdf.lower().endswith(".pdf")]
-    if not pdfs:
-        exception_message("No PDFs found in the Literature/ folder. Add a paper and try again.")
 
-    console.print("\n[bold]Available papers:[/bold]")
-    for i, name in enumerate(pdfs, 1):
-        console.print(f"  {i}. {os.path.basename(name)}")
+    inputs = UserInput()
 
-    paper = None
-    if args.paper:
-        try:
-            idx = int(args.paper)
-            if 1 <= idx <= len(pdfs):
-                paper = idx - 1
-        except ValueError:
-            match = next((i for i, p in enumerate(pdfs)
-                          if os.path.basename(p) == args.paper or p == args.paper), None)
-            if match is not None:
-                paper = match
+    # Paper selection
+    if args.combination == "a" or args.combination == "b":
+        pdf_list = []
 
-    while paper is None:
-        choice = input("\nSelect a paper by number: ").strip()
-        try:
-            idx = int(choice)
-            if 1 <= idx <= len(pdfs):
-                paper = idx - 1
-                break
-        except ValueError:
-            pass
-        console.print("[red]Invalid selection. Choose a proper paper[/red]")
-    pdf_path = pdfs[paper]
-    console.print(f"[dim]Selected: {os.path.basename(pdf_path)}[/dim]")
+        pdfs_path = os.listdir(LITERATURE_PATH)
+        if not pdfs_path:
+            exception_message("No PDFs found in the Literature/ folder. Add a paper and try again.")
+
+        console.print("\n[bold]Available papers:[/bold]")
+        for pdf in pdfs_path:
+            if Path(pdf).suffix.lower() == ".pdf":
+                pdf_list.append(pdf)
+                console.print(f"  {len(pdf_list)}. {pdf}")
+
+        while args.paper is None or args.paper < 1 or args.paper > len(pdf_list):
+            choice = input("\nSelect a paper by number: ").strip()
+            try:
+                idx = int(choice)
+                if 1 <= idx <= len(pdf_list):
+                    args.paper = idx
+                else:
+                    console.print("[red]Invalid selection. Choose a proper paper[/red]")
+            except ValueError:
+                console.print("[red]Invalid selection. Please input a number[/red]")
+
+        inputs.pdf = os.path.join(LITERATURE_PATH, pdf_list[args.paper - 1])
+        console.print(f"[dim]Selected: {pdf_list[args.paper - 1]}[/dim]")
 
     # __ Image selection __
-    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-    images_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
-    os.makedirs(images_dir, exist_ok=True)
+    if args.combination == "a" or args.combination == "c":
+        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        os.makedirs(IMAGE_PATH, exist_ok=True)
 
-    if args.image:
-        image_path = args.image if os.path.isabs(args.image) else os.path.join(images_dir, args.image)
-        if not os.path.isfile(image_path):
-            console.print(f"[red]Image not found: {args.image}[/red]")
-            raise SystemExit(1)
-        console.print(f"[dim]Image: {os.path.basename(image_path)}[/dim]")
-    else:
-        images = sorted(f for f in os.listdir(images_dir)
-                        if os.path.splitext(f)[1].lower() in _IMAGE_EXTS)
-        if not images:
-            image_path = ""
+        #similar to paper selection except you can give a path instead of a number
+        if args.image:
+            image_path = args.image if os.path.isabs(args.image) else os.path.join(IMAGE_PATH, args.image)
+            if not os.path.isfile(image_path) or Path(image_path).suffix.lower() not in _IMAGE_EXTS:
+                exception_message(f"Image not found: {args.image}")
+            console.print(f"[dim]Image: {os.path.basename(image_path)}[/dim]")
+            inputs.image = image_path
+
         else:
-            console.print("\n[bold]Available images:[/bold]")
-            for i, name in enumerate(images, 1):
-                console.print(f"  {i}. {name}")
-            console.print("  0. Skip -- no image")
-            choice = input("\nSelect an image by number (or 0 to skip): ").strip()
-            if choice == "0" or not choice:
-                image_path = ""
-                console.print("[dim]No image selected.[/dim]")
-            else:
+            images_list = []
+
+            image_dir_entries = os.listdir(IMAGE_PATH)
+            if not image_dir_entries:
+                exception_message("No Images found in the images/ folder. Add an image and try again.")
+
+            console.print("\n[bold]Available Images:[/bold]")
+            for image in image_dir_entries:
+                if Path(image).suffix.lower() in _IMAGE_EXTS:
+                    images_list.append(image)
+                    console.print(f"{len(images_list)}. {image}")
+
+            if not images_list:
+                exception_message("No Images found in the images/ folder. Add an image and try again.")
+
+            while inputs.image == "":
+                choice = input("\nSelect an image by number: ").strip()
                 try:
-                    image_path = os.path.join(images_dir, images[int(choice) - 1])
-                    console.print(f"[dim]Selected: {os.path.basename(image_path)}[/dim]")
-                except (ValueError, IndexError):
-                    console.print("[red]Invalid selection -- no image will be used.[/red]")
-                    image_path = ""
+                    idx = int(choice)
+                    if 1 <= idx <= len(images_list):
+                        inputs.image = os.path.join(IMAGE_PATH, images_list[idx - 1])
+                    else:
+                        console.print("[red]Invalid selection. Choose a proper image[/red]")
+                except ValueError:
+                    console.print("[red]Invalid selection. Please input a number[/red]")
+
+            console.print(f"[dim]Selected: {os.path.basename(inputs.image)}[/dim]")
 
     # __ Data file selection __
+    # might chance this so combination d actually allows for no datafile
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     all_data_files = sorted(f for f in os.listdir(data_dir)
                             if os.path.isfile(os.path.join(data_dir, f))) if os.path.isdir(data_dir) else []
@@ -185,31 +189,33 @@ def collect_inputs(args):
             else:
                 console.print(f"[dim]Selected: {', '.join(selected_data_files)}[/dim]")
 
+    inputs.data_files = selected_data_files
+
     # __ Goal __
     goal = args.goal or input("\nDescribe your goal for this workflow: ").strip()
     if not goal:
-        console.print("[red]Goal cannot be empty.[/red]")
-        raise SystemExit(1)
+        exception_message("[red]Goal cannot be empty.[/red]")
+    inputs.goal = goal
 
-    return pdf_path, image_path, selected_data_files, goal
+    return inputs
 
 
 # __ Academy workflow __________________________________________________________
+async def run_workflow(args: any, inputs: UserInput, run_log_path: str) -> None:
 
-async def run_workflow(args, pdf_path, image_path, selected_data_files, goal, run_log_path):
-    initial_state = {
+    initial_state: AgentState = {
         "messages":              [],
-        "goal":                  goal,
-        "pdf_path":              pdf_path,
+        "goal":                  inputs.goal,
+        "pdf_path":              inputs.pdf,
         "literature_findings":   [],
         "stack_decision":        [],
         "tasks":                 [],
         "exploration_log":       [],
-        "selected_data_files":   selected_data_files,
+        "selected_data_files":   inputs.data_files,
         "requirements_content":  "",
         "requirements_approved": False,
-        "image_path":            image_path,
-        "current_step":          "start",
+        "image_path":            inputs.image,
+        "current_step":          AgentSteps.START,
         "orchestrator_feedback": "",
         "next":                  "",
         "planner_revisions":     0,
@@ -271,7 +277,7 @@ def main():
         border_style="blue",
     ))
 
-    pdf_path, image_path, selected_data_files, goal = collect_inputs(args)
+    inputs = collect_inputs(args)
 
     os.makedirs(RUN_PATH, exist_ok=True)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -285,17 +291,17 @@ def main():
         condition=args.condition,
         combination=args.combination,
         trial=args.trial,
-        paper_id=_slugify(pdf_path) if pdf_path else "no_paper",
-        paper_path=pdf_path,
+        paper_id=_slugify(inputs.pdf) if inputs.pdf else "no_paper",
+        paper_path=inputs.pdf,
         domain=args.domain,
         framework=args.engine,
         env=args.env,
-        goal=goal,
+        goal=inputs.goal,
         model=os.getenv("MODEL_NAME", "claudeopus48"),
     )
 
     try:
-        asyncio.run(run_workflow(args, pdf_path, image_path, selected_data_files, goal, run_log_path))
+        asyncio.run(run_workflow(args, inputs, run_log_path))
         tracer.finalize_run("completed")
     except Exception as e:
         import traceback as _traceback
