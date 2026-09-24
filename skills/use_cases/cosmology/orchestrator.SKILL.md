@@ -17,7 +17,7 @@ Routing rules specific to the HACC cosmological N-body workflow (Last Journey sa
 
 Load when orchestrating a HACC / cosmology workflow (goal mentions HACC, GenericIO,
 FOF/SOD halo catalogs, "Last Journey", or paths under
-`/lcrc/project/PEDAL/jacoboh/HACC/`).
+`/lcrc/project/PEDAL/jalemu/HACC/`).
 
 ---
 
@@ -87,7 +87,7 @@ C++ extension against GenericIO libs).
 | Error pattern | Route to | Feedback |
 |---|---|---|
 | `ModuleNotFoundError: No module named 'pygio._version'` | explorer | "pygio is not built and should not be built. Use `GenericIOPrint` via subprocess instead." |
-| `qsub` / `qstat` command not found or job ID not captured | explorer | "Re-run via submit_shell_task with `cd /lcrc/project/PEDAL/jacoboh/HACC/SampleRun_go && qsub agent_subme.pbs` (the script you built) — qsub must run with that directory as cwd so $PBS_O_WORKDIR resolves." |
+| `qsub` / `qstat` command not found or job ID not captured | explorer | "Re-run via submit_shell_task with `cd /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go && qsub agent_subme.pbs` (the script you built) — qsub must run with that directory as cwd so $PBS_O_WORKDIR resolves." |
 | Explorer submits the original `subme.pbs` unmodified instead of building its own combined script | explorer | "Build your own PBS script (e.g. `agent_subme.pbs`) that runs hacc_tpm and then calls analyze_and_render.py, using `subme.pbs` only as a reference for the executable/env/param paths. Submit that generated file, not the original." |
 | Explorer reads/parses/renders from `output/full_snapshots/`/`analysis/haloproperties/` content before this run's own producer has executed | explorer | "That's leftover output from some prior run, not this run's own result — write analyze_and_render.py from the documented GenericIO format/halo-selection rules and this run's own params/indat.params, not by testing against old data." |
 | Explorer submits the producer via `qsub` and separately re-runs analysis/visualization from the live session afterward (not as failure recovery) | explorer | "The analysis/rendering script must be embedded in the same PBS script and run as part of the same `qsub` job — don't re-execute it afterward from the live session as a matter of course; just read back the PNG/summary the job already produced." |

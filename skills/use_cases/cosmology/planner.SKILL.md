@@ -19,7 +19,7 @@ Extraction and task-writing rules specific to the HACC cosmological N-body workf
 
 Load when planning a HACC / cosmological N-body workflow (paper mentions HACC, Mira,
 Last Journey, FOF/SOD halo finding, or the goal references
-`/lcrc/project/PEDAL/jacoboh/HACC/`).
+`/lcrc/project/PEDAL/jalemu/HACC/`).
 
 ---
 
@@ -116,7 +116,7 @@ back to old data from another run.
    If in_pbs is false, STOP and tell the user to start a PBS interactive job first.
    This run requires 8 MPI ranks for the HACC producer."
 
-2. "Explore /lcrc/project/PEDAL/jacoboh/HACC/SampleRun_go/ before assuming anything:
+2. "Explore /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/ before assuming anything:
    list subme.pbs, params/, output/, and analysis/ (just to confirm they exist —
    do not read snapshot/halo content from output/ or analysis/, that's leftover
    data from a prior run, not this run's). Read params/indat.params and
@@ -150,7 +150,7 @@ back to old data from another run.
    must run hacc_tpm and then, immediately after, invoke analyze_and_render.py via
    the venv's absolute python3 path — one script, both stages. Write it to
    /app/work/run0/agent_subme.pbs, copy it into
-   /lcrc/project/PEDAL/jacoboh/HACC/SampleRun_go/agent_subme.pbs, then submit via
+   /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/agent_subme.pbs, then submit via
    submit_shell_task: cd into SampleRun_go/ and run `qsub agent_subme.pbs` from that
    directory so $PBS_O_WORKDIR resolves correctly (real qsub is explicitly allowed for
    this use case). Capture and report the returned job ID. Do not modify subme.pbs."
@@ -183,7 +183,7 @@ back to old data from another run.
 ## Key Rules
 
 - Source data paths (the PBS script, snapshot, halo catalog) are real LCRC paths under
-  `/lcrc/project/PEDAL/jacoboh/HACC/SampleRun_go/` — these are external to the repo and
+  `/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/` — these are external to the repo and
   must be referenced by their actual absolute path, not `/app/data/` (unlike use cases
   whose input data is staged into the repo's data directory).
 - Never write a task that asks the explorer to modify `subme.pbs`, `indat.params`, or

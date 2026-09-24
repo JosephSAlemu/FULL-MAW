@@ -18,7 +18,7 @@ slice visualization), based on "The Last Journey" sample run.
 ## When to Use This Skill
 
 Load this whenever the explorer is executing a workflow that runs/reads a HACC
-run (paths under `/lcrc/project/PEDAL/jacoboh/HACC/`, GenericIO snapshots, FOF/SOD
+run (paths under `/lcrc/project/PEDAL/jalemu/HACC/`, GenericIO snapshots, FOF/SOD
 halo catalogs).
 
 ---
@@ -91,8 +91,8 @@ task's `WALLTIME`/`NRANKS` parameters, and a call to the Stage 2 script:
 set -e
 cd $PBS_O_WORKDIR
 
-exe=/lcrc/project/PEDAL/jacoboh/HACC/HACC_go/improv.cpu/mpi/bin/hacc_tpm
-envfile=/lcrc/project/PEDAL/jacoboh/HACC/HACC_go/env/bashrc.improv.cpu
+exe=/lcrc/project/PEDAL/jalemu/HACC/HACC_go/improv.cpu/mpi/bin/hacc_tpm
+envfile=/lcrc/project/PEDAL/jalemu/HACC/HACC_go/env/bashrc.improv.cpu
 paramfile=./params/indat.params
 source $envfile
 
@@ -124,7 +124,7 @@ mpiexec -np ${NTOTRANKS} \
   canonical, tracked copy of what was actually submitted, and it must exist in the
   work dir alongside the rest of this run's artifacts. Then copy that same file into
   `SampleRun_go/agent_subme.pbs` (e.g. `cp /app/work/run0/agent_subme.pbs
-  /lcrc/project/PEDAL/jacoboh/HACC/SampleRun_go/agent_subme.pbs` via `submit_shell_task`)
+  /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/agent_subme.pbs` via `submit_shell_task`)
   — never overwrite the original `subme.pbs`.
 - Must `cd`/submit from `SampleRun_go/` (not the work dir) so `$PBS_O_WORKDIR` resolves
   and `./params/indat.params` is found relatively:
@@ -132,7 +132,7 @@ mpiexec -np ${NTOTRANKS} \
 ```
 submit_shell_task(
     name="submit_hacc_job",
-    command="cd /lcrc/project/PEDAL/jacoboh/HACC/SampleRun_go && qsub agent_subme.pbs",
+    command="cd /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go && qsub agent_subme.pbs",
 )
 ```
 
@@ -171,14 +171,14 @@ Building it means compiling a C++ extension against the GenericIO libs — do no
 attempt this. Instead use the pre-built CLI binaries directly via `subprocess`:
 
 ```
-GIOP = "/lcrc/project/PEDAL/jacoboh/HACC/HACC_go/improv.cpu/frontend/bin/GenericIOPrint"
+GIOP = "/lcrc/project/PEDAL/jalemu/HACC/HACC_go/improv.cpu/frontend/bin/GenericIOPrint"
 ```
 
 ### Reading the particle snapshot
 ```python
 import subprocess, numpy as np
 
-SNAP = "/lcrc/project/PEDAL/jacoboh/HACC/SampleRun_go/output/full_snapshots/step_624/m000p.full.mpicosmo.624"
+SNAP = "/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/output/full_snapshots/step_624/m000p.full.mpicosmo.624"
 out = subprocess.run([GIOP, SNAP], capture_output=True, text=True)
 
 rows = []
@@ -203,7 +203,7 @@ arr = np.array(rows, dtype=np.float64)
 
 ### Reading the halo catalog
 ```python
-HP = "/lcrc/project/PEDAL/jacoboh/HACC/SampleRun_go/analysis/haloproperties/step_624/m000p-624.haloproperties"
+HP = "/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/analysis/haloproperties/step_624/m000p-624.haloproperties"
 ```
 - This file is written by HACC's own halo finder as part of the run, under
   `analysis/haloproperties/step_<N>/` — do not hand-roll FOF/SOD linking in Python;

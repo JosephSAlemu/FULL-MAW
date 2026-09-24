@@ -20,14 +20,14 @@ and how this case is actually launched here.
 ## When to Use This Skill
 
 Load when planning a Nek5000 CFD workflow (paper or goal mentions Nek5000,
-Walsh (1992), eddy_uv, or paths under `/lcrc/project/PEDAL/jacoboh/Nek5000/`).
+Walsh (1992), eddy_uv, or paths under `/lcrc/project/PEDAL/jalemu/Nek5000/`).
 
 ---
 
 ## Where the Case Lives
 
 ```
-/lcrc/project/PEDAL/jacoboh/Nek5000/NekExamples-master/eddy_uv/
+/lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv/
 ```
 Input/config files: `eddy_uv.rea`, `eddy_uv.usr`, `eddy_uv.map`, `SIZE`,
 `SESSION.NAME`. Existing job script: `subeddy.pbs`, in the same directory --
@@ -127,7 +127,7 @@ nothing about the consumer's code needs to change either way.
 ## Key Rules
 
 - Source data paths are real LCRC paths under
-  `/lcrc/project/PEDAL/jacoboh/Nek5000/NekExamples-master/eddy_uv/` — external
+  `/lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv/` — external
   to the repo, reference by actual absolute path, not `/app/data/`.
 - Never write a task asking the explorer to modify `eddy_uv.rea`,
   `eddy_uv.usr`, `eddy_uv.map`, `SIZE`, `SESSION.NAME`, or `subeddy.pbs`.

@@ -16,7 +16,7 @@ Routing rules specific to the Nek5000 `eddy_uv` workflow.
 ## When to Use This Skill
 
 Load when orchestrating a Nek5000 CFD workflow (goal mentions Nek5000, Walsh
-(1992), eddy_uv, or paths under `/lcrc/project/PEDAL/jacoboh/Nek5000/`).
+(1992), eddy_uv, or paths under `/lcrc/project/PEDAL/jalemu/Nek5000/`).
 
 ---
 

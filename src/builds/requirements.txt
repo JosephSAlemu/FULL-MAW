@@ -1,5 +1,4 @@
-ovito
-parsl>=2024.0.0
 numpy
 matplotlib
-pillow
+mpi4py
+adios2

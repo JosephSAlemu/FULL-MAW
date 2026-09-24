@@ -21,7 +21,7 @@ specific case on this specific cluster.
 
 Load whenever the explorer is executing a workflow that submits/reads a
 Nek5000 `eddy_uv` run (paths under
-`/lcrc/project/PEDAL/jacoboh/Nek5000/NekExamples-master/eddy_uv/`).
+`/lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv/`).
 
 ---
 
@@ -40,9 +40,9 @@ get_resources()   # confirm in_pbs is true AND ntasks/cpus_per_task >= NRANKS
 
 submit_mpi_task(
     name="run_eddy_uv_producer",
-    command="bash -c 'source /lcrc/project/PEDAL/jacoboh/HACC/HACC_go/env/bashrc.improv.cpu && export OMP_NUM_THREADS=1 && ./nek5000'",
+    command="bash -c 'source /lcrc/project/PEDAL/jalemu/HACC/HACC_go/env/bashrc.improv.cpu && export OMP_NUM_THREADS=1 && ./nek5000'",
     num_ranks=<NRANKS>,
-    work_dir="/lcrc/project/PEDAL/jacoboh/Nek5000/NekExamples-master/eddy_uv",
+    work_dir="/lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv",
 )
 ```
 
@@ -71,7 +71,7 @@ submit_mpi_task(
   count for this producer, not 32. Pass `num_ranks=8` to `submit_mpi_task`
   directly; there's no headroom concept to replicate.
 - The script sources
-  `/lcrc/project/PEDAL/jacoboh/HACC/HACC_go/env/bashrc.improv.cpu` to set up
+  `/lcrc/project/PEDAL/jalemu/HACC/HACC_go/env/bashrc.improv.cpu` to set up
   the Polaris/Improv module environment. That's the shared cluster bashrc
   reused from the `cosmology` use case's HACC build -- it is not a sign the
   script is misconfigured or belongs to a different project; keep sourcing it
@@ -83,7 +83,7 @@ submit_mpi_task(
 
 List the directory before assuming any filenames or formats:
 ```
-ls -la /lcrc/project/PEDAL/jacoboh/Nek5000/NekExamples-master/eddy_uv/
+ls -la /lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv/
 ```
 Config values live in `eddy_uv.rea` (params) and `eddy_uv.usr` (case-specific
 Fortran) -- read them rather than assuming values from a paper or description.
