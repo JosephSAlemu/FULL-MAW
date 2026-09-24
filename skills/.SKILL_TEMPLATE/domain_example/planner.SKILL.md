@@ -1,7 +1,7 @@
 ---
 name: uses_cases/<your domain name>/planner
 description: >
-  (your domain name) extraction rules for the planner. Covers what parameters to extract from the paper, the correct stack_decision for this project, any qsub / no-qsub exception, and MCP-style task templates for the pipeline.
+  (your domain name) extraction rules for the planner. Concise summary of what the planner should extract from the paper.
 ---
 <!-- Remove all comments in your copy. -->
 <!-- Note: don't use bullet points in section headers; extraction lists, tables, and task blocks may use them (see examples). -->
@@ -85,6 +85,27 @@ description: >
 > Section: "Stack Decision"
 
     "ovito, numpy, matplotlib, pillow. LAMMPS is NOT in stack_decision (source-built/pre-installed). Do NOT add: lammps, scipy, ase, mdanalysis, h5py."
+
+---
+
+## [Optional: Workflow Decomposition & Where Parallelism Lives]
+**Purpose**: Describe how the run splits into stages (e.g. producer → consumer), which stage each tool drives, and — critically — where the *real* independent units of work exist so the explorer parallelizes them correctly: one `submit_task` call per unit, never hand-writing `import parsl`/`Config`/`parsl.load`/`compss_start`/`@task`/`@python_app` inside the submitted code (that nests a second runtime inside the one the server already started).
+
+**Template**:
+
+Content varies. I reccomend going to the skill files in the examples.
+
+**For Example**:
+> File: `use_cases\eddy_uv\planner`
+>
+> Section: "Producer / Consumer Split"
+
+    "Producer — run the existing nek5000 executable via submit_mpi_task, inside the existing allocation, and wait for it to complete. Consumer — a single-process stage that reads the field files with pymech, computes the requested derived quantity, and must render it as a visualization saved to PNG. Both stages are executed by the one explorer agent."
+> File: `use_cases\eddy_uv\planner`
+>
+> Section: "Workflow Shape: Two Stages, and Where Real Parallelism Lives"
+
+    "The field-file series (eddy_uv0.f00001 .. f00011) is the only place independent units of work exist: each file's (read -> compute -> render) is fully independent. Call submit_task 11 separate times, once per file, each with plain Python code — the server's own worker pool runs those concurrently. Never write import parsl/Config/@task/@python_app yourself; that nests a second runtime inside the one the server already started."
 
 ---
 
