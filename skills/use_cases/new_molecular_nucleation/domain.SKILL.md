@@ -112,4 +112,4 @@ paths; never cluster-specific absolute paths such as `/lcrc/project/`, `/gpfs/`,
   incomplete.
 - Color conventions for the renders are fixed and must not be substituted: liquid or
   unstructured water is cyan, cubic ice is blue, and hexagonal ice is red.
-- Before starting any simulation on HPC, verify MPI compatibility by checking the allocation via `get_resources`. If `in_pbs` is false or `ntasks` is lower than expected, stop immediately and restart the PBS interactive job to ensure adequate resources.
+
