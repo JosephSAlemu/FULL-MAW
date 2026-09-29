@@ -1,4 +1,5 @@
+ovito
 numpy
 matplotlib
-mpi4py
-adios2
+imageio
+pillow

@@ -39,6 +39,7 @@ from academy.manager import Manager
 
 from common.consts import LITERATURE_PATH, RUN_PATH, IMAGE_PATH
 from common.exceptions import exception_message
+from mcp_explorer import post_run_review
 from trace_logger import tracer
 from run_archiver import archive_run
 
@@ -201,7 +202,7 @@ def collect_inputs(args) -> UserInput:
 
 
 # __ Academy workflow __________________________________________________________
-async def run_workflow(args: any, inputs: UserInput, run_log_path: str) -> None:
+async def run_workflow(args: any, inputs: UserInput, run_log_path: str) -> dict:
 
     initial_state: AgentState = {
         "messages":              [],
@@ -225,6 +226,11 @@ async def run_workflow(args: any, inputs: UserInput, run_log_path: str) -> None:
         "env":                   args.env,
         "condition":             args.condition,
         "domain":                args.domain,
+        "explorer_summary":      "",
+        "run_succeeded":         True,
+        "reported_issue":        "",
+        "skill_recommendations": [],
+        "skill_edits_applied":   False,
     }
 
     async with await Manager.from_exchange_factory(
@@ -262,8 +268,15 @@ async def run_workflow(args: any, inputs: UserInput, run_log_path: str) -> None:
         # The orchestrator's @loop runs the LangGraph once, then self-shuts down.
         # Wait for it to finish before tearing the manager down.
         console.print("[dim cyan][academy] workflow running -- waiting for completion...[/dim cyan]")
-        await orchestrator.agentic_workflow()
+        final_state = await orchestrator.agentic_workflow()
         console.print("[dim cyan][academy] orchestrator finished.[/dim cyan]")
+
+        # The explorer verifies the run with the user once the graph is done -- it
+        # already has the full picture of what ran, and asking here (rather than
+        # inside the explorer node) means the user is asked once about the run as a
+        # whole, even when the orchestrator routed back to the explorer several times.
+        review = await post_run_review({**(final_state or {}), "run_log": run_log_path})
+        return {**(final_state or {}), **review}
 
 
 # __ Run _______________________________________________________________________
@@ -300,9 +313,13 @@ def main():
         model=os.getenv("MODEL_NAME", "claudeopus48"),
     )
 
+    final_state = {}
     try:
-        asyncio.run(run_workflow(args, inputs, run_log_path))
-        tracer.finalize_run("completed")
+        final_state = asyncio.run(run_workflow(args, inputs, run_log_path)) or {}
+        # The explorer's end-of-run verification is what says whether the result was
+        # actually usable; the graph completing only means the agents stopped.
+        verified = getattr(tracer.run_metadata, "user_verified", None)
+        tracer.finalize_run("completed" if verified is not False else "failed")
     except Exception as e:
         import traceback as _traceback
         tracer.log_run_error(type(e).__name__, str(e), _traceback.format_exc())
@@ -324,6 +341,19 @@ def main():
 
     # __ Summary __
     summary = tracer.get_summary()
+
+    verified = getattr(tracer.run_metadata, "user_verified", None)
+    if verified is False:
+        console.print("\n[bold yellow]User reported the workflow did not execute properly.[/bold yellow]")
+        console.print(f"[dim]Issue: {tracer.run_metadata.reported_issue}[/dim]")
+        recs_path = os.path.splitext(run_log_path)[0] + "_skill_recommendations.md"
+        if os.path.isfile(recs_path):
+            console.print(f"[dim]Skill recommendations: {recs_path}[/dim]")
+        if final_state.get("skill_edits_applied"):
+            console.print("[dim]Suggested skill edits were applied to the skill file(s).[/dim]")
+    elif verified:
+        console.print("\n[bold green]User confirmed the workflow executed properly.[/bold green]")
+
     console.print("\n[bold]Trace Summary:[/bold]")
     console.print(f"  Agents: {', '.join(summary['agents_involved'])}")
     console.print(f"  Routing path: {' -> '.join(summary['routing_path'])}")

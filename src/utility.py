@@ -1,4 +1,4 @@
-from common.consts import LITERATURE_PATH, SKILLS_PATH, DATA_PATH, RUN_PATH, ENV_KNOWLEDGE, ENV_NOTES
+from common.consts import LITERATURE_PATH, SKILLS_PATH, DATA_PATH, RUN_PATH, ENV_KNOWLEDGE, ENV_NOTES, USE_CASE_SKILL_REDIRECTS
 from systemprompts.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_SYSTEM_PROMPT_NO_SKILLS
 from systemprompts.planner import PLANNER_PROMPT, PLANNER_PROMPT_NO_SKILLS
 from systemprompts.context import PROJECT_LAYOUT
@@ -33,6 +33,20 @@ from trace_logger import tracer, extract_usage, message_to_dict
 from run_archiver import archive_run
 
 
+def _redirect_skill(rel_path: str) -> str:
+    """Rewrite use_cases/<key>/<agent> requests to a single consolidated skill file.
+
+    Used for side-by-side comparisons where one domain (e.g. cosmology) should
+    load one shared skill file for every agent instead of its per-agent files.
+    """
+    parts = rel_path.split("/")
+    if len(parts) >= 2 and parts[0] == "use_cases":
+        target = USE_CASE_SKILL_REDIRECTS.get(parts[1])
+        if target:
+            return target
+    return rel_path
+
+
 async def _read_skill(rel_path: str, agent_name: str, enabled: bool = True) -> str:
     """Read skills/<rel_path>.SKILL.md -- returns '' if disabled (condition A) or not found.
 
@@ -42,6 +56,7 @@ async def _read_skill(rel_path: str, agent_name: str, enabled: bool = True) -> s
     if not enabled:
         tracer.log_skill_load(agent_name, rel_path, found=False, suppressed=True)
         return ""
+    rel_path = _redirect_skill(rel_path)
     full = os.path.join(SKILLS_PATH, rel_path + ".SKILL.md")
     found = os.path.isfile(full)
     tracer.log_skill_load(agent_name, rel_path, found, suppressed=False)

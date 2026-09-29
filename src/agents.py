@@ -484,7 +484,7 @@ class Orchestrator(Agent):
         return state_update
 
     @action
-    async def agentic_workflow(self) -> None:
+    async def agentic_workflow(self) -> dict:
         async def route_orchestrator(state: AgentState) -> str:
             return state["next"]
 
@@ -522,4 +522,6 @@ class Orchestrator(Agent):
         graph.add_edge("explorer",  "orchestrator")
 
         app = graph.compile()
-        await app.ainvoke(self.agent_state)
+        # Return the final state: the entrypoint runs the explorer's post-run
+        # verification against it once the graph has finished.
+        return await app.ainvoke(self.agent_state)

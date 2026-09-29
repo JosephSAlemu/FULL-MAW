@@ -38,6 +38,11 @@ class AgentState(TypedDict):
     condition:             str              # ablation condition: "A" (no-skills), "B" (full), "C" (single-agent)
     domain:                str              # paper domain label, e.g. "cosmology"
                                             # used to look up use_cases/<domain>/* directly instead of keyword matching
+    explorer_summary:      str              # explorer's own closing summary of the run
+    run_succeeded:         bool             # user's answer to "has the workflow executed properly?"
+    reported_issue:        str              # user's description of the issue, when run_succeeded is False
+    skill_recommendations: list[dict]       # explorer's suggested skill-file edits
+    skill_edits_applied:   bool             # whether the user let the explorer append them
 
 
 class OrchestratorOutput(BaseModel):

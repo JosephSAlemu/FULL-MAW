@@ -93,6 +93,28 @@ Follow this flow unless you have a specific reason to deviate.
 
 ---
 
+## Requirements Hygiene (general rule)
+
+When reviewing the installer's `requirements.txt`:
+- **Reject stale cross-use-case packages.** Packages that belong to a different use
+  case usually mean a `requirements.txt` leaked through from a previous run. Approve
+  only what this run's `stack_decision`/use-case skill calls for.
+- **Never approve pip-installing a pre-built binary, private source, or native
+  in-tree extension** (see the use-case skill's Guidelines/Pitfalls). Those are not
+  pip packages and building them is a real installer risk. Reject with feedback.
+
+---
+
+## Job Submission Default and Exceptions (general rule)
+
+Default on HPC (see `knowledge/lcrc`): the agent never submits a *new* PBS job — it
+runs inside the existing interactive allocation. A use case may declare an explicit
+exception in its skill (e.g. a producer that only runs through its own batch script);
+when it does, do not flag that use case's `qsub` as a violation. Keep enforcing the
+default for every use case that has not declared an exception.
+
+---
+
 ## Two-Phase Installer Review
 
 The installer works in two phases requiring your explicit sign-off:

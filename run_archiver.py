@@ -24,7 +24,7 @@ from trace_schema import RunMetadata
 # Lives outside the repo: committing MCP_Approach should never drag run output
 # along, and the eventual Artifact ("single") approach will archive alongside
 # it under a sibling folder so the two never collide.
-ARCHIVE_ROOT = "/gpfs/fs1/home/jacob.oh/SULI/TEST_RUNS/mcp_approach"
+ARCHIVE_ROOT = "/lcrc/project/PEDAL/MAW/TEST_RUNS/mcp_approach"
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _WORK_DIR = os.path.join(_REPO_ROOT, "work", "run0")
@@ -89,6 +89,15 @@ def archive_run(metadata: RunMetadata, trace_path: str) -> str:
             shutil.copytree(_WORK_DIR, os.path.join(dest, "work"))
         if os.path.isfile(trace_path):
             shutil.copy2(trace_path, os.path.join(dest, "trace.json"))
+
+        # Post-run diagnosis output, written by the orchestrator when the user
+        # reported the run as unsuccessful. Absent on a clean run.
+        recs_path = os.path.join(
+            os.path.dirname(trace_path),
+            metadata.run_id + "_skill_recommendations.md",
+        )
+        if os.path.isfile(recs_path):
+            shutil.copy2(recs_path, os.path.join(dest, "skill_recommendations.md"))
 
         return dest
     except Exception as e:

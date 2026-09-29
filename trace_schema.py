@@ -134,12 +134,26 @@ class TokenUsageEvent(BaseEvent):
     model: str = ""
 
 
+class UserVerificationEvent(BaseEvent):
+    """The human's answer to 'has the workflow executed properly?' at end of run."""
+    type: Literal["user_verification"] = "user_verification"
+    succeeded: bool
+    reported_issue: str = ""
+
+
+class SkillRecommendationEvent(BaseEvent):
+    """Post-run diagnosis: proposed skill-file additions to prevent a repeat."""
+    type: Literal["skill_recommendation"] = "skill_recommendation"
+    root_cause: str
+    recommendations: list[dict] = []
+
+
 Event = Annotated[
     Union[
         AgentStartEvent, AgentInputEvent, AgentOutputEvent, AgentEndEvent,
         RoutingEvent, ToolCallEvent, SkillLoadEvent, LLMCallEvent,
         ReplanEvent, RunErrorEvent, ArtifactManifestEvent, MessageEvent,
-        TokenUsageEvent,
+        TokenUsageEvent, UserVerificationEvent, SkillRecommendationEvent,
     ],
     Field(discriminator="type"),
 ]
@@ -163,6 +177,10 @@ class RunMetadata(BaseModel):
     start_time: str
     end_time: Optional[str] = None
     final_status: Literal["completed", "failed", "timeout", "unknown"] = "unknown"
+    # The human's end-of-run verdict, separate from whether the graph ran to completion.
+    # None when the run never reached the verification prompt (e.g. it crashed).
+    user_verified: Optional[bool] = None
+    reported_issue: str = ""
     config_spec_ref: Optional[str] = None
     code_commit: Optional[str] = None
 

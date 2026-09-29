@@ -80,6 +80,24 @@ def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
 
 _SKILLS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
+# common.consts is dependency-free literals, so importing it here can't create the
+# circular import that forced ENV_NOTES to be duplicated below.
+from common.consts import USE_CASE_SKILL_REDIRECTS
+
+
+def _redirect_skill(rel_path: str) -> str:
+    """Rewrite use_cases/<key>/<agent> requests to a single consolidated skill file.
+
+    Used for side-by-side comparisons where one domain (e.g. cosmology) should
+    load one shared skill file for every agent instead of its per-agent files.
+    """
+    parts = rel_path.split("/")
+    if len(parts) >= 2 and parts[0] == "use_cases":
+        target = USE_CASE_SKILL_REDIRECTS.get(parts[1])
+        if target:
+            return target
+    return rel_path
+
 
 def _read_skill(rel_path: str, agent_name: str = "explorer", enabled: bool = True) -> str:
     """Read skills/<rel_path>.SKILL.md -- returns '' if disabled (condition A) or not found.
@@ -90,10 +108,13 @@ def _read_skill(rel_path: str, agent_name: str = "explorer", enabled: bool = Tru
     if not enabled:
         tracer.log_skill_load(agent_name, rel_path, found=False, suppressed=True)
         return ""
+    rel_path = _redirect_skill(rel_path)
     full = os.path.join(_SKILLS_ROOT, rel_path + ".SKILL.md")
     found = os.path.isfile(full)
     tracer.log_skill_load(agent_name, rel_path, found, suppressed=False)
     if found:
+        if rel_path not in _loaded_skills:
+            _loaded_skills.append(rel_path)
         with open(full) as f:
             return f.read()
     return ""
@@ -102,6 +123,11 @@ def _read_skill(rel_path: str, agent_name: str = "explorer", enabled: bool = Tru
 # set once per explorer run, lets the module-level load_skill tool see the
 # current condition even though it has no access to AgentState when the LLM calls it
 _current_condition: str = "B"
+
+# Skill paths actually read during this run, in first-load order. The post-run
+# review needs to know which domain file was in play so it can propose (and
+# optionally append) edits to the right file rather than guessing.
+_loaded_skills: list[str] = []
 
 # Mirrors agent_mcp.ENV_NOTES. Duplicated rather than imported to avoid a circular
 # import (agent_mcp imports `explorer` from this module).
@@ -518,6 +544,467 @@ the MCP server translates them to the correct local paths.
 """
 
 
+# __ Post-Run Skill Review _____________________________________________________
+
+SKILL_REVIEW_SYSTEM_PROMPT = """\
+You are the Explorer agent, reviewing the run you just finished. The user has told you
+the workflow did NOT execute properly. Your job is to work out the root cause from what
+you actually observed, and write what should be added to the domain skill file so the
+same problem does not happen on the next run.
+
+You are NOT fixing anything now and NOT re-running anything. You are writing durable
+guidance for future runs.
+
+---
+
+## What a skill file is
+
+A skill file is domain knowledge written for a scientist. It is not source code, and it
+is not a description of how this system is built internally. It tells a future run what
+tool to use, where the files are, what comes out, what goes wrong, and what the rules of
+the domain are.
+
+The domain skill file has these sections. Each has a strict purpose -- put your addition
+in the section it belongs to and nowhere else:
+
+| Section | What belongs in it | What does NOT belong in it |
+|---|---|---|
+| `Tools` | The name of the tool that gets run, where it lives on disk, whether it is already installed. | Pitfalls, output names, domain rules. |
+| `Input Parameters` | Which files hold the settings, where they live, which values are fixed and must not be invented, which input paths to use. | Descriptions of what the run produces, or of what went wrong. |
+| `Outputs` | Names, paths, formats, and plain-language descriptions of the files the run produces. | Anything about workflow type, orchestration, which stage failed, or what the tool is. |
+| `Pitfalls` | Things that tend to go wrong, in plain English, paired with what to do instead. | Source code, stack traces, function names, internal module names. |
+| `Guidelines` | Rules of the domain: what must never be rebuilt or reimplemented, what is closed-source or pre-built, what must not be edited, what must not be re-run, required conventions. | Step-by-step procedure, or anything belonging to another section. |
+
+---
+
+## Hard constraints on what you may write
+
+1. **No code.** No source code, snippets, or pseudocode. No function names, class names,
+   module or package import names, API signatures, command lines, flags, environment
+   variable names, or configuration keys.
+2. **No internal system details.** Nothing about agents, routing, orchestration, tool
+   calls, MCP, servers, state fields, or retries. The skill file describes the
+   scientific workflow, not the machinery running it.
+3. **Allowed technical content is exactly three things:**
+   - **Paths** -- where tools live, where inputs live, where outputs are written.
+   - **Inputs** -- which input files exist, what kind of file each is, what each holds.
+   - **Outputs** -- which output files are produced, what format each is, what each contains.
+4. **Errors are described in English, not pasted.** Say what the failure looks like to a
+   person ("the output folder is empty after the run", "the counts come out roughly ten
+   times too low"), never the literal error text, exit code, exception type, or traceback.
+5. **Prefer an existing section.** Only propose a new section when the guidance genuinely
+   fits none of the five. A new section is subject to every constraint above: it may not
+   be about code, software engineering, or computer science beyond paths, inputs, and
+   outputs.
+
+---
+
+## How to choose what to recommend
+
+- Anchor on the root cause, not the symptom. If the visible failure was a missing output
+  file but the real cause was a stage that ran in the wrong place, write about the cause.
+- Write guidance that generalizes to a different paper in the same domain.
+- Do not restate guidance the skill file already contains. If it already warns about this
+  and the run ignored it, say so in your rationale and sharpen the existing wording.
+- Keep each addition short and concrete: one or two sentences for a guideline, one table
+  row for a pitfall, one bullet for an output.
+- Match the formatting the target section already uses. If the section is a pitfalls
+  table, your addition must be a table row. If it is a bullet list, a bullet.
+- You ran this workflow yourself. Prefer what you actually observed over speculation.
+
+---
+
+Return ONLY a valid JSON object with exactly these keys:
+- root_cause:      str -- plain-language analysis of what actually went wrong
+- recommendations: list of objects, each with exactly these keys:
+    - skill_file:     str -- skill path to edit, e.g. "use_cases/<name>/domain"
+    - section:        str -- the exact section heading the addition goes under, without the leading '#'
+    - is_new_section: bool -- true only if this section does not already exist in that file
+    - addition:       str -- the exact markdown text to add, formatted to match the section
+    - rationale:      str -- why this addition prevents a repeat of the issue
+"""
+
+
+def _ask(prompt: str) -> str:
+    """Prompt the human on stdin. Blocking -- callers run it off the event loop."""
+    return input(prompt).strip()
+
+
+async def _ask_user(prompt: str) -> str:
+    """Prompt the human without blocking the running event loop."""
+    return await asyncio.to_thread(_ask, prompt)
+
+
+async def _ask_yes_no(prompt: str) -> bool:
+    """Ask a yes/no question, re-asking until the answer is unambiguous."""
+    while True:
+        answer = (await _ask_user(prompt)).lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        console.print("[yellow]Please answer 'yes' or 'no'.[/yellow]")
+
+
+def _domain_skill_candidates() -> list[str]:
+    """Skill paths loaded this run, domain/use-case files first.
+
+    The review targets a domain file by default; engine and environment skills are
+    still offered because an issue can genuinely belong to one of those instead.
+    """
+    use_cases = [p for p in _loaded_skills if p.startswith("use_cases/")]
+    others = [p for p in _loaded_skills if not p.startswith("use_cases/")]
+    return use_cases + others
+
+
+def _build_run_digest(state: dict, exploration_log: list, final_summary: str,
+                      max_chars: int = 40000) -> str:
+    """Flatten what happened this run into a readable narrative for the review.
+
+    Includes the planned tasks, every tool call with its result, and the explorer's
+    own closing summary. LLM prompt bodies are deliberately excluded: they are huge
+    and the decisions they produced are already visible in the tool calls.
+    """
+    lines = [
+        f"Goal: {state.get('goal', '')}",
+        f"Engine: {state.get('engine', '')} | Env: {state.get('env', '')} | "
+        f"Domain: {state.get('domain', '') or '(unset)'}",
+        f"Input data files: {', '.join(state.get('selected_data_files', [])) or '(none)'}",
+        "",
+    ]
+
+    if state.get("literature_findings"):
+        lines.append("Literature findings:")
+        lines += [f"  - {f}" for f in state["literature_findings"]]
+        lines.append("")
+
+    if state.get("tasks"):
+        lines.append("Planned tasks:")
+        lines += [f"  {i+1}. {t}" for i, t in enumerate(state["tasks"])]
+        lines.append("")
+
+    if _loaded_skills:
+        lines.append("Skill files loaded during the run: " + ", ".join(_loaded_skills))
+        lines.append("")
+
+    lines.append("Tool calls, in order:")
+    for e in exploration_log:
+        status = "OK" if e.get("succeeded") else "FAILED"
+        args = json.dumps(e.get("args", {}), default=str)[:400]
+        lines.append(f"  [iter {e.get('iteration')}] {e.get('tool')} [{status}] args={args}")
+        lines.append(f"      result: {str(e.get('result', ''))[:800]}")
+        if e.get("engine_verified") is False:
+            lines.append(f"      engine NOT verified (backend={e.get('engine_backend')})")
+
+    if final_summary:
+        lines += ["", "Explorer's own closing summary:", final_summary]
+
+    # Record what actually landed on disk -- "the file is missing" is usually the
+    # single most diagnostic fact available, and the log alone does not show it.
+    work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work")
+    if os.path.isdir(work_dir):
+        produced = []
+        for dirpath, _, filenames in os.walk(work_dir):
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                try:
+                    size = os.path.getsize(full)
+                except OSError:
+                    size = -1
+                produced.append(f"  {full} ({size} bytes)")
+        lines += ["", f"Files present under work/ after the run ({len(produced)}):"]
+        lines += produced[:200]
+
+    digest = "\n".join(lines)
+    if len(digest) > max_chars:
+        head, tail = digest[: max_chars // 2], digest[-max_chars // 2 :]
+        digest = f"{head}\n\n... [log truncated] ...\n\n{tail}"
+    return digest
+
+
+def _append_to_skill(rel_path: str, section: str, addition: str, is_new_section: bool) -> str:
+    """Append `addition` under `section` in skills/<rel_path>.SKILL.md.
+
+    Inserts at the end of the named section (just before the next heading of the same
+    or higher level) so the text lands inside the section it was written for, rather
+    than at the bottom of the file. Creates the section at the end when it is new.
+    Returns a status string describing what happened.
+    """
+    full = os.path.join(_SKILLS_ROOT, _redirect_skill(rel_path) + ".SKILL.md")
+    if not os.path.isfile(full):
+        return f"SKIPPED (no such skill file: {full})"
+
+    with open(full) as f:
+        lines = f.read().split("\n")
+
+    target = section.lstrip("#").strip().lower()
+
+    heading_idx = None
+    heading_level = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            level = len(stripped) - len(stripped.lstrip("#"))
+            if stripped.lstrip("#").strip().lower() == target:
+                heading_idx = i
+                heading_level = level
+                break
+
+    if heading_idx is None:
+        if not is_new_section:
+            # The model named a section that isn't there. Adding it silently would
+            # contradict its own is_new_section=False, so make the new heading visible.
+            note = f"(section '{section}' was not found; added as a new section)"
+        else:
+            note = ""
+        while lines and not lines[-1].strip():
+            lines.pop()
+        # Match the separator style the file already uses between top-level sections.
+        block = ["", "---", "", f"# {section.lstrip('#').strip()}", "", addition.rstrip()]
+        if not any(ln.strip() == "---" for ln in lines[3:]):
+            block = ["", f"# {section.lstrip('#').strip()}", "", addition.rstrip()]
+        lines += block
+        with open(full, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        return f"APPENDED as new section '{section}' {note}".strip()
+
+    # Find where this section ends: the next heading at the same or higher level.
+    end = len(lines)
+    for j in range(heading_idx + 1, len(lines)):
+        stripped = lines[j].strip()
+        if stripped.startswith("#"):
+            level = len(stripped) - len(stripped.lstrip("#"))
+            if level <= heading_level:
+                end = j
+                break
+
+    # Back off past trailing blanks and any '---' rule that separates sections, so
+    # the addition stays inside this section instead of landing under the divider.
+    insert_at = end
+    while insert_at > heading_idx + 1 and (
+        not lines[insert_at - 1].strip() or lines[insert_at - 1].strip() == "---"
+    ):
+        insert_at -= 1
+
+    lines[insert_at:insert_at] = [addition.rstrip()]
+    with open(full, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return f"APPENDED under existing section '{section}'"
+
+
+async def post_run_review(state: dict) -> dict:
+    """Run the explorer's end-of-run verification exactly once, after the graph finishes.
+
+    Called by the entrypoint rather than from inside the explorer node: the
+    orchestrator can route back to the explorer several times, and the user should
+    be asked about the run as a whole, once, not once per pass.
+
+    Never raises -- a failed review must not take down an otherwise finished run.
+    """
+    llm = ChatOpenAI(
+        model=os.getenv("CODER_MODEL_NAME", os.getenv("MODEL_NAME")),
+        streaming=True,
+        stream_usage=True,
+    )
+    try:
+        return await _post_run_skill_review(
+            state,
+            state.get("exploration_log", []),
+            state.get("explorer_summary", ""),
+            llm,
+        )
+    except Exception as e:
+        console.print(f"[red][explorer] post-run review failed: {e}[/red]")
+        return {}
+
+
+async def _post_run_skill_review(state: dict, exploration_log: list,
+                                 final_summary: str, llm) -> dict:
+    """Ask the user whether the run worked; on 'no', propose and optionally apply skill edits.
+
+    Returns the state fields describing the outcome. Never raises -- a failure to
+    review must not take down an otherwise finished run.
+    """
+    console.print(Panel(
+        "The workflow has finished. Confirm the result before the run is closed out.",
+        title="[bold cyan]Run Verification[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    succeeded = await _ask_yes_no("Has the workflow executed properly? (yes/no): ")
+    if succeeded:
+        console.print("[green][explorer] Confirmed -- closing out the run.[/green]")
+        tracer.log_user_verification(True, "")
+        return {"run_succeeded": True, "reported_issue": "", "skill_recommendations": []}
+
+    issue = ""
+    while not issue:
+        issue = await _ask_user("What issue occurred with the workflow? ")
+        if not issue:
+            console.print("[yellow]Please describe the issue so it can be diagnosed.[/yellow]")
+    tracer.log_user_verification(False, issue)
+
+    console.print("\n[dim cyan][explorer] reviewing the run against the reported issue...[/dim cyan]")
+
+    candidates = _domain_skill_candidates()
+    # Condition A withholds skill content by design; don't surface it here either.
+    # The review still runs, just without knowing what the files already say.
+    enabled = state.get("condition", "B") != "A"
+
+    current = ""
+    if enabled and candidates:
+        blocks = []
+        for rel in candidates:
+            path = os.path.join(_SKILLS_ROOT, _redirect_skill(rel) + ".SKILL.md")
+            if os.path.isfile(path):
+                with open(path) as f:
+                    blocks.append(f"--- skills/{_redirect_skill(rel)}.SKILL.md ---\n{f.read()}")
+        if blocks:
+            current = ("\n\n=== Current contents of the skill files used this run ===\n"
+                       "Do not duplicate guidance already present; sharpen it instead.\n\n"
+                       + "\n\n".join(blocks))
+
+    targets = ("\n\nSkill files loaded this run (target one of these):\n"
+               + "\n".join(f"  - {_redirect_skill(c)}" for c in candidates)) if candidates else ""
+
+    human = (
+        f"The user reports the workflow did not execute properly.\n\n"
+        f"=== Issue reported by the user ===\n{issue}\n\n"
+        f"=== Full record of the run ===\n"
+        f"{_build_run_digest(state, exploration_log, final_summary)}"
+        f"{current}{targets}"
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            llm.invoke,
+            [SystemMessage(content=SKILL_REVIEW_SYSTEM_PROMPT),
+             HumanMessage(content=human)],
+        )
+    except Exception as e:
+        console.print(f"[red][explorer] skill review call failed: {e}[/red]")
+        return {"run_succeeded": False, "reported_issue": issue, "skill_recommendations": []}
+
+    text = result.content if hasattr(result, "content") else str(result)
+    usage = extract_usage(result) or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    tracer.log_llm_call("explorer", getattr(llm, "model_name", ""),
+                        [{"role": "system", "content": "<skill review>"},
+                         {"role": "human", "content": human[:4000]}],
+                        text, input_tokens=usage["input_tokens"],
+                        output_tokens=usage["output_tokens"],
+                        total_tokens=usage["total_tokens"])
+
+    import re as _re
+    match = _re.search(r"\{.*\}", text, _re.DOTALL)
+    if not match:
+        console.print("[yellow][explorer] skill review returned no parseable JSON.[/yellow]")
+        return {"run_succeeded": False, "reported_issue": issue, "skill_recommendations": []}
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        console.print(f"[yellow][explorer] could not parse skill review JSON: {e}[/yellow]")
+        return {"run_succeeded": False, "reported_issue": issue, "skill_recommendations": []}
+
+    root_cause = parsed.get("root_cause", "")
+    recs = [r for r in parsed.get("recommendations", []) if isinstance(r, dict)]
+
+    body = f"[bold]Root cause[/bold]\n{root_cause}"
+    for i, rec in enumerate(recs, 1):
+        tag = " [magenta](new section)[/magenta]" if rec.get("is_new_section") else ""
+        body += (f"\n\n[bold]{i}. skills/{rec.get('skill_file')}.SKILL.md"
+                 f" -> {rec.get('section')}{tag}[/bold]\n"
+                 f"[green]{rec.get('addition', '')}[/green]\n"
+                 f"[dim]Why: {rec.get('rationale', '')}[/dim]")
+    if not recs:
+        body += "\n\n[yellow]No skill-file change recommended for this issue.[/yellow]"
+    console.print(Panel(body, title="[bold magenta]Suggested Skill Edits[/bold magenta]",
+                        border_style="magenta"))
+
+    applied = False
+    if recs:
+        apply = await _ask_yes_no(
+            "\nApply these edits to the skill file(s) automatically? (yes/no): ")
+        if apply:
+            for rec in recs:
+                status = _append_to_skill(
+                    rec.get("skill_file", ""), rec.get("section", ""),
+                    rec.get("addition", ""), bool(rec.get("is_new_section")),
+                )
+                rec["applied"] = status
+                console.print(f"[green][explorer] {rec.get('skill_file')}: {status}[/green]")
+            applied = True
+        else:
+            console.print("[dim][explorer] Edits not applied -- they remain in the trace "
+                          "and the recommendations file.[/dim]")
+
+    _write_recommendations_file(state, root_cause, recs, issue, applied)
+
+    tracer.log_skill_recommendation(root_cause, recs)
+    return {
+        "run_succeeded": False,
+        "reported_issue": issue,
+        "skill_recommendations": recs,
+        "skill_edits_applied": applied,
+    }
+
+
+def _write_recommendations_file(state: dict, root_cause: str, recs: list,
+                                issue: str, applied: bool) -> None:
+    """Save the review next to the run log so it survives the terminal session."""
+    run_log = state.get("run_log") or ""
+    if not run_log:
+        runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+        run_id = getattr(tracer.run_metadata, "run_id", "") if tracer.run_metadata else ""
+        if not run_id:
+            return
+        run_log = os.path.join(runs_dir, run_id + ".jsonl")
+
+    path = os.path.splitext(run_log)[0] + "_skill_recommendations.md"
+    lines = [
+        "# Skill Recommendations",
+        "",
+        f"Generated: {time.strftime('%Y-%m-%dT%H:%M:%S')}",
+        f"Applied automatically: {'yes' if applied else 'no'}",
+        "",
+        "## Issue reported by the user",
+        "",
+        issue or "(none given)",
+        "",
+        "## Root cause",
+        "",
+        root_cause or "(none given)",
+        "",
+        "## Proposed additions",
+        "",
+    ]
+    if not recs:
+        lines.append("No skill-file change recommended for this issue.")
+    for i, rec in enumerate(recs, 1):
+        tag = " (NEW SECTION)" if rec.get("is_new_section") else ""
+        lines += [
+            f"### {i}. `skills/{rec.get('skill_file')}.SKILL.md` -> `{rec.get('section')}`{tag}",
+            "",
+            "Add:",
+            "",
+            "```markdown",
+            rec.get("addition", ""),
+            "```",
+            "",
+            f"Why: {rec.get('rationale', '')}",
+        ]
+        if rec.get("applied"):
+            lines.append(f"Status: {rec['applied']}")
+        lines.append("")
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        console.print(f"[dim]Skill recommendations written: {path}[/dim]")
+    except OSError as e:
+        console.print(f"[yellow][explorer] could not write recommendations file: {e}[/yellow]")
+
+
 # __ Explorer Node _____________________________________________________________
 
 def explorer(state: dict) -> dict:
@@ -703,6 +1190,7 @@ async def _explorer_async(state: dict, engine: str) -> dict:
         max_iterations = 100
         exploration_log = []
         iteration = 0
+        final_message = ""
 
         _MAX_TOOL_RESULT_CHARS = 8_000  # cap per tool result added to messages
         _CONTEXT_WINDOW        = 20     # message slots kept beyond system + human
@@ -742,8 +1230,11 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                                        model=getattr(llm, "model_name", ""))
 
             if not response.tool_calls:
+                # This closing message is the explorer's own account of what it did
+                # and what failed. The post-run review reads it back as evidence.
+                final_message = response.content if response.content else ""
                 console.print(Panel(
-                    response.content[:3000] if response.content else "(no content)",
+                    final_message[:3000] if final_message else "(no content)",
                     title="[bold green]Explorer Complete[/bold green]",
                     border_style="green",
                 ))
@@ -979,9 +1470,15 @@ async def _explorer_async(state: dict, engine: str) -> dict:
             "failures": failures,
             "iterations": iteration + 1,
         })
+
         tracer.log_agent_end("explorer")
 
+        # The orchestrator may route back here for another pass, so the post-run
+        # review does NOT happen inline -- it would prompt the user once per pass.
+        # It runs once after the graph finishes, via post_run_review(). Carry the
+        # closing summary forward so that review can read it back as evidence.
         return {
             "exploration_log": exploration_log,
             "current_step": "explorer_complete",
+            "explorer_summary": final_message,
         }

@@ -38,7 +38,8 @@ from trace_schema import (
     AgentStartEvent, AgentInputEvent, AgentOutputEvent, AgentEndEvent,
     RoutingEvent, ToolCallEvent, SkillLoadEvent, LLMCallEvent,
     ReplanEvent, RunErrorEvent, ArtifactManifestEvent, MessageEvent,
-    TokenUsageEvent, RunMetadata, TraceFile,
+    TokenUsageEvent, UserVerificationEvent, SkillRecommendationEvent,
+    RunMetadata, TraceFile,
 )
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -197,6 +198,22 @@ class TraceLogger:
             total_tokens=total_tokens, model=model,
             elapsed_s=self._elapsed(), timestamp=self._now(),
         )
+        self.events.append(event.model_dump())
+
+    def log_user_verification(self, succeeded: bool, reported_issue: str = ""):
+        """Record the human's end-of-run answer to 'did the workflow execute properly?'."""
+        event = UserVerificationEvent(succeeded=succeeded, reported_issue=reported_issue or "",
+                                       elapsed_s=self._elapsed(), timestamp=self._now())
+        self.events.append(event.model_dump())
+        if self.run_metadata is not None:
+            self.run_metadata.user_verified = succeeded
+            self.run_metadata.reported_issue = reported_issue or ""
+
+    def log_skill_recommendation(self, root_cause: str, recommendations: list[dict]):
+        """Record the post-run diagnosis and the skill-file additions it proposes."""
+        event = SkillRecommendationEvent(root_cause=root_cause,
+                                          recommendations=recommendations or [],
+                                          elapsed_s=self._elapsed(), timestamp=self._now())
         self.events.append(event.model_dump())
 
     def log_message(self, from_agent: str, to_agent: str, message: str):
