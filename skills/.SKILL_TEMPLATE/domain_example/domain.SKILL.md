@@ -39,8 +39,6 @@ Things that tend to go wrong, and what to do instead. Once the workflow exits an
 
 Any rules or things to know about your domain or workflow.
 > Examples:
-> - This simulation has to be launched as its own job on the supercomputer (a `qsub` submission), and the
->   picture should be made in that same job.
 > - Don't change the original settings files — make a copy if a change is needed.
-> - The files already sitting in the output folder are from an old run; ignore them.
 > - Do multiple runs with modified temperatures for cosmology
+> - The tool we are using is a binary or script, do NOT rebuild it in python!
