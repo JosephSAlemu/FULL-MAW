@@ -180,6 +180,45 @@ def submit_shell_task(name: str, command: str, work_dir: str = "/app/work/run0",
 
 
 @tool
+def write_workflow(python_code: str, filename: str = "workflow.py") -> str:
+    """Write the single standalone Parsl workflow file that performs ALL the work.
+
+    Parsl runs only what this file expresses. Write ONE file in which every unit
+    of work is a decorated function:
+      - `@bash_app`   -- ANY command-line/MPI invocation. The function body returns
+                         the command string; Parsl executes it. You never run it.
+      - `@python_app` -- pure Python work (analysis, plotting, writing files).
+
+    The file must build its own Parsl Config, call `parsl.load(config)`, invoke the
+    apps, resolve futures with `.result()`, and `parsl.clear()` at the end.
+
+    The server rejects the file if it has no apps, never calls parsl.load, imports
+    or calls subprocess/os.system/os.popen, or puts mpirun/srun outside a @bash_app.
+
+    Args:
+        python_code: Full contents of the Parsl driver file
+        filename: Bare .py filename written under /app/work/run0 (default: workflow.py)
+    """
+    return _call_mcp_tool("write_workflow", {
+        "python_code": python_code, "filename": filename,
+    })
+
+
+@tool
+def run_workflow(filename: str = "workflow.py", timeout: int = 7200) -> str:
+    """Execute the Parsl workflow file previously created with write_workflow.
+
+    The server launches the file; the Parsl runtime inside it schedules every
+    @bash_app and @python_app step. Call this after write_workflow succeeds.
+
+    Args:
+        filename: Workflow filename under /app/work/run0 (default: workflow.py)
+        timeout: Max seconds to wait (default: 7200)
+    """
+    return _call_mcp_tool("run_workflow", {"filename": filename, "timeout": timeout})
+
+
+@tool
 def get_task_status(task_id: str) -> str:
     """Get the current status of a submitted task.
 
@@ -355,6 +394,59 @@ _KNOWLEDGE_SKILLS = {
     "hpc":   "knowledge/lcrc",
 }
 
+# Per-engine execution contract, appended to the system prompt. Each engine binds
+# a different set of execution tools (_ENGINE_EXEC_TOOLS), so the prompt has to
+# say which ones actually exist for this run rather than listing all of them.
+_ENGINE_EXEC_PROMPTS = {
+    "parsl": """\
+## How You Execute Work (parsl -- generated file only)
+
+You have exactly two execution tools: `write_workflow` and `run_workflow`.
+There is no submit_task, no submit_shell_task, no submit_mpi_task, no run_lammps.
+They do not exist on this server. Do not attempt to call them.
+
+1. `write_workflow(python_code=..., filename="workflow.py")` -- write ONE
+   standalone Parsl driver file containing EVERY step of the workflow.
+2. `run_workflow(filename="workflow.py")` -- the server executes that file.
+
+In that file, every unit of work is a decorated function:
+
+- `@bash_app` for ANY command-line work (simulation binaries, MPI runs, file
+  conversion). The function body returns the command **string**; Parsl runs it.
+  An 8-rank MPI run is a @bash_app returning `f"mpirun -n 8 {exe} {params}"`.
+- `@python_app` for pure Python work (analysis, plotting, writing summaries).
+
+Both kinds of app live in the SAME file. A simulation plus its visualization is
+one file with a @bash_app and a @python_app, not two files and not two tools.
+
+The file must build its own Parsl `Config`, call `parsl.load(config)`, invoke the
+apps, resolve futures with `.result()`, and call `parsl.clear()` at the end. This
+is the one place you DO write Parsl config code yourself.
+
+Forbidden inside the generated file (the server rejects the file if present):
+`import subprocess`, `subprocess.run/Popen`, `os.system`, `os.popen`, and any
+`mpirun`/`srun`/`mpiexec` string outside a `@bash_app` body.
+
+If `write_workflow` rejects your file, read the `errors` list, fix the file, and
+call `write_workflow` again. Do not try to route around it with another tool.
+""",
+}
+
+
+def _engine_exec_prompt(engine: str) -> str:
+    """Execution-contract text for this engine, or the legacy submit_* contract."""
+    return _ENGINE_EXEC_PROMPTS.get(engine, """\
+## How You Execute Work
+
+- `submit_task` -- run Python code (scientific computation, analysis, plotting)
+- `submit_shell_task` -- run shell commands (cp, mkdir, ls)
+- `submit_mpi_task` -- run an MPI-capable command, only once get_resources
+  confirms in_pbs=true
+- `run_lammps` -- call directly for LAMMPS; never reimplement it with submit_task
+
+Track task_ids from submit_task results and use depends_on for dependencies.
+""")
+
 # engine-specific skills, force-loaded into the system prompt in _explorer_async
 # instead of leaving it to load_skill (systems/<engine>, knowledge/<ENGINE>)
 _ENGINE_SKILLS = {
@@ -365,7 +457,7 @@ _ENGINE_SKILLS = {
 
 _ENGINE_RELEVANT_TOOLS = (
     "submit_task", "submit_shell_task", "submit_mpi_task", "write_bp", "read_bp",
-    "run_lammps",
+    "run_lammps", "run_workflow",
 )
 
 
@@ -429,24 +521,39 @@ def load_skill(name: str) -> str:
     return content or ENV_NOTES.get(name, ENV_NOTES["local"])
 
 
-# Tools available to the explorer regardless of engine
-EXPLORER_TOOLS = [
-    submit_task, submit_shell_task,
+# Inspection/environment tools every engine exposes. These never execute
+# workflow work, they only observe it or prepare the venv.
+_COMMON_TOOLS = [
     get_task_status, get_task_result, list_tasks,
     install_package, check_package,
     list_files, read_file,
-    get_resources, submit_mpi_task, run_lammps, load_skill,
+    get_resources, load_skill,
 ]
 
-# only adios_server.py implements write_bp/read_bp, no point showing these
-# to the model on parsl/pycompss runs
-_ENGINE_EXTRA_TOOLS = {
-    "adios": [write_bp, read_bp],
+# Execution tools, which differ by engine.
+#
+# parsl is generated-file only: the agent writes one Parsl driver where every step
+# is a @bash_app or @python_app, then runs that file. It gets no submit_* tools and
+# no run_lammps, because each of those let the agent hand the server a command or
+# code string to execute -- the exact bypass this model removes. parsl_server.py
+# does not implement them any more either.
+#
+# pycompss and adios still use the older submit_* model and are unchanged.
+_ENGINE_EXEC_TOOLS = {
+    "parsl":    [write_workflow, run_workflow],
+    "pycompss": [submit_task, submit_shell_task, submit_mpi_task, run_lammps],
+    "adios":    [submit_task, submit_shell_task, submit_mpi_task, run_lammps,
+                 write_bp, read_bp],
 }
+
+_DEFAULT_EXEC_TOOLS = [submit_task, submit_shell_task, submit_mpi_task, run_lammps]
+
+# Kept for callers/tests that imported the old flat list.
+EXPLORER_TOOLS = _COMMON_TOOLS + _DEFAULT_EXEC_TOOLS
 
 
 def _tools_for_engine(engine: str) -> list:
-    return EXPLORER_TOOLS + _ENGINE_EXTRA_TOOLS.get(engine, [])
+    return _COMMON_TOOLS + _ENGINE_EXEC_TOOLS.get(engine, _DEFAULT_EXEC_TOOLS)
 
 
 # __ Explorer System Prompt ____________________________________________________
@@ -466,13 +573,14 @@ adapting your approach when things fail.
 
 ## Available Tools
 
+The exact execution tools you have depend on this run's engine -- use the ones
+actually bound for you, listed in the engine reference section below. These are
+always available:
+
 | Tool | When to use |
 |---|---|
 | get_resources | **Call first.** Detects nodes/ranks/launcher (in_pbs true/false) |
 | load_skill | Load "local" or "hpc" environment knowledge -- pick ONE based on get_resources |
-| submit_task | Execute Python code (LAMMPS, OVITO, plotting, data processing) |
-| submit_shell_task | Run shell commands (cp, mkdir, ls, file operations) |
-| submit_mpi_task | Run an MPI-capable command (only if get_resources says in_pbs=true) |
 | get_task_status | Check if a previously submitted task is done |
 | get_task_result | Get full stdout/stderr from a completed task |
 | list_tasks | See all tasks and their statuses |
@@ -486,27 +594,27 @@ adapting your approach when things fail.
 1. Call get_resources first. Then call load_skill("hpc") if in_pbs is true, or
    load_skill("local") if it is false -- load only the one that matches.
 2. Review the tasks list and plan your execution order
-3. Before running a task, check prerequisites (files exist, packages installed)
-4. Use submit_shell_task for file operations (copy, mkdir)
-5. Use submit_task for Python code (scientific computation, analysis, plotting)
-6. Use submit_mpi_task instead of submit_task/submit_shell_task for MPI-capable
-   executables, but only once get_resources has confirmed in_pbs=true
-7. After each task, verify output (list_files, read_file)
-8. If a task fails, diagnose and fix (install package, change code, retry)
-9. Track task IDs -- use depends_on when tasks have dependencies
+3. Before running anything, check prerequisites (files exist, packages installed)
+4. Express and run the work using this engine's execution tools (see below)
+5. After execution, verify output (list_files, read_file)
+6. If something fails, diagnose and fix (install package, change code, retry)
 
 ## Rules
 
-- Execute tasks in dependency order
-- Always verify output after each task
+- Always verify output after execution
 - Max 3 retries per task before giving up -- then MOVE ON to the next task
 - Do NOT spend more than 3 attempts debugging any single issue (e.g. Qt rendering, display errors)
 - If a visualization/rendering task fails due to display/Qt/GUI issues, SKIP it and move to the next task
-- Use submit_task for Python code (ALL imports inside the script)
-- Use submit_shell_task for shell commands
-- Track task_ids from submit_task results for dependency chains
 - When all executable tasks are done, STOP and provide your final summary -- do not keep retrying failed tasks
 - Report what you accomplished and what failed in your final message
+
+## You Never Execute Anything Yourself
+
+Whatever the engine, you do not run code or commands -- the workflow engine does.
+You never open a subprocess, never invoke a CLI directly, never write or run a
+bash/PBS script, and never call `mpirun`/`srun` yourself. Every command-line
+invocation must be expressed to the engine as a command *string* that the engine
+executes on your behalf.
 
 ## Scientific Integrity Rules (CRITICAL)
 
@@ -1146,10 +1254,15 @@ async def _explorer_async(state: dict, engine: str) -> dict:
         system_prompt = EXPLORER_SYSTEM_PROMPT
         if _base_skill:
             system_prompt = _base_skill + "\n\n---\n\n" + system_prompt
+
+        # the execution contract differs per engine, so it goes in before the
+        # reference material -- the model needs to know which tools exist first
+        system_prompt += "\n\n" + _engine_exec_prompt(engine)
+
         if _engine_skill:
             system_prompt += (
                 f"\n\n--- {engine.upper()} Engine Reference (REQUIRED -- read before "
-                f"calling submit_task/submit_shell_task) ---\n\n"
+                f"calling any execution tool) ---\n\n"
                 f"This run's workflow engine is {engine}. Whether you actually exercise "
                 f"its real API is recorded in the trace, not just whether you import it.\n\n"
                 f"{_engine_skill}"

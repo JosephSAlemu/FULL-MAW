@@ -3,10 +3,9 @@ name: use_cases/cosmology/planner
 description: >
   Cosmology (HACC) extraction rules for the planner. Covers what parameters to
   extract from cosmological N-body papers (Last Journey / HACC), the correct
-  stack_decision for this project, the real-qsub exception (producer AND
-  analysis/visualization written directly into one generated PBS script, submitted
-  once -- never developed against pre-existing sample output), and MCP-style task
-  templates for the pipeline.
+  stack_decision for this project, the one-workflow rule (producer AND
+  analysis/visualization handed to the engine together -- never developed against
+  pre-existing sample output), and task templates for the pipeline.
 ---
 
 # Cosmology (HACC) — Planner Skill
@@ -25,11 +24,11 @@ Last Journey, FOF/SOD halo finding, or the goal references
 
 ## The Simulation Is a Private Black Box
 
-The `hacc_tpm` executable is closed-source. Tasks must have the explorer build a PBS
-batch script that runs the existing binary and then the analysis/rendering script,
-submitting both in one `qsub` call, and read its output — never write tasks that ask
-the explorer to "reimplement", "recreate", or "regenerate" the simulation logic in
-Python. v1 scope is strictly "call the existing binary, read its output."
+The `hacc_tpm` executable is closed-source. Tasks must have the explorer run the
+existing binary through the workflow engine and then analyze its output — never
+write tasks that ask the explorer to "reimplement", "recreate", or "regenerate" the
+simulation logic in Python. v1 scope is strictly "call the existing binary, read its
+output."
 
 ---
 
@@ -74,23 +73,25 @@ these are needed, and `pygio`/HACC binaries are not pip-installable in the first
 
 ---
 
-## Architectural Exception: This Use Case May `qsub`
+## No `qsub` Exception — The Engine Runs the Producer
 
-Unlike every other use case, a task here is allowed to instruct the explorer to submit
-a **real, new PBS batch job** via `qsub` (even from inside an already-running
-interactive allocation) — because the simulation only runs through its own batch
-script. State this explicitly in the relevant task rather than relying on the
-explorer/orchestrator to infer it.
+There used to be an exception here letting this use case submit a real new PBS batch
+job. **That is gone.** This use case now follows the same rule as every other one:
+never submit a new PBS job, never write a `.pbs` or `.sh` script, and never instruct
+the explorer to call `qsub`/`qstat`. The run is already inside an allocation, and the
+workflow engine launches the producer.
 
-Critically, this must be **one job that does both stages**: the generated script runs
-`hacc_tpm` and then, immediately after, the analysis/rendering script — submitted with
-a single `qsub` call. Never write tasks that have the explorer submit the producer via
-`qsub` and then separately re-run analysis/visualization afterward from the live
-session; that's two executions, not one job. The explorer must **build the batch
-script itself** rather than submitting the pre-existing `subme.pbs` unmodified — write
-tasks that say so explicitly, and carry forward `WALLTIME`/`NRANKS` values (default
-`01:00:00` / `8` unless the paper or user's goal specifies otherwise) for the explorer
-to bake into the script it writes.
+The producer and the analysis/visualization are still **one workflow that does both
+stages**, handed to the engine together — the simulation runs, and the analysis runs
+after it, with the ordering expressed as a dependency rather than by polling a job
+queue. Never write tasks that run the producer and then separately re-run
+analysis/visualization as an unrelated execution.
+
+Carry forward the `NRANKS` value (default `8` unless the paper or user's goal
+specifies otherwise) as the rank count the producer must run with. `WALLTIME` is no
+longer meaningful — there is no batch job to request a walltime for. Read
+`subme.pbs` only as a reference for the executable/env/param paths; never submit or
+adapt it.
 
 **Never write a task that has the explorer read, parse, or render from
 `output/full_snapshots/`/`analysis/haloproperties/` content before this run's own
@@ -101,11 +102,10 @@ documented GenericIO format, mass formula, and halo-selection rules (see the
 explorer skill), informed by this run's own `params/indat.params` (config, not
 output) — not by testing the code against old data first.
 
-If the analysis stage fails after the job runs, the recovery task should have the
-explorer fix `analyze_and_render.py` and re-run it directly (via `submit_shell_task`,
-not a new `qsub`) against *this run's own* fresh output that the producer already
-wrote — never resubmit the whole PBS job just to fix an analysis bug, and never fall
-back to old data from another run.
+If the analysis stage fails after the producer has run, the recovery task should have
+the explorer fix the analysis and run **only that step** against *this run's own*
+fresh output that the producer already wrote — never repeat the expensive producer
+just to fix an analysis bug, and never fall back to old data from another run.
 
 ---
 
@@ -123,83 +123,73 @@ back to old data from another run.
    cosmotools-config.dat for this run's actual config values (FOF linking length,
    SOD Delta, RL, NG). Do not fabricate config values not present in these files."
 
-3. "Write /app/work/run0/analyze_and_render.py directly, using real absolute paths
-   (not /app/ shortcuts — this script runs standalone, invoked by the PBS job).
-   Base it on the documented GenericIOPrint format and halo-selection rules (see
-   the explorer skill): read the particle snapshot (parse x,y,z,vx,vy,vz,phi,
-   compute mass from Omega_m/rho_crit0/RL/NP), read the halo catalog (parse the
-   tab-separated header for column order, select most massive halo by
-   sod_halo_mass excluding sod_halo_count == -101), compute a 4 Mpc/h-thick xy
-   density slice centered on the halo's z, render with matplotlib (LogNorm),
-   write summary.txt. Do not develop or test this against any pre-existing
-   snapshot/halo catalog content — those paths won't have this run's real data
-   until the producer below has executed."
+3. "Run the HACC producer: hacc_tpm on 8 MPI ranks against params/indat.params,
+   with the env file sourced before the executable in the same invocation and
+   SampleRun_go/ as the working directory so ./params/indat.params resolves.
+   This is a command-line step — the workflow engine runs it. Do not write a PBS
+   or shell script, and do not call qsub. Use subme.pbs only as a reference for
+   the executable, env file, and param file paths; never modify or submit it."
 
-3a. "IF `--engine adios` WAS SELECTED (this is its own required task, not optional):
-   analyze_and_render.py MUST `import adios2` and use `adios2.Stream` — not `.npz`
-   — for `particles_step<N>.bp` (write x,y,z,vx,vy,vz,phi,mass with `stream.write`,
-   then re-open the file and read them back with `stream.read` before using them)
-   and `density_slice.bp` (write the computed grid with `stream.write`, then read
-   it back with `stream.read` before passing it to matplotlib). Do this before
-   moving on to the PBS script below — do not defer it or treat it as an
-   enhancement to add if time allows."
+4. "Dump the particle snapshot and the halo catalog to text with the GenericIOPrint
+   CLI tool, redirecting each to a file under /app/work/run0/. These are
+   command-line steps run by the engine, ordered after the producer — pygio is not
+   built and must not be used, and GenericIOPrint must not be called via subprocess."
 
-4. "Build a PBS batch script yourself (do not submit subme.pbs unmodified) — use
-   subme.pbs only as a reference for the executable/env/param paths. Use
-   WALLTIME=<walltime, default 01:00:00> and NRANKS=<ranks, default 8>. The script
-   must run hacc_tpm and then, immediately after, invoke analyze_and_render.py via
-   the venv's absolute python3 path — one script, both stages. Write it to
-   /app/work/run0/agent_subme.pbs, copy it into
-   /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/agent_subme.pbs, then submit via
-   submit_shell_task: cd into SampleRun_go/ and run `qsub agent_subme.pbs` from that
-   directory so $PBS_O_WORKDIR resolves correctly (real qsub is explicitly allowed for
-   this use case). Capture and report the returned job ID. Do not modify subme.pbs."
+5. "Analyze and render, ordered after the dumps: parse the snapshot dump
+   (x,y,z,vx,vy,vz,phi; compute mass from Omega_m/rho_crit0/RL/NP), parse the halo
+   catalog dump (read the tab-separated header for column order, select the most
+   massive halo by sod_halo_mass excluding sod_halo_count == -101), compute a
+   4 Mpc/h-thick xy density slice centered on that halo's z, render it with
+   matplotlib using LogNorm (Agg backend, headless), and write summary.txt.
+   Outputs go to /app/work/run0/. Do not develop or test this against any
+   pre-existing snapshot/halo content — those paths won't hold this run's real
+   data until the producer has executed."
 
-5. "Poll the job with `qstat <job_id>` via submit_shell_task until it reaches a
-   completed state. Use a fixed 60-second interval between polls (e.g. `sleep 60 &&
-   qstat <job_id>`) — do not busy-loop, and do not grow the interval between polls;
-   submit_shell_task blocks for the full sleep, so a longer interval just wastes
-   wall-clock time."
+5a. "IF `--engine adios` WAS SELECTED (this is its own required task, not optional):
+   the analysis MUST `import adios2` and use `adios2.Stream` — not `.npz` — for
+   `particles_step<N>.bp` (write x,y,z,vx,vy,vz,phi,mass with `stream.write`, then
+   re-open the file and read them back with `stream.read` before using them) and
+   `density_slice.bp` (write the computed grid, then read it back before passing it
+   to matplotlib). Do not defer this or treat it as an enhancement to add if time
+   allows."
 
-5a. "IF `--engine adios` WAS SELECTED: use `list_files` on /app/work/run0/ to confirm
-   `particles_step<N>.bp` and `density_slice.bp` exist. If either is missing,
-   analyze_and_render.py did not actually use `adios2.Stream` as required by task
-   3a — go back and fix it (add the real `stream.write`/`stream.read` calls), then
-   re-run the analysis stage directly via submit_shell_task against this run's
-   already-produced output. Do not report the run as complete with `.npz` in
+6. "Verify the workflow's output: confirm dm_density_slice.png and summary.txt exist
+   in /app/work/run0/ and report them. If they're missing, read the workflow's
+   stderr: if hacc_tpm itself failed, fix the cause and re-run; if only the analysis
+   failed, fix it and re-run ONLY the analysis step against this run's own fresh
+   producer output — do not repeat the producer just for an analysis bug, and do not
+   fall back to old data from another run."
+
+6a. "IF `--engine adios` WAS SELECTED: confirm `particles_step<N>.bp` and
+   `density_slice.bp` exist in /app/work/run0/. If either is missing, the analysis
+   did not actually use `adios2.Stream` as required by task 5a — fix it (add the real
+   `stream.write`/`stream.read` calls) and re-run the analysis step against this
+   run's already-produced output. Do not report the run as complete with `.npz` in
    place of the required `.bp` files."
-
-6. "Read back dm_density_slice.png and summary.txt from /app/work/run0/ (written by
-   the embedded script when the job ran) to confirm they exist and report them. If
-   they're missing, check the job's log: if hacc_tpm itself failed, fix and
-   resubmit the whole job; if only the analysis stage failed, fix
-   analyze_and_render.py and re-run it directly via submit_shell_task against this
-   run's own fresh output — do not resubmit the whole job just for an analysis bug,
-   and do not fall back to old data from another run."
 ```
 
 ---
 
 ## Key Rules
 
-- Source data paths (the PBS script, snapshot, halo catalog) are real LCRC paths under
-  `/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/` — these are external to the repo and
-  must be referenced by their actual absolute path, not `/app/data/` (unlike use cases
-  whose input data is staged into the repo's data directory).
+- Source data paths (the reference PBS script, snapshot, halo catalog) are real LCRC
+  paths under `/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/` — these are external to
+  the repo and must be referenced by their actual absolute path, not `/app/data/`
+  (unlike use cases whose input data is staged into the repo's data directory).
 - Never write a task that asks the explorer to modify `subme.pbs`, `indat.params`, or
   `cosmotools-config.dat` in place — if a derived param file is needed (e.g. for a
-  slice tool), write a separate copy. The explorer's own generated batch script
-  (`agent_subme.pbs`) is expected to exist both under `/app/work/run0/` (the tracked
-  copy) and under `SampleRun_go/` (the copy `qsub` actually runs) — these are new
-  files, not modifications to `subme.pbs`.
+  slice tool), write a separate copy.
+- Never write a task that has the explorer generate a `.pbs` or `.sh` script, call
+  `qsub`/`qstat`, or invoke the CLI/subprocess directly. All command-line work is
+  handed to the workflow engine.
 - Never write a task that reads, parses, or renders from `output/full_snapshots/` or
   `analysis/haloproperties/` content before this run's own producer has executed —
   that's leftover data from some prior run, not this run's result, and this run's
   analysis must never depend on it.
 - If recovery from a failed analysis stage is needed, that recovery must target
-  *this run's own* fresh output (re-run `analyze_and_render.py` directly against it)
-  — never resubmit the whole PBS job just to fix an analysis bug, and never fall back
-  to old data from another run.
+  *this run's own* fresh output by re-running only the analysis step against it —
+  never repeat the producer just to fix an analysis bug, and never fall back to old
+  data from another run.
 - This is a single producer -> analysis -> visualization pipeline per run, with no
   per-frame animation/GIF stage (that's specific to `molecular_nucleation`).
 
@@ -219,10 +209,10 @@ back to old data from another run.
   "tasks": [
     "Call get_resources FIRST; confirm in_pbs true, 8 MPI ranks available.",
     "Explore SampleRun_go/ (subme.pbs, params/, output/, analysis/) to confirm structure and read config values -- do not read snapshot/halo content from output/ or analysis/.",
-    "Write /app/work/run0/analyze_and_render.py directly from the documented GenericIOPrint format and halo-selection rules, using this run's own indat.params config values -- not developed against any pre-existing data.",
-    "Build agent_subme.pbs (WALLTIME=01:00:00, NRANKS=8) that runs hacc_tpm then analyze_and_render.py, write to /app/work/run0/, copy into SampleRun_go/, submit `qsub agent_subme.pbs` from there (real qsub allowed for this use case, one job for both stages); capture job ID.",
-    "Poll `qstat <job_id>` until completed.",
-    "Read back dm_density_slice.png and summary.txt from /app/work/run0/ to confirm the job produced them; if the analysis stage failed, fix and re-run it directly against this run's own fresh output, not a job resubmit."
+    "Run hacc_tpm on 8 MPI ranks against params/indat.params, with the env file sourced before the executable in the same invocation and SampleRun_go/ as the working directory. Do not write a PBS script or call qsub -- subme.pbs is a path reference only.",
+    "Dump the particle snapshot and halo catalog to text files in /app/work/run0/ using the GenericIOPrint CLI tool, ordered after the producer. Do not use pygio.",
+    "Analyze and render, ordered after the dumps: parse the snapshot (x,y,z,vx,vy,vz,phi; compute mass from Omega_m/rho_crit0/RL/NP), select the most massive halo by sod_halo_mass excluding sod_halo_count == -101, compute a 4 Mpc/h-thick xy density slice on that halo's z, render with matplotlib LogNorm (Agg backend), and write summary.txt.",
+    "Confirm dm_density_slice.png and summary.txt exist in /app/work/run0/; if only the analysis failed, fix and re-run that step alone against this run's own fresh output, never repeating the producer."
   ]
 }
 ```

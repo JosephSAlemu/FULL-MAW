@@ -1,10 +1,10 @@
 ---
 name: use_cases/cosmology/orchestrator
 description: >
-  Cosmology (HACC) routing rules for the orchestrator. Covers the real-qsub
-  architectural exception (producer AND analysis/visualization embedded in one
-  generated PBS script, submitted once), requirements approval for this project,
-  and HACC-specific error pattern recognition.
+  Cosmology (HACC) routing rules for the orchestrator. Covers the one-workflow rule
+  (producer AND analysis/visualization handed to the workflow engine together, no
+  qsub), requirements approval for this project, and HACC-specific error pattern
+  recognition.
 ---
 
 # Cosmology (HACC) — Orchestrator Skill
@@ -31,31 +31,29 @@ Same shape as other use cases. Route to installer after planner completes.
 
 ---
 
-## Architectural Exception: Real `qsub` Is Allowed Here
+## No `qsub` Exception — The Engine Runs the Producer
 
-The general LCRC rule is "the agent never submits a new PBS job — run inside the
-existing interactive allocation instead." **This use case is an explicit, deliberate
-exception**: the explorer builds one PBS script (e.g. `agent_subme.pbs`, using
-`SampleRun_go/subme.pbs` only as a reference for paths) that runs the `hacc_tpm`
-producer **and then** the analysis/rendering script, and submits it via a single
-`qsub agent_subme.pbs` — not a violation to flag or route back for correction. Do
-not give feedback telling the explorer to avoid `qsub` for this project.
+There used to be an explicit exception here letting this use case submit a real new
+PBS batch job. **That is gone.** This project now follows the same general LCRC rule
+as every other one: the agent never submits a new PBS job and never writes a
+`.pbs`/`.sh` launcher — the workflow engine runs the producer inside the existing
+allocation. If the explorer calls `qsub`/`qstat` or generates a batch script, that is
+a violation to flag and route back.
 
-Two things to verify:
-1. **Genuinely one `qsub` call covering both stages** — if the explorer submits the
-   producer via `qsub` and then separately re-runs the analysis/visualization from
-   the live session afterward, that *is* a violation (two executions instead of one
-   job) and should be routed back.
-2. **The analysis/rendering script was written from documented format rules, not
-   developed against pre-existing sample output** — `output/full_snapshots/` and
+Three things to verify:
+1. **Producer and analysis are one workflow** — the simulation and the
+   analysis/rendering must be handed to the engine together, with the analysis
+   ordered after the producer as a dependency. Two unrelated executions, or polling
+   a job queue, is a violation.
+2. **No direct execution** — the explorer must not invoke the CLI, use `subprocess`,
+   or run `mpirun` itself. `hacc_tpm` and `GenericIOPrint` are command-line steps the
+   engine runs.
+3. **The analysis was written from documented format rules, not developed against
+   pre-existing sample output** — `output/full_snapshots/` and
    `analysis/haloproperties/` may already contain content from some prior run; the
    explorer must not read, parse, or render from that content when writing or
-   testing `analyze_and_render.py`. That's leftover data from another run, not this
-   run's own result.
-
-This exception is specific to this use case — still enforce the no-new-qsub rule for
-every other use case (e.g. `molecular_nucleation`, and `eddy_uv`, which runs its
-producer via `submit_mpi_task` inside the existing allocation instead).
+   testing the analysis. That's leftover data from another run, not this run's own
+   result.
 
 ---
 
@@ -86,12 +84,12 @@ C++ extension against GenericIO libs).
 
 | Error pattern | Route to | Feedback |
 |---|---|---|
-| `ModuleNotFoundError: No module named 'pygio._version'` | explorer | "pygio is not built and should not be built. Use `GenericIOPrint` via subprocess instead." |
-| `qsub` / `qstat` command not found or job ID not captured | explorer | "Re-run via submit_shell_task with `cd /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go && qsub agent_subme.pbs` (the script you built) — qsub must run with that directory as cwd so $PBS_O_WORKDIR resolves." |
-| Explorer submits the original `subme.pbs` unmodified instead of building its own combined script | explorer | "Build your own PBS script (e.g. `agent_subme.pbs`) that runs hacc_tpm and then calls analyze_and_render.py, using `subme.pbs` only as a reference for the executable/env/param paths. Submit that generated file, not the original." |
-| Explorer reads/parses/renders from `output/full_snapshots/`/`analysis/haloproperties/` content before this run's own producer has executed | explorer | "That's leftover output from some prior run, not this run's own result — write analyze_and_render.py from the documented GenericIO format/halo-selection rules and this run's own params/indat.params, not by testing against old data." |
-| Explorer submits the producer via `qsub` and separately re-runs analysis/visualization from the live session afterward (not as failure recovery) | explorer | "The analysis/rendering script must be embedded in the same PBS script and run as part of the same `qsub` job — don't re-execute it afterward from the live session as a matter of course; just read back the PNG/summary the job already produced." |
-| Analysis stage fails inside a completed job and the explorer resubmits the whole PBS job | explorer | "Don't requeue hacc_tpm just to fix an analysis bug — this run's real output already exists on disk from the producer that already ran. Fix analyze_and_render.py and re-run it directly via submit_shell_task against that output instead." |
+| `ModuleNotFoundError: No module named 'pygio._version'` | explorer | "pygio is not built and should not be built. Dump the file with the `GenericIOPrint` CLI tool as its own engine-run command step, redirecting stdout to a text file, then parse that file in the Python step." |
+| Explorer calls `qsub`/`qstat`, or writes a `.pbs`/`.sh` script | explorer | "Do not submit a PBS job or write a launcher script — you are already inside an allocation. Have the workflow engine run hacc_tpm on 8 ranks with the env file sourced in the same command and SampleRun_go/ as the working directory." |
+| Explorer calls `subprocess`, or invokes `hacc_tpm`/`GenericIOPrint`/`mpirun` directly | explorer | "You never execute commands yourself. Every CLI invocation must be handed to the workflow engine as a command string." |
+| Explorer reads/parses/renders from `output/full_snapshots/`/`analysis/haloproperties/` content before this run's own producer has executed | explorer | "That's leftover output from some prior run, not this run's own result — write the analysis from the documented GenericIO format/halo-selection rules and this run's own params/indat.params, not by testing against old data." |
+| Producer and analysis submitted as two unrelated executions, or the analysis runs before the producer finishes | explorer | "They are one workflow: express the analysis as depending on the producer so the engine orders them, rather than running them separately or relying on timing." |
+| Analysis stage fails and the explorer re-runs the whole workflow | explorer | "Don't repeat hacc_tpm just to fix an analysis bug — this run's real output already exists on disk from the producer that already ran. Run a workflow containing only the corrected analysis step against that output." |
 | Halo selection picks an unexpectedly small/odd halo | explorer | "Select most massive halo by `sod_halo_mass` (M_200c), excluding rows where `sod_halo_count == -101` — not by `fof_halo_mass`." |
 | Visualization image missing or blank | explorer | "Verify density_slice data was actually computed (non-zero `sigma`) before rendering; check the halo's z-coordinate was passed through correctly as the slice center." |
 | All other failures | explorer | Full stderr content |
@@ -100,7 +98,7 @@ C++ extension against GenericIO libs).
 
 ## Notes
 
-- After a successful run (PBS job completed, density slice image produced, summary
+- After a successful run (workflow completed, density slice image produced, summary
   written), route to "end"
 - Never route back to planner unless the task list itself is structurally wrong (e.g.
   missing a required stage) — config-value mistakes should go back to explorer with

@@ -2,9 +2,9 @@
 name: use_cases/cosmology/explorer
 description: >
   Use-case-specific explorer rules for the HACC cosmology workflow (Last Journey
-  sample run). Covers building a single PBS script that runs the producer AND the
-  analysis/rendering together in one qsub submission -- GenericIO reading via CLI
-  tools (no pygio), halo catalog parsing, and known pitfalls.
+  sample run). Covers expressing the producer AND the analysis/rendering as one
+  workflow handed to the engine -- GenericIO reading via CLI tools (no pygio),
+  halo catalog parsing, and known pitfalls.
 ---
 
 # Cosmology (HACC) — Explorer Skill
@@ -31,17 +31,24 @@ finish, read its output. Do not modify `params/indat.params`.
 
 ---
 
-## Overall Shape: One PBS Script, Sim + Vis Together
+## Overall Shape: One Workflow, Sim + Vis Together
 
-The producer and the analysis/visualization go in **one PBS script** — a single
-`qsub` submission that runs the simulation and then renders the final image. Do not
-develop or test the analysis code against `SampleRun_go/output/full_snapshots/` or
-`SampleRun_go/analysis/haloproperties/` content that's already sitting there from
+The producer and the analysis/visualization are **one workflow**, expressed to the
+workflow engine in a single generated file, and the engine runs it.
+
+**Never write a PBS script, never call `qsub`/`qstat`, and never launch a new batch
+job.** You are already inside an allocation. The producer is a command-line MPI
+program, so it is a CLI step the engine runs; the analysis/rendering is pure Python,
+so it is a Python step the engine runs. On the parsl engine that means one file with
+a `@bash_app` for the producer and a `@python_app` for the analysis — see
+`systems/parsl` for the exact shape.
+
+Do not develop or test the analysis code against `SampleRun_go/output/full_snapshots/`
+or `SampleRun_go/analysis/haloproperties/` content that's already sitting there from
 some prior run — that's someone else's leftover output, not this run's, and this
-run's result should never depend on it. Write the analysis/rendering script directly
-from the documented GenericIO format and halo-selection rules below, informed by
-this run's own `params/indat.params` (config, not output), then embed it in the PBS
-script alongside the producer.
+run's result should never depend on it. Write the analysis from the documented
+GenericIO format and halo-selection rules below, informed by this run's own
+`params/indat.params` (config, not output).
 
 ---
 
@@ -55,110 +62,70 @@ hardcode values from the paper without confirming they match this sample run. Th
 are this run's own input configuration, not another run's results, so reading them
 is fine.
 
----
-
-## Stage 2: Write the Analysis/Rendering Script
-
-Write `/app/work/run0/analyze_and_render.py` directly, using the documented
-GenericIOPrint format and halo-selection rules ("Reading Snapshot & Halo Data" and
-"Computing and Rendering the Density Slice" below) and the config values read in
-Stage 1 -- not by reading or testing against any pre-existing snapshot/halo catalog
-content. This script must use **real absolute paths**, not `/app/`-prefixed ones —
-`/app/` paths are only resolved by the MCP tool layer, and this script runs
-standalone (invoked directly by the PBS job, no MCP tools involved) — so its output
-paths should be the real path to this repo's `work/run0/` directory (confirm the
-repo root with `pwd`/`list_files` if unsure), and its input paths should be the real
-`SampleRun_go/output/...`/`analysis/...` paths (where *this job's own* producer run
-will write, once it executes).
+Read `SampleRun_go/subme.pbs` too — but **only** as a reference for the executable
+path, env file, param file location, and rank count. You are reading it for those
+values, not copying its structure. Never submit it, never adapt it, never write a
+file like it.
 
 ---
 
-## Stage 3: Build and Submit One PBS Job (producer + analysis, single qsub)
+## Stage 2: The Producer Step (CLI, run by the engine)
 
-Read `SampleRun_go/subme.pbs` first, but only as a reference for the executable path,
-env file, and param file location; then write a new script with those paths, the
-task's `WALLTIME`/`NRANKS` parameters, and a call to the Stage 2 script:
+The producer is `hacc_tpm` under MPI. Express it as a single command string for the
+engine to run, built from the paths read in Stage 1:
 
-```bash
-#!/bin/bash
-#PBS -A PEDAL
-#PBS -l walltime=<WALLTIME>
-#PBS -l select=1:mpiprocs=<NRANKS>
-#PBS -l place=scatter
-#PBS -N agent_hacc_run
-#PBS -j oe
+- `envfile` must be sourced **before** the executable, in the same command
+- `cd` into `SampleRun_go/` in the same command, so `./params/indat.params`
+  resolves relatively
+- `NRANKS` comes from the task; default to **8** (this sample run's 2x2x2
+  decomposition) if unspecified. `WALLTIME` is irrelevant now — there is no batch
+  job to request walltime for.
 
-set -e
-cd $PBS_O_WORKDIR
-
-exe=/lcrc/project/PEDAL/jalemu/HACC/HACC_go/improv.cpu/mpi/bin/hacc_tpm
-envfile=/lcrc/project/PEDAL/jalemu/HACC/HACC_go/env/bashrc.improv.cpu
-paramfile=./params/indat.params
-source $envfile
-
-NNODES=1
-NRANKS=<NRANKS>
-NTHREADS=1
-NTOTRANKS=$(( NNODES * NRANKS ))
-
-mpiexec -np ${NTOTRANKS} \
-  --map-by ppr:${NRANKS}:node \
-  --bind-to core \
-  -x OMP_NUM_THREADS=${NTHREADS} \
-  $exe $paramfile -n
-
-# Analysis + visualization -- runs in the same job, right after the producer.
-# Use the venv's real absolute python3 path (this script is invoked directly by
-# PBS, not through the MCP tool layer, so no /app/ shortcuts here either).
-<VENV_PYTHON_ABS_PATH> <REPO_ROOT_ABS_PATH>/work/run0/analyze_and_render.py
-```
-
-- `WALLTIME`/`NRANKS` come from the task (the user may override them); if the task
-  doesn't specify either, default to `01:00:00` / `8` — the values confirmed working
-  for this sample run's 2x2x2 decomposition.
-- `<VENV_PYTHON_ABS_PATH>` is this repo's `venv3/bin/python3`, by its real absolute
-  path (e.g. confirm with `list_files`/`read_file` if unsure of the exact repo root)
-  — do not invoke bare `python3`, it may resolve to a different interpreter once
-  `envfile` has been sourced.
-- Write the generated script to `/app/work/run0/agent_subme.pbs` first — this is the
-  canonical, tracked copy of what was actually submitted, and it must exist in the
-  work dir alongside the rest of this run's artifacts. Then copy that same file into
-  `SampleRun_go/agent_subme.pbs` (e.g. `cp /app/work/run0/agent_subme.pbs
-  /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/agent_subme.pbs` via `submit_shell_task`)
-  — never overwrite the original `subme.pbs`.
-- Must `cd`/submit from `SampleRun_go/` (not the work dir) so `$PBS_O_WORKDIR` resolves
-  and `./params/indat.params` is found relatively:
+The resulting command has the shape:
 
 ```
-submit_shell_task(
-    name="submit_hacc_job",
-    command="cd /lcrc/project/PEDAL/jalemu/HACC/SampleRun_go && qsub agent_subme.pbs",
-)
+source <envfile> && cd <SampleRun_go> && mpirun -n <NRANKS> <exe> ./params/indat.params -n
 ```
 
-- Capture the returned job ID, then poll with `qstat <job_id>` via `submit_shell_task`
-  until the state is `C` (completed). Use a **fixed 60-second interval** between polls
-  (e.g. `sleep 60 && qstat <job_id>`) — do not busy-loop with zero delay, and do not
-  escalate the interval between polls; `submit_shell_task` blocks for the full sleep
-  duration, so growing it wastes wall-clock time for no benefit.
+On parsl this string is the return value of a `@bash_app`. You never run it yourself.
+
+---
+
+## Stage 3: The Analysis/Rendering Step (Python, run by the engine)
+
+Implement the analysis using the documented GenericIOPrint format and halo-selection
+rules ("Reading Snapshot & Halo Data" and "Computing and Rendering the Density Slice"
+below) plus the Stage 1 config values — not by reading or testing against any
+pre-existing snapshot/halo catalog content.
+
+It must run **after** the producer. Express that ordering to the engine (on parsl,
+resolve the producer's future before invoking the analysis app, or pass the future
+in as a dependency). Do not rely on wall-clock timing or polling.
+
+Paths inside this step:
+- **Inputs** are the real absolute `SampleRun_go/output/...` and
+  `analysis/haloproperties/...` paths — where *this run's own* producer just wrote.
+- **Outputs** go to `/app/work/run0/`.
+
+Put all imports inside the function body, and set `matplotlib.use("Agg")` before
+importing `pyplot` — the node is headless.
 
 ---
 
 ## Stage 4: Report, or Recover Without Re-Running the Producer
 
-After completion, read back `/app/work/run0/dm_density_slice.png` and `summary.txt`
-(written by the embedded script) to confirm they exist and report them.
+After the workflow completes, read back `/app/work/run0/dm_density_slice.png` and
+`summary.txt` to confirm they exist and report them.
 
-If they're missing, check the job's `.o<jobid>` log for where it failed:
+If they're missing, read the workflow's stdout/stderr to find where it failed:
 - **If the producer (`hacc_tpm`) itself failed**, fix the underlying issue (wrong
-  param path, wrong rank count, etc.) and resubmit the whole `agent_subme.pbs` — the
+  param path, wrong rank count, env not sourced) and re-run the workflow — the
   producer has to actually run again to get real output.
-- **If the producer succeeded but the analysis/rendering script failed**, do
-  **not** resubmit the whole job — `hacc_tpm` already wrote real output for this run
-  to `output/full_snapshots/`/`analysis/haloproperties/`. Fix `analyze_and_render.py`
-  and re-run it directly via `submit_shell_task` (the venv's absolute python3 path,
-  same as the PBS script invokes it) against that output. This is still *this run's*
-  own fresh data, not old data from some other run, and it avoids re-queuing the
+- **If the producer succeeded but the analysis/rendering failed**, do **not** re-run
+  the producer. `hacc_tpm` already wrote real output for this run to
+  `output/full_snapshots/`/`analysis/haloproperties/`. Write a workflow containing
+  **only** the corrected analysis step, pointed at that existing output, and run
+  that. This is still *this run's* own fresh data, and it avoids repeating the
   expensive MPI producer just to fix a bug in the analysis code.
 
 ---
@@ -168,32 +135,44 @@ If they're missing, check the job's `.o<jobid>` log for where it failed:
 `pygio` (in-tree at `HACC_go/submodules/genericio/python/pygio`) is **not built** —
 importing it fails with `ModuleNotFoundError: No module named 'pygio._version'`.
 Building it means compiling a C++ extension against the GenericIO libs — do not
-attempt this. Instead use the pre-built CLI binaries directly via `subprocess`:
+attempt this. Instead use the pre-built CLI binary:
 
 ```
 GIOP = "/lcrc/project/PEDAL/jalemu/HACC/HACC_go/improv.cpu/frontend/bin/GenericIOPrint"
 ```
 
-### Reading the particle snapshot
-```python
-import subprocess, numpy as np
+`GenericIOPrint` is a CLI tool, so **the engine runs it, not you** — never call it
+with `subprocess`. Make it its own CLI step that redirects stdout to a text file in
+the work dir, then parse that file in the Python step:
 
-SNAP = "/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/output/full_snapshots/step_624/m000p.full.mpicosmo.624"
-out = subprocess.run([GIOP, SNAP], capture_output=True, text=True)
+```
+<GIOP> <SNAP> > /app/work/run0/snapshot_dump.txt
+```
+
+On parsl that command string is a `@bash_app`, ordered before the `@python_app` that
+parses it. (`import subprocess` is rejected outright by `write_workflow`.)
+
+### Parsing the particle snapshot dump
+```python
+# inside the @python_app, after the GenericIOPrint step has written the dump
+import numpy as np
 
 rows = []
-for ln in out.stdout.splitlines():
-    s = ln.strip()
-    if s.startswith("#") or not s:
-        continue
-    parts = s.split()
-    if len(parts) < 7:
-        continue
-    rows.append([float(parts[i]) for i in range(7)])  # x,y,z,vx,vy,vz,phi
+with open("/app/work/run0/snapshot_dump.txt") as fh:
+    for ln in fh:
+        s = ln.strip()
+        if s.startswith("#") or not s:
+            continue
+        parts = s.split()
+        if len(parts) < 7:
+            continue
+        rows.append([float(parts[i]) for i in range(7)])  # x,y,z,vx,vy,vz,phi
 arr = np.array(rows, dtype=np.float64)
 ```
-- Pass the **master snapshot file** (e.g. `m000p.full.mpicosmo.624`), not a per-rank
-  shard — `GenericIOPrint` reads across all ranks for you.
+- The snapshot to dump is e.g.
+  `SampleRun_go/output/full_snapshots/step_624/m000p.full.mpicosmo.624`.
+- Pass the **master snapshot file**, not a per-rank shard — `GenericIOPrint` reads
+  across all ranks for you.
 - Header/comment lines start with `#`; the physical-coordinates line
   (`# physical coordinates: (0,0,0) -> (64,64,64)`) confirms the box bounds — use it
   to sanity-check `RL` from `indat.params` rather than trusting one source blindly.
@@ -205,11 +184,13 @@ arr = np.array(rows, dtype=np.float64)
 ```python
 HP = "/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/analysis/haloproperties/step_624/m000p-624.haloproperties"
 ```
+- Dump it the same way as the snapshot: a CLI step running `GenericIOPrint` on it,
+  redirected to a text file, then parsed in the Python step.
 - This file is written by HACC's own halo finder as part of the run, under
   `analysis/haloproperties/step_<N>/` — do not hand-roll FOF/SOD linking in Python;
   parse this output instead. (This path won't have this run's real content until
-  `hacc_tpm` has actually executed — the analysis script parses whatever is there
-  *when it runs*, i.e. inside the PBS job, after the producer stage.)
+  `hacc_tpm` has actually executed — so this step must be ordered after the
+  producer step.)
 - `GenericIOPrint` on this file gives a tab-separated header line listing ~76 columns
   including `fof_halo_count`, `fof_halo_mass`, `fof_halo_center_x/y/z`,
   `sod_halo_mass`, `sod_halo_radius`, `sod_halo_center_x/y/z`, etc. — parse the header
@@ -254,21 +235,19 @@ this is a final human-facing artifact, plain `.png` is correct (no ADIOS2 needed
 
 ## ADIOS2 Engine Notes (when `--engine adios`)
 
-The `write_bp`/`read_bp` MCP *tools* can't be called from inside the embedded
-`analyze_and_render.py` script — it runs standalone inside the PBS job, invoked
-directly by the batch script with no MCP session available, and those are MCP
-tools like any other, so they need a live session to invoke. But that's a
-constraint on the *tools*, not on ADIOS2 itself: `adios2` is a plain Python
-library (already installed in the venv this script runs under) with no
-dependency on any session, server process, or IPC — it just reads/writes `.bp`
-files on disk. `write_bp`/`read_bp` work by generating a small wrapper script
-(`import adios2; with adios2.Stream(path, mode) as stream: ...`) and running it
-as a subprocess — exactly the same execution mechanism the embedded script
-already uses. There's nothing stopping the embedded script from doing the same
-thing directly.
+This section applies only when the run uses `--engine adios`. (On the parsl
+engine there are no `write_bp`/`read_bp` tools at all.)
+
+The `write_bp`/`read_bp` MCP *tools* can't be called from inside the analysis
+code — that code runs inside the workflow engine's task, with no MCP session
+available, and those are MCP tools like any other. But that's a constraint on the
+*tools*, not on ADIOS2 itself: `adios2` is a plain Python library (already
+installed in the venv) with no dependency on any session, server process, or IPC
+— it just reads/writes `.bp` files on disk. There's nothing stopping the analysis
+code from using the library directly.
 
 So: when `--engine adios` is selected, **this is required, not an optional
-enhancement.** `import adios2` in `analyze_and_render.py` itself and use
+enhancement.** `import adios2` inside the analysis code itself and use
 `adios2.Stream(path, mode)` directly (not the `write_bp`/`read_bp` tools, which
 aren't reachable from here) with a genuine `stream.write(...)` then
 `stream.read(...)` round trip — write the array to the `.bp` file and then
@@ -288,12 +267,16 @@ of engine mode.
 
 | Pitfall | Solution |
 |---|---|
-| `pygio` import fails (`No module named 'pygio._version'`) | Expected — it's not built. Use `GenericIOPrint` via `subprocess` instead; do not try to build/install pygio. |
+| Tempted to write a `.pbs` script or call `qsub`/`qstat` | Never. You are already inside an allocation — the engine runs the producer directly. |
+| `pygio` import fails (`No module named 'pygio._version'`) | Expected — it's not built. Dump with `GenericIOPrint` as a CLI step instead; do not try to build/install pygio. |
+| Reaching for `subprocess` to call `GenericIOPrint` | Rejected by the engine. Make it a CLI step that redirects stdout to a file, then parse that file in the Python step. |
+| `hacc_tpm` fails immediately / env errors | `envfile` must be sourced in the *same* command, before the executable — a separate step won't carry the environment over. |
 | GenericIOPrint output has no obvious "mass" column | Mass isn't stored per-particle for this sample run — compute `mp` from `Omega_m`, `rho_crit0`, `RL`, `NP` (see above) and broadcast it. |
 | Picking "most massive halo" by `fof_halo_mass` gives a different halo than expected | Use `sod_halo_mass` (M_200c), excluding rows where `sod_halo_count == -101`. |
-| Job finishes but `dm_density_slice.png`/`summary.txt` are missing | The embedded script probably failed silently — check the job's `.o<jobid>` log (or add `set -e` before the analysis call in the generated script) rather than assuming the producer itself failed. |
-| Reading/parsing `output/full_snapshots/`/`analysis/haloproperties/` content before this run's own producer has executed | Don't — that's leftover data from some prior run, not this run's own result. Write the analysis script from the documented format/rules, not by testing against old data. |
-| Analysis stage fails inside the job -- tempted to resubmit the whole PBS job | Don't requeue `hacc_tpm` just to fix an analysis bug — the producer's real output for this run already exists on disk. Fix `analyze_and_render.py` and re-run it directly against that output via `submit_shell_task`. |
+| Workflow finishes but `dm_density_slice.png`/`summary.txt` are missing | The analysis step probably failed — read the workflow's stderr rather than assuming the producer itself failed. |
+| Analysis runs before the producer has written output | The ordering wasn't expressed to the engine. Make the analysis step depend on the producer step; don't rely on timing. |
+| Reading/parsing `output/full_snapshots/`/`analysis/haloproperties/` content before this run's own producer has executed | Don't — that's leftover data from some prior run, not this run's own result. Write the analysis from the documented format/rules, not by testing against old data. |
+| Analysis stage fails -- tempted to re-run the whole workflow | Don't repeat `hacc_tpm` just to fix an analysis bug — the producer's real output for this run already exists on disk. Run a workflow with only the corrected analysis step against that output. |
 | `hacc_slice` slice values look wrong / file size doesn't divide evenly | Check float32 vs float64 assumption first (`NG*NG*4` vs `NG*NG*8` bytes) rather than assuming a fixed dtype. |
 
 ---

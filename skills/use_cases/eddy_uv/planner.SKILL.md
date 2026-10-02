@@ -2,7 +2,7 @@
 name: use_cases/eddy_uv/planner
 description: >
   Eddy_uv (Nek5000 CFD) environment facts for the planner -- where the case
-  lives, running the producer via submit_mpi_task inside the existing allocation
+  lives, running the producer under MPI inside the existing allocation
   (no qsub), and what package reads Nek5000 field files. Does not prescribe the
   CFD/stream-function math -- that's left to the planner's own reasoning from the
   paper and the .usr/.rea files.
@@ -42,13 +42,13 @@ regenerate it.
 
 Like every other use case, this one follows the general LCRC rule: never
 submit a new PBS job -- run inside the existing interactive allocation
-instead. The Nek5000 producer runs via `submit_mpi_task`, which launches
-`./nek5000` with `mpirun`/`mpiexec` inside the same allocation the whole run
-is already using, so the producer and the field-file analysis/visualization
-stages that follow are always one job, never two separate submissions. State
-this explicitly in the relevant task, and carry forward the `NRANKS` value
-(default `8` unless the paper or user's goal specifies otherwise) for the
-explorer to pass as `num_ranks`.
+instead. The Nek5000 producer is launched by the workflow engine with
+`mpirun`/`mpiexec` inside the same allocation the whole run is already using,
+so the producer and the field-file analysis/visualization stages that follow
+are always one job, never two separate submissions. State this explicitly in
+the relevant task, and carry forward the `NRANKS` value (default `8` unless
+the paper or user's goal specifies otherwise) as the rank count the producer
+must run with.
 
 ---
 
@@ -70,8 +70,8 @@ from other use cases (`scipy`, `mpi4py`, `ovito`, `pillow`, `lammps`,
 
 ## Producer / Consumer Split
 
-- **Producer** — run the existing `nek5000` executable via `submit_mpi_task`
-  (using `subeddy.pbs` only as a path/env reference), inside the existing
+- **Producer** — run the existing `nek5000` executable under MPI (using
+  `subeddy.pbs` only as a path/env reference), inside the existing
   allocation, and wait for it to complete.
 - **Consumer** — a single-process stage that reads the resulting field files
   with `pymech`, computes the requested derived quantity (e.g. the stream
@@ -90,37 +90,28 @@ derived quantity or plot.
 
 ## Workflow Shape: Two Stages, and Where Real Parallelism Lives
 
-1. **Producer** — run `./nek5000` via `submit_mpi_task` (num_ranks=8,
-   work_dir=eddy_uv/) inside the existing allocation; this blocks until done,
-   no polling needed. Never wrapped in Parsl/PyCOMPSs `@task` code, regardless
-   of which engine the run selected -- the only real parallelism here (8 MPI
-   ranks) already happens entirely inside the pre-built `nek5000` executable
-   via `mpiexec`, not anything the agent drives from Python.
+1. **Producer** — run `./nek5000` under MPI with 8 ranks, with `eddy_uv/` as
+   the working directory, inside the existing allocation; this blocks until
+   done, no polling needed. Treat it as one single unit of work: the only real
+   parallelism here (8 MPI ranks) happens entirely inside the pre-built
+   `nek5000` executable, so never try to split or fan out the producer itself.
 2. **Consumer** — the field-file series (`eddy_uv0.f00001` .. `f00011`) is the
    *only* place independent units of work actually exist in this workflow:
    each file's (read -> compute -> render) is fully independent of every
    other file.
 
-### How to actually get that parallelism: one `submit_task` call per file
+### How to express that parallelism
 
-`submit_task` already runs whatever `python_code` you give it through the
-selected engine's task machinery automatically (see `systems/parsl` /
-`systems/pycompss` -- the server wraps it in `@python_app`/`@task` for you,
-on its own persistent worker pool). **Never write `import parsl`,
-`Config`, `parsl.load(...)`, `compss_start()`, `@task`, or `@python_app`
-yourself inside the code you submit.** That nests a second runtime inside
-one the server already started. Confirmed in a real run of this exact
-workflow: doing that let Parsl auto-detect the node's full core count and
-spin up **128 worker processes** to run one synchronous function call.
+Write the consumer as **11 independent units of work, one per field file**
+(read this one file, compute, render, save). Do not write one task that loops
+over all 11 files serially — that throws away the only real parallelism in
+this workflow.
 
-The correct way to parallelize across the 11 field files: call `submit_task`
-**11 separate times**, once per file, each with plain Python code (read this
-one file, compute, render, save). The server's own worker pool already runs
-those concurrently -- that's the whole mechanism, no Parsl/PyCOMPSs code
-needed in the task body at all, regardless of which engine the run selected.
-If the engine isn't task-parallel (`adios`, or none requested), the same
-plain-Python-per-file code just runs through the fallback path instead --
-nothing about the consumer's code needs to change either way.
+Describe the work; let the explorer choose the dispatch mechanism for its
+engine. On parsl it becomes 11 `@python_app` invocations inside the single
+generated workflow file, which Parsl runs concurrently on its worker pool. On
+other engines it becomes 11 separate `submit_task` calls. Either way the
+per-file logic is identical, so do not prescribe the tool in the task text.
 
 ---
 

@@ -30,12 +30,15 @@ PLANNER_PROMPT_NO_SKILLS = """\
 You are a scientific workflow analyst. Given the full text of a research paper and a goal, extract
 everything needed to reproduce the computational workflow described in the paper.
 
-## What Tasks Are in the MCP Approach
+## What Tasks Are
 
-Tasks describe what the explorer agent executes via MCP tool calls -- not code to write to a file
-and run. There is no workflow.py, no main(), no bash launcher, no @python_app definitions. The
-explorer calls `submit_task` with inline Python code directly, or a domain-specific tool when the
-goal names one (e.g. a simulation runner).
+Tasks describe what work must happen, in order -- not which tool the explorer should call. Write
+each task as a discrete unit of scientific or computational work, specific enough that the explorer
+can produce exact code for it. How that work is dispatched is the explorer's decision and depends
+on the workflow engine this run uses.
+
+Never instruct the explorer to write a bash script, write a PBS script, or invoke the CLI or a
+subprocess directly -- all command-line work is handed to the workflow engine as a command string.
 
 ## Software Available
 

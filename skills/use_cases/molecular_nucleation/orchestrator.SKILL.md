@@ -33,8 +33,8 @@ When the explorer reports tool call failures, use these patterns to decide where
 
 | Error pattern | Route to | Feedback |
 |---|---|---|
-| `exit 143` on run_lammps | explorer | "MPI init failure — run_lammps should handle this automatically via server TASK_ENV. Check that get_resources was called first and in_pbs is true." |
-| `WorkerLost` + `MPI` / `ORTE` | explorer | "LAMMPS MPI init failure. The run_lammps tool handles HPC/local selection — do not use submit_task with Python API for LAMMPS." |
+| `exit 143` running LAMMPS | explorer | "MPI init failure. On engines with the `run_lammps` tool, use it — it handles this via server TASK_ENV. On parsl, run `lmp` as a CLI step under `mpirun` with the lammps module loaded. Either way, check get_resources was called first and in_pbs is true." |
+| `WorkerLost` + `MPI` / `ORTE` | explorer | "LAMMPS MPI init failure. Where the `run_lammps` tool exists, use it rather than the Python API; on parsl, run `lmp` as a CLI step under `mpirun`." |
 | `ModuleNotFoundError: No module named 'lammps'` | explorer | "LAMMPS not found. Use `from lammps import lammps` — the source build is at /usr/local/lib. Do not pip install lammps." |
 | `ModuleNotFoundError: No module named 'PIL'` | explorer | "pillow is installed as 'pillow' not 'PIL'. Import with `from PIL import Image`." |
 | `frames/step.*.lammpstrj` not found / no frames | explorer | "LAMMPS did not produce dump files. Ensure os.chdir(work_dir) is called BEFORE lammps() and that work_dir/frames/ exists." |
@@ -63,7 +63,7 @@ When the installer presents requirements.txt for approval, verify it contains:
 
 **LAMMPS succeeded, OVITO failed:** explorer_complete, frames exist but results.csv missing -> `next="explorer"`, `feedback="OVITO analysis failed. Verify ovito is installed and that frames exist in /app/work/run0/frames/ before retrying analysis."`
 
-**LAMMPS failed exit 143:** explorer_complete, no frames -> `next="explorer"`, `feedback="run_lammps returned exit 143 (MPI SIGTERM). Check that get_resources was called first and in_pbs is true. Do not use submit_task for LAMMPS."`
+**LAMMPS failed exit 143:** explorer_complete, no frames -> `next="explorer"`, `feedback="LAMMPS returned exit 143 (MPI SIGTERM). Check that get_resources was called first and in_pbs is true. Use the run_lammps tool if your engine has it; on parsl run lmp as a CLI step under mpirun with the lammps module loaded."`
 
 **Missing input file:** explorer_complete, cp failed -> `next="explorer"`, `feedback="Input file copy failed. Verify AW.tersoff, data.init, and in.watbox all exist in /app/data/."`
 

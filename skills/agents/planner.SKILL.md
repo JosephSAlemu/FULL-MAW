@@ -43,15 +43,24 @@ confirms MPI is available and appropriate.
 
 ---
 
-## What Tasks Are in the MCP Approach
+## What Tasks Are
 
-**Critical:** Tasks describe what the **explorer agent executes via MCP tool calls** — not code to write to a file and run. There is no workflow.py, no main(), no bash launcher, no @python_app definitions. The explorer calls `submit_task` with inline Python code directly.
+**Critical:** Tasks describe **what work must happen**, in order — not which tool
+the explorer should press. Write each task as a discrete unit of scientific or
+computational work with enough specificity that the explorer can produce exact
+code for it. How that work is dispatched is the explorer's decision and depends
+on the engine this run uses.
 
-Each task is one discrete step the explorer will execute. The explorer reads the task and calls either:
-- `submit_task` — to run inline Python code (simulation, analysis, plotting)
-- `submit_shell_task` — to run shell commands (mkdir, cp, ls)
-- `check_package` — to verify a package is installed
-- `submit_mpi_task` — to run MPI-parallel executables (HPC env only)
+Say *what* runs, with what inputs, producing what output. Do not prescribe the
+mechanism:
+
+**Good:** `"Run the HACC simulation binary on 8 MPI ranks using the params file, writing snapshots to the run directory."`
+**Bad:** `"Call submit_mpi_task with command 'mpirun -np 8 hacc_tpm'."`
+
+Never instruct the explorer to write a bash script, a PBS script, or to invoke
+the CLI or a subprocess directly. CLI work is handed to the workflow engine as a
+command string; on the parsl engine the explorer puts every step into a single
+generated Parsl file as `@bash_app`/`@python_app` functions.
 
 ---
 
@@ -74,10 +83,10 @@ Instead of:
 > "Run the simulation and analyze the output"
 
 Write:
-1. "Copy input files to /app/work/run0/ using submit_shell_task. Always re-copy fresh."
-2. "Run the simulation using the appropriate tool per the use-case skill."
-3. "Verify output: use list_files to confirm output files exist before proceeding."
-4. "Run analysis via submit_task: load output, apply analysis, write results.csv."
+1. "Copy input files fresh into /app/work/run0/ before every run."
+2. "Run the simulation using the tool and parameters named in the use-case skill."
+3. "Verify the expected output files exist before proceeding to analysis."
+4. "Analyze the simulation output: load it, apply the analysis, write results.csv."
 
 ---
 
@@ -87,12 +96,12 @@ A complete task list must cover ALL of these phases:
 
 | Phase | Min tasks |
 |---|---|
-| Package verification (`check_package` for each required tool) | 1–2 |
-| Directory and file setup (mkdir, copy data files) | 1–2 |
+| Package verification (confirm each required tool is present) | 1–2 |
+| Directory and file setup (create dirs, copy data files) | 1–2 |
 | Primary simulation (use the tool specified in the use-case skill) | 1 |
-| Simulation output verification (`list_files` to confirm output exists) | 1 |
-| Analysis (`submit_task` with inline Python) | 2–3 |
-| Visualization / per-frame rendering (`submit_task`) | 1–2 |
+| Simulation output verification (confirm output exists) | 1 |
+| Analysis | 2–3 |
+| Visualization / per-frame rendering | 1–2 |
 | Animation assembly | 1 |
 | Time series or summary plot | 1–2 |
 
@@ -123,10 +132,11 @@ If the input ends with "Orchestrator feedback", fix every issue. Do not repeat t
 
 Before finalizing:
 - [ ] 10+ tasks, not 3
-- [ ] No task says "write a @python_app", "write a main()", or "write a bash launcher" — those are artifact approach patterns, not MCP
+- [ ] No task tells the explorer to write a bash script, a PBS script, or to call the CLI or a subprocess directly
+- [ ] No task hardcodes which MCP tool to call — describe the work, not the mechanism
 - [ ] All paths use `/app/` — never cluster-specific paths like `/lcrc/project/`, `/gpfs/`
 - [ ] Every critical ordering requirement (copy before run, verify before analysis) is its own task
-- [ ] Simulation tool matches what the use-case skill specifies — not a generic `submit_task`
+- [ ] Simulation tool matches what the use-case skill specifies
 - [ ] Visualization colors, atom sizes, and output formats are specified per task
-- [ ] A verification step (list_files) exists after the simulation before analysis
+- [ ] A verification step exists after the simulation before analysis
 - [ ] Stack and tasks match the environment constraints from the loaded knowledge skill

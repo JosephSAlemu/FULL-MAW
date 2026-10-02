@@ -25,6 +25,20 @@ Nek5000 `eddy_uv` run (paths under
 
 ---
 
+## Note on Tool Names in This Skill
+
+This skill names `submit_mpi_task` and `submit_task` throughout. Those are the
+tools on the **pycompss** and **adios** engines.
+
+**On the parsl engine they do not exist.** There, you write one Parsl file via
+`write_workflow` and run it with `run_workflow`: the `./nek5000` producer becomes
+a `@bash_app` returning the MPI command string, and each per-field-file analysis
+step becomes a `@python_app` in that same file. The *facts* below — rank count,
+sourced env, working directory, file naming — all still apply exactly as written;
+only the dispatch mechanism differs. Your engine reference is authoritative.
+
+---
+
 ## Stage 1: Run the Producer (submit_mpi_task, inside the existing allocation)
 
 **No new PBS job here, and no `qsub`.** The producer runs via `submit_mpi_task`

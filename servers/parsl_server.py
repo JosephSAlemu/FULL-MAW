@@ -2,17 +2,28 @@
 Parsl Workflow MCP Server
 
 An MCP server that exposes Parsl workflow engine capabilities as tools.
-The explorer agent connects to this server via MCP protocol to submit tasks,
-check status, get results, and manage the workflow execution.
 
-Task execution is routed through a real Parsl DataFlowKernel when Parsl is
-installed: each command runs as a Parsl @python_app (HighThroughputExecutor +
-LocalProvider). If Parsl is not installed, the server falls back to direct
-subprocess execution -- identical results, just without Parsl scheduling.
-Compatible with HPC environments and local development.
+Execution model: **generated-file only.** The agent never submits code strings
+and never invokes the CLI itself. It writes exactly one standalone Parsl driver
+file -- in which every unit of work is a function decorated `@bash_app` (for CLI
+calls) or `@python_app` (for pure Python) -- using `write_workflow`, then asks
+the server to execute that file with `run_workflow`. The DataFlowKernel created
+*inside* the generated file is what schedules and launches all real work.
 
-The VENV_PYTHON environment variable controls which Python interpreter to use.
-If set, tasks run in that virtualenv. If not, tasks run with the system Python.
+This is why `submit_task`, `submit_shell_task`, `submit_mpi_task`, and
+`run_lammps` no longer exist here. Each of them took a code or command string
+and had the server run it, which left the agent -- not Parsl -- deciding how
+work was executed, and let MPI/CLI invocations bypass `@bash_app` entirely.
+`write_workflow` + `run_workflow` are the only execution surface; everything
+else this server exposes is read-only inspection or venv management.
+
+`run_workflow` launches the generated file through the server's own Parsl
+`@bash_app`, so even the launch is dispatched by Parsl rather than by a bare
+subprocess call in our code.
+
+The VENV_PYTHON environment variable controls which Python interpreter runs the
+generated workflow. If set, it runs in that virtualenv; otherwise it runs with
+the system Python.
 
 Usage:
     python servers/parsl_server.py                    # stdio mode (for MCP clients)
@@ -21,8 +32,10 @@ Usage:
 
 import os
 import re
+import ast
 import sys
 import json
+import shlex
 import subprocess
 import uuid
 import time
@@ -476,180 +489,114 @@ def _run_bash_command(cmd: list[str], work_dir: str = DEFAULT_WORK_DIR, timeout:
     return result
 
 
-def _run_python_script(script: str, work_dir: str = DEFAULT_WORK_DIR, timeout: int = 1800) -> dict:
-    """Write a Python script to a file and execute it with VENV_PYTHON.
-
-    Kept (not deleted after running) in _task_scripts/ so the actual code submitted
-    to this engine is inspectable after the run, not just visible in the trace.json
-    args field.
-    """
-    scripts_dir = os.path.join(work_dir, "_task_scripts")
-    os.makedirs(scripts_dir, exist_ok=True)
-
-    fd, script_path = tempfile.mkstemp(suffix=".py", prefix="task_", dir=scripts_dir)
-    with os.fdopen(fd, "w") as f:
-        f.write(script)
-    return _run_command([VENV_PYTHON, script_path], work_dir=work_dir, timeout=timeout)
-
-
 # __ MCP Tools _________________________________________________________________
 
 @mcp.tool()
-def submit_task(
-    name: str,
+def write_workflow(
     python_code: str,
-    depends_on: list[str] | None = None,
-    timeout: int = 1800,
+    filename: str = "workflow.py",
 ) -> str:
-    """Submit a Python task for execution via the Parsl workflow engine.
+    """Write the standalone Parsl workflow file that will perform ALL of the work.
 
-    The task runs locally using the configured Python interpreter (system or venv).
-    If depends_on is specified, the task waits for those tasks to complete first.
+    This is the only way to express work to this server. Write ONE file containing
+    every step of the workflow, where each step is a function decorated with:
+      - `@bash_app`   -- for anything that would otherwise be a CLI/MPI invocation.
+                         The function body returns the command *string*; Parsl runs it.
+      - `@python_app` -- for pure-Python work (analysis, plotting, file writing).
+
+    The file must build its own Parsl Config, call `parsl.load(config)`, invoke the
+    apps, resolve their futures with `.result()`, and call `parsl.clear()` at the end.
+
+    Validation is enforced, not advisory. The file is rejected if it:
+      - defines no `@bash_app` and no `@python_app`
+      - never calls `parsl.load(...)`
+      - shells out directly (`subprocess`, `os.system`, `os.popen`, `pty.spawn`,
+        `commands.getoutput`) -- CLI work belongs in a `@bash_app` command string
+      - calls `mpirun`/`srun`/`mpiexec` outside a `@bash_app` body
 
     Args:
-        name: Descriptive name for this task (e.g. "run_lammps", "analyze_ovito")
-        python_code: Python code to execute (multi-line string, self-contained)
-        depends_on: List of task IDs that must complete before this task runs (optional)
-        timeout: Max seconds to wait for execution (default: 600)
+        python_code: Full contents of the Parsl driver file
+        filename: Filename to write under the work dir (default: workflow.py).
+                  Must be a bare *.py filename, not a path.
 
     Returns:
-        JSON with task_id, status, and execution results
+        JSON with status, path, and the apps detected in the file
     """
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-
-    # Redirect LAMMPS code to the dedicated run_lammps tool
-    if "from lammps import" in python_code or "import lammps" in python_code:
+    if os.path.basename(filename) != filename or not filename.endswith(".py"):
         return json.dumps({
-            "task_id": task_id,
             "status": "rejected",
-            "error": (
-                "LAMMPS must be run via the `run_lammps` tool, not submit_task. "
-                "Call: run_lammps(script='in.watbox', work_dir='/app/work/run0'). "
-                "The run_lammps tool handles HPC vs local execution automatically."
-            ),
-        })
+            "error": f"filename must be a bare .py filename, got '{filename}'",
+        }, indent=2)
 
-    # Check dependencies
-    if depends_on:
-        for dep_id in depends_on:
-            if dep_id not in _tasks:
-                return json.dumps({
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": f"Dependency {dep_id} not found",
-                })
-            if _tasks[dep_id]["status"] != "completed":
-                return json.dumps({
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": f"Dependency {dep_id} has status '{_tasks[dep_id]['status']}', not 'completed'",
-                })
-
-    # Register task
-    _tasks[task_id] = {
-        "name": name,
-        "status": "running",
-        "depends_on": depends_on or [],
-        "submitted_at": time.time(),
-    }
-
-    # Resolve /app/ path aliases in user code so os.chdir("/app/work/run0") etc. work
     resolved_code = _resolve_paths(python_code)
+    problems, apps = _validate_workflow_code(resolved_code)
+    if problems:
+        return json.dumps({
+            "status": "rejected",
+            "errors": problems,
+            "hint": (
+                "Every unit of work must be a @bash_app (returning a command string) "
+                "or a @python_app, inside one file that loads its own Parsl config. "
+                "Do not shell out from the driver body."
+            ),
+        }, indent=2)
 
-    # Wrap user code
-    wrapped_script = f"""\
-import sys, os, traceback
-
-# Ensure working directory exists
-os.makedirs("{DEFAULT_WORK_DIR}", exist_ok=True)
-os.chdir("{DEFAULT_WORK_DIR}")
-try:
-    # --- User task code ---
-{_indent(resolved_code, 4)}
-    # --- End user code ---
-    print("__TASK_SUCCESS__")
-except Exception as e:
-    print(f"__TASK_FAILED__: {{e}}", file=sys.stderr)
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
-"""
-
-    result = _run_python_script(wrapped_script, timeout=timeout)
-
-    # Update task status
-    if result["exit_code"] == 0 and "__TASK_SUCCESS__" in result["stdout"]:
-        _tasks[task_id]["status"] = "completed"
-        _tasks[task_id]["exit_code"] = 0
-        _tasks[task_id]["stdout"] = result["stdout"].replace("__TASK_SUCCESS__", "").strip()
-        _tasks[task_id]["stderr"] = result["stderr"]
-    else:
-        _tasks[task_id]["status"] = "failed"
-        _tasks[task_id]["exit_code"] = result["exit_code"]
-        _tasks[task_id]["stdout"] = result["stdout"]
-        _tasks[task_id]["stderr"] = result["stderr"]
-
-    _tasks[task_id]["completed_at"] = time.time()
-    _tasks[task_id]["engine"] = "parsl" if result.get("used_parsl") else "parsl-fallback"
+    os.makedirs(DEFAULT_WORK_DIR, exist_ok=True)
+    path = os.path.join(DEFAULT_WORK_DIR, filename)
+    with open(path, "w") as f:
+        f.write(resolved_code)
 
     return json.dumps({
-        "task_id": task_id,
-        "name": name,
-        "status": _tasks[task_id]["status"],
-        "exit_code": result["exit_code"],
-        "stdout": result["stdout"][:3000],
-        "stderr": result["stderr"][:3000],
-        "engine": _tasks[task_id]["engine"],
+        "status": "written",
+        "path": path,
+        "bash_apps": apps["bash_app"],
+        "python_apps": apps["python_app"],
+        "lines": len(resolved_code.splitlines()),
+        "next": f"Call run_workflow(filename='{filename}') to execute it.",
     }, indent=2)
 
 
 @mcp.tool()
-def submit_shell_task(
-    name: str,
-    command: str,
-    work_dir: str = "",
-    timeout: int = 1800,
+def run_workflow(
+    filename: str = "workflow.py",
+    timeout: int = 7200,
 ) -> str:
-    """Submit a shell command for execution.
+    """Execute a workflow file previously created with write_workflow.
 
-    Use this for file operations, system commands, and non-Python tasks.
+    The file is launched as `<VENV_PYTHON> <work_dir>/<filename>` by the server's
+    own Parsl @bash_app -- Parsl dispatches the launch, and the Parsl runtime
+    inside the generated file then schedules the actual @bash_app/@python_app
+    steps. The agent does not run anything itself.
 
     Args:
-        name: Descriptive name for this task (e.g. "copy_data_files", "create_directories")
-        command: Shell command to execute (e.g. "mkdir -p /app/work/run0/frames")
-        work_dir: Working directory (default: repo work/run0)
-        timeout: Max seconds to wait
+        filename: Workflow filename under the work dir (default: workflow.py)
+        timeout: Max seconds to wait (default: 7200)
 
     Returns:
-        JSON with task_id, status, and execution results
+        JSON with task_id, status, exit_code, stdout, stderr
     """
     task_id = f"task_{uuid.uuid4().hex[:8]}"
+    path = os.path.join(DEFAULT_WORK_DIR, os.path.basename(filename))
 
-    # Block attempts to bypass run_lammps by directly invoking the lmp binary,
-    # mpirun'ing it, or writing+running a driver script that imports lammps.
-    if (re.search(r"(^|[/\s])lmp(_mpi|_serial)?(\s|$)", command)
-            or "from lammps import" in command
-            or re.search(r"\bimport\s+lammps\b", command)):
+    if not os.path.isfile(path):
         return json.dumps({
             "task_id": task_id,
-            "status": "rejected",
+            "status": "failed",
             "error": (
-                "LAMMPS must be run via the `run_lammps` tool, not submit_shell_task. "
-                "Call: run_lammps(script='in.watbox', work_dir='/app/work/run0')."
+                f"No workflow file at {path}. "
+                f"Call write_workflow(python_code=..., filename='{filename}') first."
             ),
-        })
-
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
+        }, indent=2)
 
     _tasks[task_id] = {
-        "name": name,
+        "name": f"run_workflow:{filename}",
         "status": "running",
         "depends_on": [],
         "submitted_at": time.time(),
     }
 
-    # Replace /app/ paths with actual repo paths for local execution
-    resolved_cmd = _resolve_paths(command)
-    result = _run_bash_command(["bash", "-c", resolved_cmd], work_dir=_work, timeout=timeout)
+    cmd = f"{shlex.quote(VENV_PYTHON)} {shlex.quote(path)}"
+    result = _run_bash_command(["bash", "-lc", cmd], work_dir=DEFAULT_WORK_DIR, timeout=timeout)
 
     _tasks[task_id]["status"] = "completed" if result["exit_code"] == 0 else "failed"
     _tasks[task_id]["exit_code"] = result["exit_code"]
@@ -660,12 +607,14 @@ def submit_shell_task(
 
     return json.dumps({
         "task_id": task_id,
-        "name": name,
+        "name": _tasks[task_id]["name"],
         "status": _tasks[task_id]["status"],
+        "workflow_file": path,
+        "launch_command": cmd,
         "exit_code": result["exit_code"],
         "engine": _tasks[task_id]["engine"],
-        "stdout": result["stdout"][:3000],
-        "stderr": result["stderr"][:3000],
+        "stdout": result["stdout"][:6000],
+        "stderr": result["stderr"][:6000],
     }, indent=2)
 
 
@@ -855,174 +804,6 @@ def get_resources() -> str:
 
 
 @mcp.tool()
-def submit_mpi_task(
-    name: str,
-    command: str,
-    num_ranks: int = 0,
-    work_dir: str = "",
-    timeout: int = 1800,
-) -> str:
-    """Submit a command to run in parallel under MPI (srun or mpirun).
-
-    Prepends the detected MPI launcher to the given command. Use this for
-    MPI-capable executables such as LAMMPS (`lmp`), or parallel Python
-    scripts using mpi4py.
-
-    Args:
-        name:      Descriptive name for this task
-        command:   The executable and its arguments (without the launcher prefix),
-                   e.g. "lmp -in /app/work/run0/in.watbox"
-        num_ranks: Number of MPI ranks. 0 (default) uses all available ranks
-                   from PBS_NP, or 1 on a local machine.
-        work_dir:  Working directory (default: repo work/run0)
-        timeout:   Max seconds to wait (default: 1800)
-
-    Returns:
-        JSON with task_id, status, exit_code, stdout, stderr
-    """
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
-
-    resources = _detect_resources()
-    ranks = num_ranks if num_ranks > 0 else resources["ntasks"]
-    launcher = resources["launcher"]
-
-    if launcher == "srun":
-        full_cmd = f"srun -n {ranks} {command}"
-    elif launcher == "mpirun":
-        full_cmd = f"mpirun -np {ranks} {command}"
-    else:
-        # no MPI launcher found, just run it directly as a single process
-        full_cmd = command
-
-    _tasks[task_id] = {
-        "name": name,
-        "status": "running",
-        "depends_on": [],
-        "submitted_at": time.time(),
-        "mpi_ranks":  ranks,
-        "launcher":   launcher,
-    }
-
-    resolved_cmd = _resolve_paths(full_cmd)
-    result = _run_bash_command(["bash", "-c", resolved_cmd], work_dir=_work, timeout=timeout)
-
-    _tasks[task_id]["status"] = "completed" if result["exit_code"] == 0 else "failed"
-    _tasks[task_id]["exit_code"] = result["exit_code"]
-    _tasks[task_id]["stdout"] = result["stdout"]
-    _tasks[task_id]["stderr"] = result["stderr"]
-    _tasks[task_id]["completed_at"] = time.time()
-
-    return json.dumps({
-        "task_id":   task_id,
-        "name":      name,
-        "status":    _tasks[task_id]["status"],
-        "launcher":  launcher,
-        "ranks":     ranks,
-        "command":   full_cmd,
-        "exit_code": result["exit_code"],
-        "stdout":    result["stdout"][:3000],
-        "stderr":    result["stderr"][:3000],
-    }, indent=2)
-
-
-@mcp.tool()
-def run_lammps(
-    script: str = "in.watbox",
-    work_dir: str = "",
-    timeout: int = 7200,
-) -> str:
-    """Run a LAMMPS simulation. Automatically selects the right execution method:
-    - Inside a PBS job with mpirun available: mpirun -np PBS_NP lmp -in <script>
-    - Otherwise (local / no MPI launcher): Python API (single process)
-
-    Args:
-        script: Input script filename relative to work_dir (default: in.watbox)
-        work_dir: Working directory containing the script and data files.
-                  Supports /app/ paths (default: repo work/run0)
-        timeout: Max seconds to wait (default: 7200)
-
-    Returns:
-        JSON with task_id, status, method (mpi|python_api), ranks, stdout, stderr
-    """
-    import glob as _glob
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
-
-    # Clear previous trajectory frames so stale output can't be mistaken for a new run.
-    frames_dir = os.path.join(_work, "frames")
-    if os.path.isdir(frames_dir):
-        for _old in _glob.glob(os.path.join(frames_dir, "*.lammpstrj")):
-            os.remove(_old)
-
-    res = _detect_resources()
-    use_mpi = res["in_pbs"] and bool(res["launcher"])
-    method = "mpi" if use_mpi else "python_api"
-    ranks = res["ntasks"] if use_mpi else 1
-
-    _tasks[task_id] = {
-        "name": f"run_lammps:{script}",
-        "status": "running",
-        "depends_on": [],
-        "submitted_at": time.time(),
-        "method": method,
-    }
-
-    if use_mpi:
-        # the pip lammps wheel's bundled lmp binary won't load on this cluster's kernel,
-        # dmesg shows an elf segment-layout mismatch no matter which MPI it's paired with.
-        # the cluster module (gcc 13.2.0 + OpenMPI 5.0.6) is built for this kernel and works.
-        # need -l so `module` is defined, and it unsets the Intel-MPI singleton vars
-        # TASK_ENV sets for the python-API fallback since those break a real mpirun launch
-        cmd = (
-            f"module load lammps/22Jul2025 >/dev/null 2>&1 && "
-            f"cd {_work} && "
-            f"env -u PMI_SIZE -u PMI_RANK -u I_MPI_HYDRA_BOOTSTRAP "
-            f"mpirun -n {ranks} lmp -in {script}"
-        )
-        result = _run_bash_command(["bash", "-lc", cmd], work_dir=_work, timeout=timeout)
-    else:
-        py_script = f"""\
-import os, sys
-os.chdir("{_work}")
-from lammps import lammps
-lmp = lammps(cmdargs=["-screen", "none"])
-lmp.file("{script}")
-lmp.close()
-"""
-        result = _run_python_script(py_script, work_dir=_work, timeout=timeout)
-
-    exit_code = result["exit_code"]
-    frames_written = _glob.glob(os.path.join(frames_dir, "*.lammpstrj")) if os.path.isdir(frames_dir) else []
-    # exit 11 = SIGSEGV on lmp cleanup, but output was already written before it crashed
-    if exit_code == 11 and frames_written:
-        status = "completed"
-        note = f"lmp exited 11 (SIGSEGV cleanup crash) but {len(frames_written)} trajectory frames were written — treating as success"
-    else:
-        status = "completed" if exit_code == 0 else "failed"
-        note = ""
-
-    _tasks[task_id]["status"] = status
-    _tasks[task_id]["exit_code"] = exit_code
-    _tasks[task_id]["stdout"] = result["stdout"]
-    _tasks[task_id]["stderr"] = result["stderr"]
-    _tasks[task_id]["completed_at"] = time.time()
-
-    return json.dumps({
-        "task_id":   task_id,
-        "name":      f"run_lammps:{script}",
-        "status":    status,
-        "method":    method,
-        "ranks":     ranks,
-        "exit_code": exit_code,
-        "frames":    len(frames_written),
-        "note":      note,
-        "stdout":    result["stdout"][:3000],
-        "stderr":    result["stderr"][:3000],
-    }, indent=2)
-
-
-@mcp.tool()
 def cleanup() -> str:
     """Clean up resources: clears the task registry and shuts down the Parsl DFK."""
     global _tasks, _PARSL_LOADED
@@ -1045,10 +826,114 @@ def cleanup() -> str:
 
 # __ Helpers ___________________________________________________________________
 
-def _indent(text: str, spaces: int) -> str:
-    """Indent every line of text by the given number of spaces."""
-    prefix = " " * spaces
-    return "\n".join(prefix + line for line in text.splitlines())
+# Direct-execution escapes. If the driver reaches for any of these, it is doing
+# the work itself instead of handing it to Parsl, which is exactly what the
+# generated-file model exists to prevent.
+_FORBIDDEN_CALLS = {
+    "os.system": "use a @bash_app returning the command string",
+    "os.popen": "use a @bash_app returning the command string",
+    "os.execv": "use a @bash_app returning the command string",
+    "os.spawnl": "use a @bash_app returning the command string",
+    "pty.spawn": "use a @bash_app returning the command string",
+    "commands.getoutput": "use a @bash_app returning the command string",
+}
+
+_LAUNCHER_RE = re.compile(r"\b(mpirun|mpiexec|srun|aprun)\b")
+
+
+def _decorator_names(node: ast.FunctionDef) -> set[str]:
+    """Collect decorator names on a function, bare or dotted, called or not."""
+    names = set()
+    for dec in node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, ast.Attribute):
+            names.add(target.attr)
+    return names
+
+
+def _validate_workflow_code(code: str) -> tuple[list[str], dict]:
+    """Check a generated Parsl driver obeys the generated-file execution model.
+
+    Returns (problems, apps). An empty problems list means the file is accepted.
+    apps maps "bash_app"/"python_app" to the function names carrying each.
+    """
+    problems: list[str] = []
+    apps = {"bash_app": [], "python_app": []}
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return [f"SyntaxError on line {e.lineno}: {e.msg}"], apps
+
+    app_fn_lines: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            decs = _decorator_names(node)
+            for kind in ("bash_app", "python_app", "join_app"):
+                if kind in decs:
+                    apps.setdefault(kind, []).append(node.name)
+                    end = getattr(node, "end_lineno", node.lineno)
+                    app_fn_lines.append((node.lineno, end))
+
+    if not apps["bash_app"] and not apps["python_app"]:
+        problems.append(
+            "No @bash_app or @python_app found. Every unit of work must be a "
+            "Parsl app -- CLI calls as @bash_app, Python work as @python_app."
+        )
+
+    def _inside_app(lineno: int) -> bool:
+        return any(start <= lineno <= end for start, end in app_fn_lines)
+
+    has_load = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        base = getattr(func.value, "id", "")
+        dotted = f"{base}.{func.attr}"
+        if dotted == "parsl.load":
+            has_load = True
+            continue
+        fix = _FORBIDDEN_CALLS.get(dotted)
+        if fix is None and base == "subprocess":
+            fix = "use a @bash_app returning the command string"
+        if fix:
+            problems.append(
+                f"Line {node.lineno}: direct execution via `{dotted}` is not "
+                f"allowed -- {fix}."
+            )
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mod = node.module if isinstance(node, ast.ImportFrom) else None
+            names = [a.name for a in node.names]
+            if mod == "subprocess" or "subprocess" in names:
+                problems.append(
+                    f"Line {node.lineno}: importing subprocess is not allowed -- "
+                    f"CLI work belongs in a @bash_app command string."
+                )
+
+    if not has_load:
+        problems.append(
+            "No parsl.load(config) call. The generated file must create and load "
+            "its own Parsl Config so Parsl -- not the caller -- schedules the work."
+        )
+
+    # An MPI launcher outside an app body means the driver is assembling a launch
+    # itself rather than letting a @bash_app express it.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _LAUNCHER_RE.search(node.value) and not _inside_app(node.lineno):
+                problems.append(
+                    f"Line {node.lineno}: MPI launcher found outside a @bash_app. "
+                    f"Put the mpirun/srun command inside a @bash_app body."
+                )
+
+    return problems, apps
 
 
 def _resolve_paths(text: str) -> str:

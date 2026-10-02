@@ -58,18 +58,20 @@ Follow this flow unless you have a specific reason to deviate.
 ### After explorer -- route BACK if:
 - Explorer reports that critical tasks failed after retries
 - Expected output files are missing
-- An `ENGINE USAGE WARNING` appears in the exploration summary -- a `submit_task`/
-  `submit_shell_task`/`submit_mpi_task` call didn't demonstrably exercise the real
-  workflow engine. Route to **explorer** with feedback naming the specific task.
+- An `ENGINE USAGE WARNING` appears in the exploration summary -- a call didn't
+  demonstrably exercise the real workflow engine. Route to **explorer** with
+  feedback naming the specific task.
   **The fix differs by engine -- don't give the wrong instruction:**
-  - **Parsl / PyCOMPSs**: `submit_task` already wraps every call in the real runtime
-    automatically (see the explorer's engine skill). A warning here means the
-    *server's* runtime fell back (`engine_backend` ends in `-fallback`) -- that's an
-    environment/install problem, not something the explorer can fix by rewriting
-    code. Do NOT tell the explorer to add `@python_app`/`@task`/`parsl.load()`/
-    `compss_start()` itself -- writing those inside `submit_task`'s code is the
-    anti-pattern the engine skill explicitly warns against (double-initializes the
-    runtime). If this keeps happening, route to **installer** instead.
+  - **Parsl**: the explorer writes one standalone Parsl file via `write_workflow`
+    and runs it via `run_workflow`; that file is *supposed* to define
+    `@bash_app`/`@python_app` functions and call `parsl.load()` itself. A warning
+    here means the *server's* own runtime fell back when launching the file
+    (`engine_backend` ends in `-fallback`) -- an environment/install problem. If it
+    keeps happening, route to **installer** instead.
+  - **PyCOMPSs**: `submit_task` already wraps every call in the real runtime
+    automatically (see the explorer's engine skill). A warning means the server's
+    runtime fell back -- again an environment problem, not something the explorer
+    fixes by rewriting code. Do NOT tell it to call `compss_start()` itself.
   - **ADIOS**: a warning here (with `engine_backend="adios2"`, not `-fallback`) means
     ADIOS2 was available but the explorer's code never called a real API (e.g.
     `adios2.open`/`Stream`/`.write(`/`.read(`) -- this IS something the explorer did

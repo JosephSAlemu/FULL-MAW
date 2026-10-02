@@ -83,8 +83,13 @@ mpirun -np $PBS_NP python3 my_parallel_script.py
 mpirun -np 32 lmp -in script.in
 ```
 
-Use the `submit_mpi_task` MCP tool — it reads `PBS_NP` automatically and
-prepends `mpirun -np N` so you don't need to hardcode the rank count.
+You never type these commands into a shell yourself — they are handed to the
+workflow engine, which runs them. How depends on the engine:
+
+- **Parsl**: there is no `submit_mpi_task`. The command goes inside a `@bash_app`
+  in the generated workflow file, which returns it as a string for Parsl to run.
+- **Other engines**: use the `submit_mpi_task` MCP tool — it reads `PBS_NP`
+  automatically and prepends `mpirun -np N`, so you don't hardcode the rank count.
 
 ---
 

@@ -30,7 +30,7 @@ mpi4py        (only if environment knowledge confirms MPI is available)
 ```
 
 That's the full requirement for the workflow to run end-to-end (snapshot/halo reading
-goes through CLI binaries via `subprocess`, not Python bindings).
+goes through pre-built CLI binaries run by the workflow engine, not Python bindings).
 
 **Optional:** `adios2` — only relevant if `--engine adios` is selected. If it's in
 `stack_decision`, try installing it (`pip install adios2`), but a failure here is not
