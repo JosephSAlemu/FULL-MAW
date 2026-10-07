@@ -1,46 +1,225 @@
 ---
 name: systems/adios
 description: >
-  ADIOS2 (Adaptable Input/Output System) workflow framework knowledge. Covers
-  high-performance I/O for scientific simulations, BP file format, SST streaming,
-  Python bindings, and differences from Parsl/PyCOMPSs. Load this skill when
-  the workflow uses ADIOS2 for data transport between pipeline stages.
+  ADIOS2 reference for MAW workflows. Covers the generated-file execution model
+  (write_workflow/run_workflow), the staged-pipeline structure, Stream read/write
+  round trips, MPMD in-situ streaming over SST with MPI_RANKS, BP format, the
+  MPI-enabled build, and how ADIOS2 differs from Parsl/PyCOMPSs.
 ---
 
-# ADIOS2 -- System Skill
+# ADIOS2 — System Skill
 
-ADIOS2 is a high-performance I/O framework developed at ORNL (Oak Ridge National
-Laboratory) for scientific simulations. It provides flexible data transport
-between workflow stages, supporting file-based (BP format), streaming (SST),
-and in-memory (DataMan) data exchange.
+ADIOS2 is a high-performance I/O framework from ORNL for scientific
+simulations. It moves data between workflow stages through BP files, SST
+streams, and in-memory transports.
+
+Load this skill when generating or debugging an ADIOS2 workflow.
 
 ---
 
-## READ THIS FIRST: Use `write_bp`/`read_bp`, Not Raw `submit_task`
+## READ THIS FIRST: You Write One File, Structured as a Pipeline
 
-Unlike Parsl/PyCOMPSs, the server **cannot** force real ADIOS2 usage the way
-`@python_app`/`@task` wrapping does -- ADIOS2 is an I/O library, not a task
-scheduler, so there's no single call-site to wrap around arbitrary code.
-`submit_task` only pre-imports `adios2`; it does nothing to stop you from
-importing it and then never calling it.
+The adios engine is **generated-file only**. You have exactly two execution
+tools:
 
-**Prefer `write_bp(name, bp_path, python_code)` / `read_bp(name, bp_path,
-python_code)` instead of `submit_task` for any real ADIOS2 I/O.** These tools
-have the server open a real `adios2.Stream(bp_path, "w"/"r")` for you --
-`python_code` runs with `stream` already bound to it. Call
-`stream.write(...)`/`stream.write_attribute(...)` (write mode) or
-`stream.read(...)`/`stream.read_attribute(...)` (read mode) on it directly.
-**Do not open your own Stream or `import adios2` yourself inside that code --
-the server already did both.**
+| Tool | What it does |
+|---|---|
+| `write_workflow(python_code, filename)` | Writes ONE standalone workflow file to `/app/work/run0/` |
+| `run_workflow(filename)` | The server executes that file |
 
-This is checked, not just suggested: every `submit_task`/`write_bp`/`read_bp`
-call reports an `"engine"` field (see "MCP Server Behavior" below for the
-full 4-state breakdown). The one that matters for `write_bp`/`read_bp`:
-`"adios2-unused"` means ADIOS2 was available but your code never called the
-pre-opened Stream -- even inside `write_bp`/`read_bp`'s wrapper, if you never
-call `.write(`/`.read(` on it, you'll still get `"adios2-unused"`. This is
-recorded in the trace and the orchestrator routes back to you if it sees
-`"adios2-unused"` on a task that should have done real I/O.
+**You never execute anything yourself.** You do not call the CLI from your
+tools, write a bash script, or write a PBS script. You describe the whole
+pipeline in one file and hand it to the server.
+
+### ADIOS2 is an I/O library, not a scheduler
+
+This is the key difference from Parsl and PyCOMPSs. ADIOS2 has **no task
+decorator** — no `@bash_app`, no `@task`, nothing that wraps a function and
+schedules it. What it gives you is high-performance data movement between
+stages.
+
+So the generated file is a **staged pipeline**, and what matters is that the
+stages are real and that data flows between them through ADIOS2:
+
+- Each stage is a **top-level function**.
+- A **`main()`** calls the stages in order.
+- Inter-stage numerical data moves through ADIOS2: the producing stage calls
+  `stream.write(...)` on an `adios2.Stream(path, "w")`, and the consuming stage
+  reads it back with `stream.read(...)` from an `adios2.Stream(path, "r")`.
+  **Write it, then actually read it back** — do not keep using the in-memory
+  copy, because then no real I/O happened.
+- Human-facing outputs (PNG, summary text) stay plain files. BP is for the
+  numerical arrays flowing between stages.
+
+### CLI steps
+
+Because ADIOS2 cannot launch programs, a CLI step for an **external compiled
+binary** is a stage function that uses `subprocess` internally. **That is allowed
+only inside a stage body.** `subprocess` at the top level of the file is rejected
+— at that point the file is a flat script rather than a pipeline.
+
+Python stages must never be subprocesses: they go in this same file and talk to
+each other through ADIOS2. See "MPMD Mode" below for running the whole pipeline
+under a single `mpirun` with zero per-stage subprocesses.
+
+### What `write_workflow` rejects
+
+- no stage functions, or no `main()`
+- `subprocess`/`os.system`/`os.popen` at module top level
+- never opening an `adios2.Stream` while adios2 is installed
+- writing without reading back (`adios_writes` or `adios_reads` at zero)
+
+On rejection, read the returned `errors`, fix the file, and call
+`write_workflow` again.
+
+---
+
+## Worked Example: simulate → analyze, with a real BP round trip
+
+```python
+import os
+import numpy as np
+import adios2
+
+WORK = "/app/work/run0"
+BP = f"{WORK}/particles.bp"
+
+
+def simulate(paramfile, bp_path):
+    """CLI stage: run the simulation binary, then publish its output via BP.
+
+    subprocess is used here because ADIOS2 cannot launch programs. It lives
+    inside the stage body, never at module level.
+    """
+    import subprocess
+
+    subprocess.run(
+        ["mpirun", "-n", "8", "/path/to/sim_binary", paramfile],
+        check=True,
+    )
+
+    arr = np.loadtxt(f"{WORK}/raw_output.txt", dtype=np.float32)
+    with adios2.Stream(bp_path, "w") as s:
+        s.write("positions", arr, arr.shape, [0] * arr.ndim, arr.shape)
+        s.write_attribute("nparticles", arr.shape[0])
+    return bp_path
+
+
+def analyze(bp_path, outdir):
+    """Analysis stage: read the array back out of BP, render it."""
+    import matplotlib
+    matplotlib.use("Agg")            # headless compute node
+    import matplotlib.pyplot as plt
+
+    with adios2.Stream(bp_path, "r") as s:
+        for _ in s.steps():
+            positions = s.read("positions")
+
+    os.makedirs(outdir, exist_ok=True)
+    plt.hist2d(positions[:, 0], positions[:, 1], bins=256)
+    png = os.path.join(outdir, "density.png")
+    plt.savefig(png, dpi=150)
+    plt.close()
+    return png
+
+
+def main():
+    os.makedirs(WORK, exist_ok=True)
+    simulate("/path/to/indat.params", BP)
+    png = analyze(BP, WORK)
+    print(f"wrote {png}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+What makes this legal: named stages driven by `main()`, `subprocess` confined
+to a stage body, and `positions` genuinely written to BP and read back out
+rather than passed in memory.
+
+---
+
+## MPMD Mode: One `mpirun`, Zero Per-Stage Subprocesses
+
+The pipeline above is sequential: each stage runs to completion before the next
+starts, and data lands in a `.bp` file in between. For true **in-situ**
+streaming — producer and consumer running *concurrently*, data moving through
+memory over SST — declare a rank budget and split the communicator.
+
+Add a top-level `MPI_RANKS = <int>`. The server sees it and launches the file as
+`mpirun -n <MPI_RANKS> python workflow.py`, so every stage is a rank of the same
+job. `run_workflow` reports `launch_mode: "mpmd:<n>"` instead of `"serial"`.
+
+```python
+MPI_RANKS = 4                       # server launches under mpirun -n 4
+
+import numpy as np, adios2
+from mpi4py import MPI
+
+world = MPI.COMM_WORLD
+rank, size = world.Get_rank(), world.Get_size()
+
+NPROD = 2                                   # ranks 0-1 produce, 2-3 consume
+role = 0 if rank < NPROD else 1
+comm = world.Split(color=role, key=rank)    # each stage gets its own communicator
+lrank, lsize = comm.Get_rank(), comm.Get_size()
+
+def simulate(comm):
+    ad = adios2.Adios(comm)                 # pass the SPLIT comm, not COMM_WORLD
+    io = ad.declare_io("sim")
+    io.set_engine("SST")                    # in-memory streaming, no file
+    u = np.zeros(4, dtype=np.float64)
+    var = io.define_variable("U", u, [lsize*4], [lrank*4], [4])   # define ONCE
+    e = io.open("gs_stream", adios2.bindings.Mode.Write, comm)
+    for step in range(3):
+        u[:] = float(step * 10 + lrank)
+        e.begin_step(); e.put(var, u); e.end_step()
+    e.close()
+
+def analyze(comm):
+    ad = adios2.Adios(comm)
+    io = ad.declare_io("ana")
+    io.set_engine("SST")
+    e = io.open("gs_stream", adios2.bindings.Mode.Read, comm)
+    while True:
+        if e.begin_step() != adios2.bindings.StepStatus.OK:
+            break
+        v = io.inquire_variable("U")
+        n = int(v.shape()[0])
+        out = np.zeros(n, dtype=np.float64)
+        v.set_selection([[0], [n]])
+        e.get(v, out)
+        e.end_step()
+        print(f"consumer {lrank}: sum {out.sum()}")
+    e.close()
+
+simulate(comm) if role == 0 else analyze(comm)
+```
+
+This is the gray-scott pattern: instead of four terminals or an MPMD colon
+command line, the roles live in one file and dispatch on rank.
+
+What the validator additionally enforces when `MPI_RANKS` is set:
+
+- `MPI.COMM_WORLD` must be used (rank/size come from it)
+- `.Split(` must be called (each stage needs its own communicator)
+- the split `comm` must be passed to ADIOS2 — `Adios(comm)` and
+  `io.open(name, mode, comm)`, not bare `Adios()`
+
+With `MPI_RANKS` set, `main()` is not required: rank role selects the stage.
+
+### MPMD gotchas
+
+| Gotcha | Rule |
+|---|---|
+| `define_variable` inside the step loop | Raises "variable U already defined". Define once before the loop, reuse the handle |
+| Passing `COMM_WORLD` to a stage's `Adios()` | Stages must get their own split comm, or they collide |
+| Reading without `set_selection` | A reader rank must declare which slice of the global array it wants |
+| `v.Shape()` | The Python binding is lowercase `v.shape()` |
+| SST writer with no reader | Blocks on the rendezvous. Both roles must exist in the same launch |
+| SST between two threads of one process | Deadlocks. SST expects separate ranks — use MPMD, not threads |
+| A run that times out, then every later run times out | A killed run leaves a stale `<name>.sst` rendezvous file and the next open waits on a peer that is gone. `run_workflow` clears `*.sst` before each MPMD launch, but if you run a file by hand, delete them yourself |
 
 ---
 
@@ -50,19 +229,17 @@ recorded in the trace and the orchestrator routes back to you if it sees
 import adios2
 import numpy as np
 
-# Write data to BP file
-with adios2.open("output.bp", "w") as fw:
-    for step in range(num_steps):
-        fw.write("temperature", temperature_array, shape, start, count)
-        fw.end_step()
+# Stream API (preferred -- this is what the validator looks for)
+with adios2.Stream("output.bp", "w") as s:
+    s.write("temperature", arr, arr.shape, [0], arr.shape)
+    s.write_attribute("units", "kelvin")
 
-# Read data from BP file
-with adios2.open("output.bp", "r") as fr:
-    for step in fr:
-        data = step.read("temperature")
-        # process data
+with adios2.Stream("output.bp", "r") as s:
+    for _ in s.steps():
+        data = s.read("temperature")
+        units = s.read_attribute("units")
 
-# Streaming mode (SST) -- producer
+# Lower-level engine API, for streaming (SST) producers
 adios = adios2.ADIOS()
 io = adios.declare_io("SimOutput")
 io.set_engine("SST")
@@ -73,6 +250,19 @@ writer.end_step()
 writer.close()
 ```
 
+`stream.write(name, array, shape, start, count)` — the last three describe the
+global shape and this writer's slice of it, which is what makes parallel writes
+compose into one logical array.
+
+---
+
+## Data Formats
+
+- **BP (Binary Pack)**: ADIOS2's native format, optimized for parallel I/O
+- **SST (Sustainable Staging Transport)**: real-time streaming between processes
+- **DataMan**: in-memory exchange for tightly coupled workflows
+- **HDF5**: readable/writable through ADIOS2's HDF5 engine
+
 ---
 
 ## Key Differences from Parsl/PyCOMPSs
@@ -80,91 +270,106 @@ writer.close()
 | Feature | Parsl | PyCOMPSs | ADIOS2 |
 |---|---|---|---|
 | Primary role | Task scheduling | Task scheduling | Data I/O & transport |
-| Task decorator | `@python_app` | `@task` | None (I/O library) |
-| Data exchange | File system | File system | BP files, SST streams, in-memory |
-| Streaming support | No | No | Yes (SST, DataMan) |
+| Unit of work | `@python_app` / `@bash_app` | `@task` / `@binary` / `@mpi` | A plain stage function |
+| CLI steps | `@bash_app` command string | `@binary`/`@mpi` decorator | `subprocess` inside a stage |
+| Inter-stage data | Files / futures | Files / task parameters | BP files, SST streams |
+| Streaming | No | No | Yes (SST, DataMan) |
 | In-situ analysis | No | No | Yes |
-| HPC optimized I/O | No | No | Yes (parallel BP, aggregation) |
 
 ---
 
-## Data Formats
+## Engine States
 
-- **BP (Binary Pack)**: ADIOS2's native file format, optimized for parallel I/O
-- **SST (Sustainable Staging Transport)**: Real-time streaming between processes
-- **DataMan**: In-memory data exchange for tightly coupled workflows
-- **HDF5**: ADIOS2 can also read/write HDF5 via its HDF5 engine
+Every `write_workflow`/`run_workflow` response reports an `engine` field:
+
+1. **`"adios2"`** — ADIOS2 installed and the file genuinely calls a real API
+   (`adios2.Stream`/`open`/`declare_io`/`.write(`/`.read(`). The only state
+   meaning real ADIOS2 I/O happened.
+2. **`"adios2-unused"`** — ADIOS2 installed, the file mentions it, but no real
+   API call was detected. This is the "imported but never used" failure mode:
+   the run needs redoing, not reporting as success.
+3. **`"adios2-fallback"`** — ADIOS2 isn't installed here. The pipeline still
+   runs using numpy file I/O instead of BP — same computational result, no
+   ADIOS2. An environment gap, not an agent error.
+
+The orchestrator routes back to you on `"adios2-unused"` for a stage that
+should have done real I/O.
 
 ---
 
-## MCP Server Behavior
+## Common Pitfalls
 
-The ADIOS2 MCP server (`servers/adios_server.py`) operates in four states,
-reported via the `engine` field on every `submit_task`/`write_bp`/`read_bp`
-response:
-
-1. **`"adios2"`** -- ADIOS2 is installed AND the submitted code actually
-   called a real API (`adios2.open`/`Stream`/`.declare_io`/`.begin_step`/
-   `.end_step`/`.write(`/`.read(`, etc., depending on the tool). This is the
-   only state that means real ADIOS2 I/O actually happened.
-2. **`"adios2-unused"`** -- ADIOS2 is installed, the code shows intent to use
-   it (an `import adios2` for `submit_task`, or just being inside `write_bp`/
-   `read_bp`'s pre-opened Stream at all), but no real API call was detected
-   (`adios_server.py::_adios_engine_state` scans for it). This is the exact
-   "imported but never used" failure mode -- treat it as a task that needs to
-   be redone, not a success.
-3. **`"adios2-n/a"`** -- `submit_task`/`submit_shell_task`/`submit_mpi_task`
-   only: ADIOS2 is installed but the code has nothing to do with it at all (no
-   `import adios2`). Most tasks in an ADIOS run (LAMMPS, OVITO, rendering,
-   GIF assembly, ...) legitimately fall here -- this is NOT a warning, it
-   just means ADIOS2 usage wasn't expected for that task. Only
-   `"adios2-unused"` (intent shown, never followed through) is a real
-   problem. `write_bp`/`read_bp` never report this state -- every call to
-   them is meant to do real I/O, so not calling `.write(`/`.read(` is always
-   `"adios2-unused"`, never `"n/a"`.
-4. **`"adios2-fallback"`** -- ADIOS2 isn't installed in this environment at
-   all. Tasks execute as plain Python using numpy file I/O (.npy/.npz)
-   instead of BP files -- same computational result, just without ADIOS2.
-   Not your fault if you see this; it's an environment/install gap.
+| Pitfall | Rule |
+|---|---|
+| `subprocess` at module top level | Rejected. Put the CLI call inside a stage function |
+| `subprocess` to run another *Python* stage | Never. Python stages live in this file and talk over ADIOS2 |
+| Flat script with no functions | Rejected. Named stages, driven by `main()` |
+| Writing to BP but never reading back | Rejected. The consumer must `stream.read(...)` it |
+| Passing a big array stage-to-stage in memory | Defeats the point of this engine — route it through BP |
+| Putting the PNG or summary into BP | BP is for inter-stage numerical arrays; deliverables stay plain files |
+| Rendering without `matplotlib.use("Agg")` | Headless nodes have no display |
+| Assuming ADIOS2 schedules anything | It does not. It is I/O only; ordering comes from `main()` |
 
 ---
 
 ## Running with ADIOS2
 
-On HPC systems with ADIOS2 installed:
 ```bash
-module load adios2
 python agent_mcp.py --engine adios --paper 1 --goal "..."
 ```
 
-On local machines without ADIOS2:
+`adios_server.py` sets the needed env vars itself, so no module loading is
+required before running the agent.
+
+### The MPI build (required for MPMD)
+
+**The PyPI `adios2` wheel is a SERIAL build** — `bindings.is_built_with_mpi` is
+`False`, `Adios(comm)` raises, and SST cannot stream between ranks. MPMD mode
+needs an MPI-enabled build. On Improv this was built by hand:
+
 ```bash
-# Works fine -- falls back to numpy I/O
-python agent_mcp.py --engine adios --paper 1 --goal "..."
+module load gcc/14.2.0 openmpi/5.0.7/gcc/14.2.0 cmake/3.27.4
+
+# mpi4py must be built against the SAME MPI, not the PyPI wheel
+MPICC=$(which mpicc) pip install --no-binary=mpi4py --force-reinstall --no-cache-dir mpi4py
+
+curl -LO https://github.com/ornladios/ADIOS2/archive/refs/tags/v2.10.2.tar.gz
+tar xzf v2.10.2.tar.gz && cd ADIOS2-2.10.2 && mkdir build && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=$HOME/.local/adios2-mpi \
+  -DCMAKE_BUILD_TYPE=Release -DADIOS2_USE_MPI=ON -DADIOS2_USE_Python=ON \
+  -DPython_EXECUTABLE=<repo>/venv3/bin/python \
+  -DADIOS2_USE_Fortran=OFF -DADIOS2_USE_HDF5=OFF -DBUILD_TESTING=OFF \
+  -DCMAKE_C_COMPILER=$(which mpicc) -DCMAKE_CXX_COMPILER=$(which mpicxx)
+make -j32 && make install
 ```
 
-Installing ADIOS2 Python bindings:
-```bash
-pip install adios2       # may require system-level ADIOS2 installation
-conda install -c conda-forge adios2
+Then copy the built package over the wheel's in site-packages. Verify with:
+
+```python
+from adios2 import bindings; print(bindings.is_built_with_mpi)   # must be True
 ```
+
+Two environment traps the server already handles via `TASK_ENV`, worth knowing
+if you run a workflow by hand:
+
+- **`LD_LIBRARY_PATH`** must include `$ADIOS2_HOME/lib64`, or the import fails
+  with `libadios2_cxx11_mpi.so.2.10: cannot open shared object file`.
+- **`LD_PRELOAD`** must pin gcc-14's `libstdc++.so.6`. `numpy` loads a spack
+  gcc-8.5 `libstdc++` first, and whichever lands in the process wins — so
+  importing numpy before adios2 fails with
+  `version 'GLIBCXX_3.4.32' not found`.
+
+Override `ADIOS2_HOME`, `GCC14_LIB`, or `OPENMPI_BIN` if installed elsewhere.
+
+Without the MPI build, serial pipelines still work normally; only `MPI_RANKS`
+MPMD mode is unavailable.
 
 ---
 
 ## Common Use Cases
 
 - Reading large MD trajectory files in BP format
-- Streaming simulation output in real-time (in-situ analysis)
-- Coupled simulations (e.g., simulation + analytics pipeline)
+- Streaming simulation output for in-situ analysis
+- Coupled simulations (simulation + analytics pipeline)
 - High-performance parallel I/O on HPC file systems
 - Paired with LAMMPS via `dump adios` in the LAMMPS input script
-
----
-
-## Notes
-
-- ADIOS2 is primarily an I/O layer, not a task scheduler
-- On HPC, it is often used together with Parsl or PyCOMPSs
-- The fallback mode ensures the MCP approach works anywhere
-- ADIOS2's streaming mode (SST) is particularly valuable for in-situ workflows
-  where analytics run concurrently with simulation

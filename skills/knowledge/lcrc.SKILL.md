@@ -83,13 +83,17 @@ mpirun -np $PBS_NP python3 my_parallel_script.py
 mpirun -np 32 lmp -in script.in
 ```
 
-You never type these commands into a shell yourself — they are handed to the
-workflow engine, which runs them. How depends on the engine:
+You never type these commands into a shell yourself — they go into the
+generated workflow file, and the engine runs them. How depends on the engine:
 
-- **Parsl**: there is no `submit_mpi_task`. The command goes inside a `@bash_app`
-  in the generated workflow file, which returns it as a string for Parsl to run.
-- **Other engines**: use the `submit_mpi_task` MCP tool — it reads `PBS_NP`
-  automatically and prepends `mpirun -np N`, so you don't hardcode the rank count.
+- **Parsl**: a `@bash_app` whose body returns the command string.
+- **PyCOMPSs**: an `@mpi(binary=..., runner="mpirun", processes=N)` task —
+  `processes=` carries the rank count, so no `mpirun` text is written.
+- **ADIOS2**: a stage function that calls `subprocess` internally, since ADIOS2
+  has no launcher of its own.
+
+Use `$PBS_NP` (via `get_resources`) to size the rank count rather than
+hardcoding it.
 
 ---
 

@@ -20,7 +20,7 @@ Usage:
     tracer.log_agent_end("planner")
 
     tracer.log_llm_call("planner", "claudeopus48", messages, response_text, ...)
-    tracer.log_tool_call("explorer", "submit_task", {"name": "run_lammps"}, result, True)
+    tracer.log_tool_call("explorer", "run_workflow", {"filename": "workflow.py"}, result, True)
     tracer.log_skill_load("planner", "agents/planner", found=True)
 
     tracer.finalize_run("completed")

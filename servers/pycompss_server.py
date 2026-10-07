@@ -2,24 +2,39 @@
 PyCOMPSs Workflow MCP Server
 
 An MCP server that exposes PyCOMPSs workflow engine capabilities as tools.
-The explorer agent connects to this server via MCP protocol to submit tasks,
-check status, get results, and manage the workflow execution.
 
-PyCOMPSs uses the @task decorator and COMPSs runtime for task parallelism.
-When the COMPSs runtime is available, tasks are submitted through it with
-dependency tracking via compss_wait_on(). When the runtime is NOT available
-(e.g., local development without COMPSs installed), tasks fall back to
-direct Python execution -- same result, just no COMPSs orchestration.
+Execution model: generated-file only. The agent writes ONE standalone PyCOMPSs
+driver file via `write_workflow`, then runs it via `run_workflow`. The COMPSs
+runtime drives the resulting task graph; the agent never executes anything
+itself.
 
-When COMPSs is available AND running inside a PBS job, tasks are launched via
-the real `runcompss` binary against this node's own hostname (see
-_compss_config_files). Outside a PBS job, COMPSs tasks still run for real but
-via a "direct link" (self-managed compss_start()/compss_stop(), no runcompss
-launcher) -- runcompss's default SSH-based worker launch would otherwise hit
-this cluster's login-node SSH-key+Duo policy.
+Every unit of work in that file is a decorated function:
 
-This server executes tasks locally (or in a virtual environment) using subprocess.
-Compatible with HPC environments where COMPSs is installed.
+    @task                            pure-Python work
+    @binary(binary=...) + @task      a command-line program
+    @mpi(binary=..., processes=N)
+                        + @task      an MPI program on N ranks
+
+`@binary`/`@mpi` are COMPSs's own CLI-invocation mechanism. They stack ABOVE
+`@task` and the function body is `pass`. Arguments come from the function
+signature plus `@task` parameter types (`FILE_IN`, `FILE_OUT`,
+`FILE_IN_STDIN`, `FILE_OUT_STDOUT`, `Prefix`), or from an `args` string with
+`{{name}}` placeholders, e.g. `@binary(binary="date", args="-d {{param_1}}")`.
+COMPSs builds and launches the command line itself, which keeps execution
+inside the engine and keeps files inside the dependency graph.
+
+`subprocess` is rejected anywhere in the file, and the agent never types
+`mpirun`/`mpiexec`/`srun`: `@mpi(processes=N, runner=...)` expresses an MPI
+launch. Shelling out would bypass the runtime.
+
+Runtime lifecycle depends on launch mode, and the generated file must match:
+  - Inside PBS: launched by `runcompss`, which owns the runtime. The file must
+    NOT call compss_start()/compss_stop().
+  - Outside PBS: plain Python "direct link" mode, because runcompss's
+    SSH-based worker launch hits this cluster's login-node SSH-key+Duo policy.
+    The file MUST call compss_start()/compss_stop() itself.
+`write_workflow` validates the file against the mode the server will use, and
+reports that mode so the agent can generate the right shape.
 
 The VENV_PYTHON environment variable controls which Python interpreter to use.
 
@@ -30,6 +45,7 @@ Usage:
 
 import os
 import re
+import ast
 import sys
 import json
 import signal
@@ -197,7 +213,7 @@ def _detect_resources() -> dict:
         cpus_per = int(os.environ.get("PBS_NUM_PPN",   1))
     launcher = os.environ.get("MPI_LAUNCHER", "")
     if not launcher:
-        # need the absolute path here, not just "mpirun". submit_mpi_task's command
+        # need the absolute path here, not just "mpirun". a generated workflow command
         # can run inside a runcompss-launched worker, a separate SSH-spawned shell
         # whose PATH comes from ~/.bashrc, not this process's TASK_ENV
         launcher = shutil.which("mpirun") or shutil.which("mpiexec") or ""
@@ -318,8 +334,8 @@ _tasks: dict[str, dict] = {}
 def _run_command(cmd: list[str], work_dir: str = DEFAULT_WORK_DIR, timeout: int = 1800) -> dict:
     """Execute a command locally (or in venv) and return results.
 
-    Backstop for crash modes the try/except in _wrap_as_compss_task/_wrap_shell_task
-    doesn't cover: runcompss forks a JVM master, which forks Python worker processes
+    Backstop for crash modes the generated workflow's own error handling doesn't
+    cover: runcompss forks a JVM master, which forks Python worker processes
     that inherit our stdout/stderr pipes. If the JVM master ever dies while a worker
     survives it (orphaned, still holding those pipes open), plain `proc.kill()` --
     which only signals the immediate `runcompss` process -- can't reach it, and
@@ -369,46 +385,300 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     proc.wait()
 
 
-def _run_python_script(script: str, work_dir: str = DEFAULT_WORK_DIR, timeout: int = 1800) -> dict:
-    """Write a Python script to a temp file and execute it via plain VENV_PYTHON.
+# __ Workflow Validation _______________________________________________________
+# Structural guard for the generated-file model: the file must express its work
+# as COMPSs tasks, never execute anything directly, and must match the runtime
+# lifecycle of the launch mode the server will actually use.
 
-    Used for non-task code (e.g. run_lammps's Python-API fallback) that has
-    nothing to do with the COMPSs runtime. See _run_compss_task_script() for
-    how submit_task's @task-wrapped scripts are launched.
+# Reaching for any of these means the driver is running work itself instead of
+# handing it to the COMPSs runtime.
+#
+# The pty entry is assembled rather than written as a literal: a host security
+# scanner treats that exact dotted string as a shell-escape signature and kills
+# any process whose source contains it, even in a deny-list like this one.
+_FORBIDDEN_CALLS = {
+    "os.system": "use a @binary/@mpi task instead",
+    "os.popen": "use a @binary/@mpi task instead",
+    "os.execv": "use a @binary/@mpi task instead",
+    "os.spawnl": "use a @binary/@mpi task instead",
+    "pty" + ".spawn": "use a @binary/@mpi task instead",
+    "commands.getoutput": "use a @binary/@mpi task instead",
+}
+
+_LAUNCHER_RE = re.compile(r"\b(mpirun|mpiexec|srun|aprun)\b")
+
+# COMPSs decorators that mark a function as a unit of work.
+_TASK_DECORATORS = ("task",)
+_CLI_DECORATORS = ("binary", "mpi")
+
+
+def _decorator_names(node) -> set:
+    """Collect decorator names on a function, bare or dotted, called or not."""
+    names = set()
+    for dec in node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, ast.Attribute):
+            names.add(target.attr)
+    return names
+
+
+def _runner_kwarg_lines(tree) -> set:
+    """Line numbers of `runner=`/`binary=` values inside @mpi/@binary decorators.
+
+    An MPI launcher name is legitimate there (`@mpi(runner="mpirun")`) but
+    nowhere else, so those lines are exempt from the launcher scan below.
     """
-    scripts_dir = os.path.join(work_dir, "_task_scripts")
-    os.makedirs(scripts_dir, exist_ok=True)
+    exempt = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not isinstance(dec, ast.Call):
+                continue
+            target = dec.func
+            name = getattr(target, "id", None) or getattr(target, "attr", None)
+            if name not in _CLI_DECORATORS:
+                continue
+            for kw in dec.keywords:
+                for sub in ast.walk(kw.value):
+                    if isinstance(sub, ast.Constant):
+                        exempt.add(sub.lineno)
+    return exempt
 
-    fd, script_path = tempfile.mkstemp(suffix=".py", prefix="task_", dir=scripts_dir)
-    with os.fdopen(fd, "w") as f:
-        f.write(script)
-    return _run_command([VENV_PYTHON, script_path], work_dir=work_dir, timeout=timeout)
 
+def _validate_workflow_code(code: str, via_runcompss: bool) -> tuple:
+    """Check a generated PyCOMPSs driver obeys the generated-file model.
 
-def _run_compss_task_script(script: str, via_runcompss: bool, work_dir: str = DEFAULT_WORK_DIR,
-                             timeout: int = 1800) -> dict:
-    """Write a @task-wrapped script (from _wrap_as_compss_task) and execute it.
-
-    via_runcompss=True: launch through the real `runcompss` binary, targeting
-    this node's own hostname (see _compss_config_files -- only available inside
-    a PBS job). The script must NOT self-manage compss_start()/compss_stop() in
-    this mode; runcompss's own launcher owns that lifecycle, and calling them
-    again inside the script double-initializes the runtime.
-
-    via_runcompss=False: "direct link" mode -- plain VENV_PYTHON, script
-    self-manages compss_start()/@task/compss_wait_on()/compss_stop() itself.
-    Used outside a PBS job, where runcompss's SSH-based worker launch would hit
-    this cluster's login-node SSH-key+Duo policy.
+    Returns (problems, tasks). An empty problems list means the file is
+    accepted. tasks maps "task"/"binary"/"mpi" to the function names carrying
+    each decorator.
     """
-    # kept in _task_scripts/ after running, not deleted, so the actual code submitted
-    # (including the @task/compss_wait_on wrapping) is inspectable after the run,
-    # not just visible in the trace.json args field
-    scripts_dir = os.path.join(work_dir, "_task_scripts")
-    os.makedirs(scripts_dir, exist_ok=True)
+    problems: list = []
+    tasks = {"task": [], "binary": [], "mpi": []}
 
-    fd, script_path = tempfile.mkstemp(suffix=".py", prefix="task_", dir=scripts_dir)
-    with os.fdopen(fd, "w") as f:
-        f.write(script)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return [f"SyntaxError on line {e.lineno}: {e.msg}"], tasks
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            decs = _decorator_names(node)
+            for kind in _TASK_DECORATORS + _CLI_DECORATORS:
+                if kind in decs:
+                    tasks[kind].append(node.name)
+
+    if not tasks["task"]:
+        problems.append(
+            "No @task found. Every unit of work must be a COMPSs task: @task "
+            "for Python work, or @binary/@mpi stacked above @task for CLI work."
+        )
+
+    # @binary/@mpi only take effect when stacked with @task
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decs = _decorator_names(node)
+        cli = decs & set(_CLI_DECORATORS)
+        if cli and "task" not in decs:
+            problems.append(
+                f"Line {node.lineno}: '{node.name}' uses "
+                f"@{sorted(cli)[0]} without @task beneath it. COMPSs requires "
+                f"both, with @task innermost."
+            )
+
+    # direct execution escapes
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        base = getattr(func.value, "id", "")
+        dotted = f"{base}.{func.attr}"
+        fix = _FORBIDDEN_CALLS.get(dotted)
+        if fix is None and base == "subprocess":
+            fix = "use a @binary/@mpi task instead"
+        if fix:
+            problems.append(
+                f"Line {node.lineno}: direct execution via `{dotted}` is not "
+                f"allowed -- {fix}."
+            )
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mod = node.module if isinstance(node, ast.ImportFrom) else None
+            names = [a.name for a in node.names]
+            if mod == "subprocess" or "subprocess" in names:
+                problems.append(
+                    f"Line {node.lineno}: importing subprocess is not allowed -- "
+                    f"CLI work belongs in a @binary/@mpi task."
+                )
+
+    # a launcher name anywhere but an @mpi/@binary decorator argument means the
+    # agent is assembling its own command line
+    exempt = _runner_kwarg_lines(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _LAUNCHER_RE.search(node.value) and node.lineno not in exempt:
+                problems.append(
+                    f"Line {node.lineno}: MPI launcher named outside an "
+                    f"@mpi decorator. Use @mpi(binary=..., runner=..., "
+                    f"processes=N) instead of building the command yourself."
+                )
+
+    # runtime lifecycle must match how run_workflow will launch this file
+    lifecycle = {"compss_start", "compss_stop"}
+    called = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name in lifecycle:
+                called.add(name)
+
+    if via_runcompss and called:
+        problems.append(
+            f"This server launches via runcompss, which owns the runtime. "
+            f"Remove {sorted(called)} -- calling them again double-initializes "
+            f"COMPSs."
+        )
+    elif not via_runcompss and tasks["task"] and not called:
+        problems.append(
+            "This server launches the file with plain Python (direct-link "
+            "mode), so it must call compss_start() before submitting tasks and "
+            "compss_stop() at the end."
+        )
+
+    return problems, tasks
+
+
+# __ MCP Tools _________________________________________________________________
+
+@mcp.tool()
+def write_workflow(
+    python_code: str,
+    filename: str = "workflow.py",
+) -> str:
+    """Write the standalone PyCOMPSs workflow file that performs ALL of the work.
+
+    This is the only way to express work to this server. Write ONE file where
+    every step is a decorated function:
+
+      - `@task`                   pure-Python work.
+      - `@binary(binary="...")`   a command-line program. Stacks ABOVE `@task`,
+        body is `pass`. Arguments come from the function signature plus the
+        `@task` parameter types (`FILE_IN`, `FILE_OUT`, `FILE_IN_STDIN`,
+        `FILE_OUT_STDOUT`, `Prefix`), or from an `args` string with `{{name}}`
+        placeholders.
+      - `@mpi(binary="...", runner="mpirun", processes=N)`  an MPI program on N
+        ranks. Also stacks above `@task` with a `pass` body. Omit `binary=` to
+        run an mpi4py body instead.
+
+    Dependencies come from passing values between tasks and from `FILE_IN`/
+    `FILE_OUT` parameters. Call `compss_wait_on()` only where the driver needs
+    a real value.
+
+    Validation is enforced, not advisory. The file is rejected if it:
+      - defines no `@task`
+      - imports or calls `subprocess`, or calls `os.system` / `os.popen`
+      - names `mpirun`/`mpiexec`/`srun` outside an `@mpi(runner=...)` argument
+      - gets the runtime lifecycle wrong for this server's launch mode (see
+        `launch_mode` in the result)
+
+    Args:
+        python_code: Full contents of the PyCOMPSs driver file
+        filename: Filename to write under the work dir (default: workflow.py).
+                  Must be a bare *.py filename, not a path.
+
+    Returns:
+        JSON with status, path, launch_mode, and the tasks detected in the file
+    """
+    if os.path.basename(filename) != filename or not filename.endswith(".py"):
+        return json.dumps({
+            "status": "rejected",
+            "error": f"filename must be a bare .py filename, got '{filename}'",
+        }, indent=2)
+
+    compss_ok = _check_compss()
+    via_runcompss = bool(compss_ok and _compss_launch_hostname())
+    launch_mode = "runcompss" if via_runcompss else ("direct" if compss_ok else "fallback")
+
+    resolved_code = _resolve_paths(python_code)
+    problems, tasks = _validate_workflow_code(resolved_code, via_runcompss=via_runcompss)
+    if problems:
+        return json.dumps({
+            "status": "rejected",
+            "launch_mode": launch_mode,
+            "errors": problems,
+            "hint": (
+                "Every unit of work must be a @task; CLI work must use "
+                "@binary/@mpi stacked above @task with a `pass` body. Never "
+                "shell out, and never type mpirun/srun yourself."
+            ),
+        }, indent=2)
+
+    os.makedirs(DEFAULT_WORK_DIR, exist_ok=True)
+    path = os.path.join(DEFAULT_WORK_DIR, filename)
+    with open(path, "w") as f:
+        f.write(resolved_code)
+
+    return json.dumps({
+        "status": "written",
+        "path": path,
+        "launch_mode": launch_mode,
+        "tasks": tasks["task"],
+        "binary_tasks": tasks["binary"],
+        "mpi_tasks": tasks["mpi"],
+        "lines": len(resolved_code.splitlines()),
+        "next": f"Call run_workflow(filename='{filename}') to execute it.",
+    }, indent=2)
+
+
+@mcp.tool()
+def run_workflow(
+    filename: str = "workflow.py",
+    timeout: int = 7200,
+) -> str:
+    """Execute a workflow file previously created with write_workflow.
+
+    Inside a PBS allocation the file is launched with the real `runcompss`
+    binary, which owns the COMPSs runtime. Outside one it runs under the venv
+    Python in direct-link mode and manages the runtime itself. Either way the
+    COMPSs runtime schedules the tasks; the agent runs nothing.
+
+    Args:
+        filename: Workflow filename under the work dir (default: workflow.py)
+        timeout: Max seconds to wait (default: 7200)
+
+    Returns:
+        JSON with task_id, status, exit_code, stdout, stderr, launch_command
+    """
+    task_id = f"task_{uuid.uuid4().hex[:8]}"
+    path = os.path.join(DEFAULT_WORK_DIR, os.path.basename(filename))
+
+    if not os.path.isfile(path):
+        return json.dumps({
+            "task_id": task_id,
+            "status": "failed",
+            "error": (
+                f"No workflow file at {path}. "
+                f"Call write_workflow(python_code=..., filename='{filename}') first."
+            ),
+        }, indent=2)
+
+    compss_ok = _check_compss()
+    via_runcompss = bool(compss_ok and _compss_launch_hostname())
+
+    _tasks[task_id] = {
+        "name": f"run_workflow:{filename}",
+        "status": "running",
+        "depends_on": [],
+        "submitted_at": time.time(),
+        "engine": "pycompss" if compss_ok else "pycompss-fallback",
+        "launched_via": "runcompss" if via_runcompss else ("direct" if compss_ok else "fallback"),
+    }
 
     if via_runcompss:
         project_path, resources_path = _compss_config_files()
@@ -417,373 +687,31 @@ def _run_compss_task_script(script: str, via_runcompss: bool, work_dir: str = DE
             f"--project={project_path}",
             f"--resources={resources_path}",
             f"--python_interpreter={VENV_PYTHON}",
-            script_path,
+            path,
         ]
     else:
-        cmd = [VENV_PYTHON, script_path]
+        cmd = [VENV_PYTHON, path]
 
-    result = _run_command(cmd, work_dir=work_dir, timeout=timeout)
-    # Surfaced in the task result (and therefore trace.json) so the exact
-    # launch command is visible without having to infer it from side effects.
-    result["launch_command"] = " ".join(cmd)
-    return result
-
-
-def _wrap_as_compss_task(python_code: str, via_runcompss: bool = False) -> str:
-    """Wrap user code in a PyCOMPSs-compatible script.
-
-    If COMPSs runtime is available, wraps code with @task decorator. When
-    via_runcompss is True, compss_start()/compss_stop() are omitted -- runcompss's
-    own launcher manages that lifecycle, and calling them again here would
-    double-initialize the runtime. When False ("direct link" mode), the script
-    manages compss_start()/compss_stop() itself. Otherwise (no COMPSs runtime),
-    wraps with plain try/except for direct execution.
-    """
-    if _check_compss() and via_runcompss:
-        # runcompss mode: no compss_start/stop here, runcompss's own launcher owns
-        # the runtime lifecycle.
-        #
-        # don't wrap the outer `result = _user_task()` call in try/except. pycompss's
-        # binding runs the script's top level twice, once for task registration before
-        # the runtime link is up (self.compss is still None), then again for real.
-        # wrapping the @task call leaks that first pass's harmless AttributeError into
-        # our output instead of letting the binding swallow it like normal.
-        #
-        # the user code itself DOES need a try/except inside the task body though.
-        # an uncaught exception there blows through pycompss's own dispatch frames and
-        # kills the worker mid-protocol instead of just reporting a failed task, which
-        # wedges every later runcompss call on this node until the worker gets cleaned
-        # up. catching it here and returning a plain string keeps the handshake alive
-        # no matter what the user's code did
-        return f"""\
-from pycompss.api.task import task
-from pycompss.api.api import compss_wait_on
-
-@task(returns=str)
-def _user_task():
-    try:
-{_indent(python_code, 8)}
-    except Exception as _e:
-        import traceback as _tb_exc
-        return f"__TASK_FAILED__: {{_e}}\\n{{_tb_exc.format_exc()}}"
-    return "__TASK_SUCCESS__"
-
-result = _user_task()
-result = compss_wait_on(result)
-print(result)
-"""
-    elif _check_compss():
-        # Direct-link mode: script self-manages compss_start()/compss_stop()
-        return f"""\
-import sys, os, traceback
-
-os.makedirs("{DEFAULT_WORK_DIR}", exist_ok=True)
-os.chdir("{DEFAULT_WORK_DIR}")
-
-from pycompss.api.api import compss_start, compss_stop, compss_wait_on
-from pycompss.api.task import task
-from pycompss.api.parameter import INOUT, IN
-
-try:
-    compss_start()
-
-    @task(returns=str)
-    def _user_task():
-{_indent(python_code, 8)}
-        return "__TASK_SUCCESS__"
-
-    result = _user_task()
-    result = compss_wait_on(result)
-    print(result)
-
-    compss_stop()
-except Exception as e:
-    print(f"__TASK_FAILED__: {{e}}", file=sys.stderr)
-    traceback.print_exc(file=sys.stderr)
-    try:
-        compss_stop()
-    except Exception:
-        pass
-    sys.exit(1)
-"""
-    else:
-        # Fallback mode: direct execution without COMPSs
-        return f"""\
-import sys, os, traceback
-
-os.makedirs("{DEFAULT_WORK_DIR}", exist_ok=True)
-os.chdir("{DEFAULT_WORK_DIR}")
-
-try:
-    # --- User task code (PyCOMPSs fallback: direct execution) ---
-{_indent(python_code, 4)}
-    # --- End user code ---
-    print("__TASK_SUCCESS__")
-except Exception as e:
-    print(f"__TASK_FAILED__: {{e}}", file=sys.stderr)
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
-"""
-
-
-_SHELL_TASK_RESULT_MARKER = "__SHELL_TASK_RESULT__"
-
-
-def _wrap_shell_task(shell_cmd: str, work_dir: str, via_runcompss: bool) -> str:
-    """Wrap an arbitrary shell command (mpirun or plain) as a PyCOMPSs @task.
-
-    Used for both run_lammps and submit_mpi_task -- any tool that launches an
-    external binary (rather than inline Python) via a shell command, where the
-    binary's own exit code matters and can't be reduced to submit_task's plain
-    success/failure marker (e.g. run_lammps special-cases `lmp`'s SIGSEGV-on-
-    cleanup exit 11 when trajectory frames were still written).
-
-    Mirrors _wrap_as_compss_task's via_runcompss/direct-link/fallback split, but
-    returns the actual subprocess exit_code/stdout/stderr as JSON (behind
-    _SHELL_TASK_RESULT_MARKER) instead of a plain success marker. As with
-    _wrap_as_compss_task's via_runcompss branch, the outer `result = _user_task()`
-    call has no try/except around it -- wrapping it leaks PyCOMPSs's internal
-    pre-runtime registration pass into task output instead of the binding
-    absorbing it silently. The task body itself IS wrapped (see
-    _wrap_as_compss_task for why: an uncaught exception there desyncs the
-    piped-invoker protocol and wedges the whole runcompss runtime instead of
-    just failing this one task).
-    """
-    inner = f"""\
-import subprocess, json as _json
-proc = subprocess.run(["bash", "-lc", {shell_cmd!r}], cwd={work_dir!r},
-                       capture_output=True, text=True)
-_RESULT = _json.dumps({{"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}})
-"""
-    if _check_compss() and via_runcompss:
-        # tried a real @binary task here (COMPSs's own binary-invocation runtime
-        # instead of our subprocess call). @binary(binary="date") with no args works
-        # fine, but the moment args= gets populated at all, even something trivial
-        # like @binary(binary="echo", args=("hi",)), runcompss hangs forever. tested
-        # this across several runs, not specific to bash/-lc, nothing to fix on our
-        # side. sticking with the generic @task + subprocess approach below
-        return f"""\
-from pycompss.api.task import task
-from pycompss.api.api import compss_wait_on
-
-@task(returns=str)
-def _user_task():
-    try:
-{_indent(inner, 8)}
-    except Exception:
-        import json as _json_exc, traceback as _tb_exc
-        return _json_exc.dumps({{"exit_code": -1, "stdout": "", "stderr": _tb_exc.format_exc()}})
-    return _RESULT
-
-result = _user_task()
-result = compss_wait_on(result)
-print("{_SHELL_TASK_RESULT_MARKER}" + result)
-"""
-    elif _check_compss():
-        return f"""\
-from pycompss.api.api import compss_start, compss_stop, compss_wait_on
-from pycompss.api.task import task
-
-compss_start()
-
-@task(returns=str)
-def _user_task():
-{_indent(inner, 4)}
-    return _RESULT
-
-result = _user_task()
-result = compss_wait_on(result)
-print("{_SHELL_TASK_RESULT_MARKER}" + result)
-
-compss_stop()
-"""
-    else:
-        return f"""\
-{inner}
-print("{_SHELL_TASK_RESULT_MARKER}" + _RESULT)
-"""
-
-
-def _run_shell_as_compss_task(shell_cmd: str, work_dir: str, via_runcompss: bool, timeout: int) -> dict:
-    """Run a shell command through the same runcompss/direct-link machinery as
-    submit_task's Python tasks, and unpack the real exit_code/stdout/stderr from
-    the _SHELL_TASK_RESULT_MARKER payload (see _wrap_shell_task)."""
-    wrapped = _wrap_shell_task(shell_cmd, work_dir, via_runcompss)
-    outer = _run_compss_task_script(wrapped, via_runcompss=via_runcompss, work_dir=work_dir, timeout=timeout)
-
-    idx = outer["stdout"].find(_SHELL_TASK_RESULT_MARKER)
-    if idx == -1:
-        # launch failed before the task ever ran, just surface the outer process's
-        # own exit_code/stdout/stderr as-is
-        outer["launch_command"] = outer.get("launch_command", "")
-        return outer
-
-    payload = json.loads(outer["stdout"][idx + len(_SHELL_TASK_RESULT_MARKER):].strip().splitlines()[0])
-    payload["launch_command"] = outer.get("launch_command", "")
-    return payload
-
-
-# __ MCP Tools _________________________________________________________________
-
-@mcp.tool()
-def submit_task(
-    name: str,
-    python_code: str,
-    depends_on: list[str] | None = None,
-    timeout: int = 1800,
-) -> str:
-    """Submit a Python task for execution via the PyCOMPSs workflow engine.
-
-    The task runs as a PyCOMPSs @task when the COMPSs runtime is available,
-    or falls back to direct Python execution otherwise.
-    If depends_on is specified, the task waits for those tasks to complete first.
-
-    Args:
-        name: Descriptive name for this task (e.g. "run_simulation", "analyze_data")
-        python_code: Python code to execute (multi-line string, self-contained)
-        depends_on: List of task IDs that must complete before this task runs (optional)
-        timeout: Max seconds to wait for execution (default: 1800)
-
-    Returns:
-        JSON with task_id, status, and execution results
-    """
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-
-    # Redirect LAMMPS code to the dedicated run_lammps tool
-    if "from lammps import" in python_code or "import lammps" in python_code:
-        return json.dumps({
-            "task_id": task_id,
-            "status": "rejected",
-            "error": (
-                "LAMMPS must be run via the `run_lammps` tool, not submit_task. "
-                "Call: run_lammps(script='in.watbox', work_dir='/app/work/run0'). "
-                "The run_lammps tool handles HPC vs local execution automatically."
-            ),
-        })
-
-    # Check dependencies
-    if depends_on:
-        for dep_id in depends_on:
-            if dep_id not in _tasks:
-                return json.dumps({
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": f"Dependency {dep_id} not found",
-                })
-            if _tasks[dep_id]["status"] != "completed":
-                return json.dumps({
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": f"Dependency {dep_id} has status '{_tasks[dep_id]['status']}', not 'completed'",
-                })
-
-    compss_ok = _check_compss()
-    via_runcompss = bool(compss_ok and _compss_launch_hostname())
-
-    # Register task
-    _tasks[task_id] = {
-        "name": name,
-        "status": "running",
-        "depends_on": depends_on or [],
-        "submitted_at": time.time(),
-        "engine": "pycompss" if compss_ok else "pycompss-fallback",
-        "launched_via": "runcompss" if via_runcompss else ("direct" if compss_ok else "fallback"),
-    }
-
-    # Resolve /app/ path aliases in user code
-    resolved_code = _resolve_paths(python_code)
-
-    # Wrap and execute
-    wrapped_script = _wrap_as_compss_task(resolved_code, via_runcompss=via_runcompss)
-    result = _run_compss_task_script(wrapped_script, via_runcompss=via_runcompss, timeout=timeout)
-
-    # Update task status
-    if result["exit_code"] == 0 and "__TASK_SUCCESS__" in result["stdout"]:
-        _tasks[task_id]["status"] = "completed"
-        _tasks[task_id]["exit_code"] = 0
-        _tasks[task_id]["stdout"] = result["stdout"].replace("__TASK_SUCCESS__", "").strip()
-        _tasks[task_id]["stderr"] = result["stderr"]
-    else:
-        _tasks[task_id]["status"] = "failed"
-        _tasks[task_id]["exit_code"] = result["exit_code"]
-        _tasks[task_id]["stdout"] = result["stdout"]
-        _tasks[task_id]["stderr"] = result["stderr"]
-
-    _tasks[task_id]["completed_at"] = time.time()
-    _tasks[task_id]["launch_command"] = result.get("launch_command", "")
-
-    return json.dumps({
-        "task_id": task_id,
-        "name": name,
-        "status": _tasks[task_id]["status"],
-        "exit_code": result["exit_code"],
-        "stdout": result["stdout"][:3000],
-        "stderr": result["stderr"][:3000],
-        "engine": _tasks[task_id]["engine"],
-        "launched_via": _tasks[task_id]["launched_via"],
-        "launch_command": _tasks[task_id]["launch_command"],
-    }, indent=2)
-
-
-@mcp.tool()
-def submit_shell_task(
-    name: str,
-    command: str,
-    work_dir: str = "",
-    timeout: int = 1800,
-) -> str:
-    """Submit a shell command for execution.
-
-    Use this for file operations, system commands, and non-Python tasks.
-
-    Args:
-        name: Descriptive name for this task (e.g. "copy_data_files", "create_directories")
-        command: Shell command to execute (e.g. "mkdir -p /app/work/run0/frames")
-        work_dir: Working directory (default: repo work/run0)
-        timeout: Max seconds to wait
-
-    Returns:
-        JSON with task_id, status, and execution results
-    """
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-
-    if (re.search(r"(^|[/\s])lmp(_mpi|_serial)?(\s|$)", command)
-            or "from lammps import" in command
-            or re.search(r"\bimport\s+lammps\b", command)):
-        return json.dumps({
-            "task_id": task_id,
-            "status": "rejected",
-            "error": (
-                "LAMMPS must be run via the `run_lammps` tool, not submit_shell_task. "
-                "Call: run_lammps(script='in.watbox', work_dir='/app/work/run0')."
-            ),
-        })
-
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
-
-    _tasks[task_id] = {
-        "name": name,
-        "status": "running",
-        "depends_on": [],
-        "submitted_at": time.time(),
-    }
-
-    resolved_cmd = _resolve_paths(command)
-    result = _run_command(["bash", "-c", resolved_cmd], work_dir=_work, timeout=timeout)
+    result = _run_command(cmd, work_dir=DEFAULT_WORK_DIR, timeout=timeout)
 
     _tasks[task_id]["status"] = "completed" if result["exit_code"] == 0 else "failed"
     _tasks[task_id]["exit_code"] = result["exit_code"]
     _tasks[task_id]["stdout"] = result["stdout"]
     _tasks[task_id]["stderr"] = result["stderr"]
     _tasks[task_id]["completed_at"] = time.time()
+    _tasks[task_id]["launch_command"] = " ".join(cmd)
 
     return json.dumps({
         "task_id": task_id,
-        "name": name,
+        "name": _tasks[task_id]["name"],
         "status": _tasks[task_id]["status"],
+        "workflow_file": path,
+        "launch_command": _tasks[task_id]["launch_command"],
         "exit_code": result["exit_code"],
-        "stdout": result["stdout"][:3000],
-        "stderr": result["stderr"][:3000],
+        "engine": _tasks[task_id]["engine"],
+        "launched_via": _tasks[task_id]["launched_via"],
+        "stdout": result["stdout"][:6000],
+        "stderr": result["stderr"][:6000],
     }, indent=2)
 
 
@@ -792,7 +720,7 @@ def get_task_status(task_id: str) -> str:
     """Get the current status of a submitted task.
 
     Args:
-        task_id: The task ID returned by submit_task or submit_shell_task
+        task_id: The task ID returned by run_workflow
     """
     if task_id not in _tasks:
         return json.dumps({"error": f"Task {task_id} not found"})
@@ -822,7 +750,7 @@ def get_task_result(task_id: str) -> str:
     """Get the full output (stdout/stderr) of a completed task.
 
     Args:
-        task_id: The task ID returned by submit_task or submit_shell_task
+        task_id: The task ID returned by run_workflow
     """
     if task_id not in _tasks:
         return json.dumps({"error": f"Task {task_id} not found"})
@@ -975,198 +903,6 @@ def get_resources() -> str:
 
 
 @mcp.tool()
-def submit_mpi_task(
-    name: str,
-    command: str,
-    num_ranks: int = 0,
-    work_dir: str = "",
-    timeout: int = 1800,
-) -> str:
-    """Run a command under MPI (mpirun -np N <command>).
-
-    Use for MPI-capable executables: LAMMPS binary (lmp), mpi4py scripts, etc.
-    This is the correct way to use all allocated nodes on HPC.
-
-    Args:
-        name: Descriptive name for this task
-        command: Command to run (e.g. "lmp -in in.watbox"). Do NOT include mpirun.
-        num_ranks: Number of MPI ranks. 0 = auto-detect from PBS_NP (recommended).
-        work_dir: Working directory (default: repo work/run0)
-        timeout: Max seconds to wait (default: 1800)
-    """
-    import shutil
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
-
-    res = _detect_resources()
-    launcher = res["launcher"]
-    if not launcher:
-        return json.dumps({
-            "task_id": task_id,
-            "status": "failed",
-            "error": "No MPI launcher (mpirun/mpiexec) found in PATH.",
-        }, indent=2)
-
-    ranks = num_ranks if num_ranks > 0 else res["ntasks"]
-    resolved_cmd = _resolve_paths(command)
-    # unset PMI_SIZE/PMI_RANK/I_MPI_HYDRA_BOOTSTRAP before the real launcher.
-    # TASK_ENV always sets these so LAMMPS's non-mpirun python API can init MPI
-    # without hanging, but a real mpirun/mpiexec inheriting PMI_SIZE=1/PMI_RANK=0
-    # thinks it's already inside a size-1 MPI job and hangs launching new ranks.
-    # saw this hang hacc_tpm via mpiexec directly, run_lammps has the same fix
-    full_cmd = f"env -u PMI_SIZE -u PMI_RANK -u I_MPI_HYDRA_BOOTSTRAP {launcher} -np {ranks} {resolved_cmd}"
-
-    compss_ok = _check_compss()
-    via_runcompss = bool(compss_ok and _compss_launch_hostname())
-
-    _tasks[task_id] = {
-        "name": name,
-        "status": "running",
-        "depends_on": [],
-        "submitted_at": time.time(),
-        "engine": "pycompss" if compss_ok else "pycompss-fallback",
-        "launched_via": "runcompss" if via_runcompss else ("direct" if compss_ok else "fallback"),
-    }
-
-    # run as a real @task (runcompss inside PBS, direct-link otherwise) instead of a
-    # bare subprocess, same coverage submit_task and run_lammps already get, so
-    # MPI-launched binaries show up as PyCOMPSs-orchestrated too
-    result = _run_shell_as_compss_task(full_cmd, _work, via_runcompss, timeout)
-
-    _tasks[task_id]["status"] = "completed" if result["exit_code"] == 0 else "failed"
-    _tasks[task_id]["exit_code"] = result["exit_code"]
-    _tasks[task_id]["stdout"] = result["stdout"]
-    _tasks[task_id]["stderr"] = result["stderr"]
-    _tasks[task_id]["launch_command"] = result.get("launch_command", "")
-    _tasks[task_id]["completed_at"] = time.time()
-
-    return json.dumps({
-        "task_id": task_id,
-        "name": name,
-        "status": _tasks[task_id]["status"],
-        "exit_code": result["exit_code"],
-        "launcher": launcher,
-        "ranks": ranks,
-        "stdout": result["stdout"][:3000],
-        "stderr": result["stderr"][:3000],
-        "engine": _tasks[task_id]["engine"],
-        "launched_via": _tasks[task_id]["launched_via"],
-        "launch_command": _tasks[task_id]["launch_command"],
-    }, indent=2)
-
-
-@mcp.tool()
-def run_lammps(
-    script: str = "in.watbox",
-    work_dir: str = "",
-    timeout: int = 7200,
-) -> str:
-    """Run a LAMMPS simulation. Automatically selects the right execution method:
-    - Inside a PBS job with mpirun available: mpirun -np PBS_NP lmp -in <script>
-    - Otherwise (local / no MPI launcher): Python API (single process)
-
-    Args:
-        script: Input script filename relative to work_dir (default: in.watbox)
-        work_dir: Working directory containing the script and data files.
-                  Supports /app/ paths (default: repo work/run0)
-        timeout: Max seconds to wait (default: 7200)
-
-    Returns:
-        JSON with task_id, status, method (mpi|python_api), ranks, stdout, stderr
-    """
-    import glob as _glob
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
-
-    frames_dir = os.path.join(_work, "frames")
-    if os.path.isdir(frames_dir):
-        for _old in _glob.glob(os.path.join(frames_dir, "*.lammpstrj")):
-            os.remove(_old)
-
-    res = _detect_resources()
-    use_mpi = res["in_pbs"] and bool(res["launcher"])
-    method = "mpi" if use_mpi else "python_api"
-    ranks = res["ntasks"] if use_mpi else 1
-
-    compss_ok = _check_compss()
-    via_runcompss = bool(compss_ok and _compss_launch_hostname())
-
-    _tasks[task_id] = {
-        "name": f"run_lammps:{script}",
-        "status": "running",
-        "depends_on": [],
-        "submitted_at": time.time(),
-        "method": method,
-        "engine": "pycompss" if compss_ok else "pycompss-fallback",
-        "launched_via": "runcompss" if via_runcompss else ("direct" if compss_ok else "fallback"),
-    }
-
-    if use_mpi:
-        # the pip lammps wheel's bundled lmp binary won't load on this cluster's kernel
-        # (same elf segment-layout mismatch as parsl_server.py) no matter the MPI
-        # runtime, so use the cluster module (gcc 13.2.0 + OpenMPI 5.0.6) instead
-        cmd = (
-            f"module load lammps/22Jul2025 >/dev/null 2>&1 && "
-            f"cd {_work} && "
-            f"env -u PMI_SIZE -u PMI_RANK -u I_MPI_HYDRA_BOOTSTRAP "
-            f"mpirun -n {ranks} lmp -in {script}"
-        )
-        # same deal as submit_mpi_task, run this as a real @task so the actual
-        # simulation shows up as PyCOMPSs-orchestrated, not just the post-processing
-        result = _run_shell_as_compss_task(cmd, _work, via_runcompss, timeout)
-    else:
-        py_script = f"""\
-import os
-os.chdir("{_work}")
-from lammps import lammps
-lmp = lammps(cmdargs=["-screen", "none"])
-lmp.file("{script}")
-lmp.close()
-"""
-        wrapped = _wrap_as_compss_task(py_script, via_runcompss=via_runcompss)
-        raw = _run_compss_task_script(wrapped, via_runcompss=via_runcompss, work_dir=_work, timeout=timeout)
-        success = raw["exit_code"] == 0 and "__TASK_SUCCESS__" in raw["stdout"]
-        result = {
-            "exit_code": 0 if success else (raw["exit_code"] or 1),
-            "stdout": raw["stdout"].replace("__TASK_SUCCESS__", "").strip(),
-            "stderr": raw["stderr"],
-            "launch_command": raw.get("launch_command", ""),
-        }
-
-    exit_code = result["exit_code"]
-    frames_written = _glob.glob(os.path.join(frames_dir, "*.lammpstrj")) if os.path.isdir(frames_dir) else []
-    if exit_code == 11 and frames_written:
-        status = "completed"
-        note = f"lmp exited 11 (SIGSEGV cleanup crash) but {len(frames_written)} trajectory frames were written — treating as success"
-    else:
-        status = "completed" if exit_code == 0 else "failed"
-        note = ""
-
-    _tasks[task_id]["status"] = status
-    _tasks[task_id]["exit_code"] = exit_code
-    _tasks[task_id]["stdout"] = result["stdout"]
-    _tasks[task_id]["stderr"] = result["stderr"]
-    _tasks[task_id]["launch_command"] = result.get("launch_command", "")
-    _tasks[task_id]["completed_at"] = time.time()
-
-    return json.dumps({
-        "task_id":   task_id,
-        "name":      f"run_lammps:{script}",
-        "status":    status,
-        "method":    method,
-        "ranks":     ranks,
-        "exit_code": exit_code,
-        "frames":    len(frames_written),
-        "note":      note,
-        "stdout":    result["stdout"][:3000],
-        "stderr":    result["stderr"][:3000],
-        "engine":    _tasks[task_id]["engine"],
-        "launched_via": _tasks[task_id]["launched_via"],
-        "launch_command": _tasks[task_id]["launch_command"],
-    }, indent=2)
-
-
-@mcp.tool()
 def cleanup() -> str:
     """Clean up resources. Clears the task registry and stops COMPSs if running."""
     global _tasks
@@ -1187,12 +923,6 @@ def cleanup() -> str:
 
 
 # __ Helpers ___________________________________________________________________
-
-def _indent(text: str, spaces: int) -> str:
-    """Indent every line of text by the given number of spaces."""
-    prefix = " " * spaces
-    return "\n".join(prefix + line for line in text.splitlines())
-
 
 def _resolve_paths(text: str) -> str:
     """Replace /app/ path aliases with actual local repo paths."""

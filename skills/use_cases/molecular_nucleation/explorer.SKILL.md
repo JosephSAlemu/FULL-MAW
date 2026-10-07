@@ -1,9 +1,10 @@
 ---
 name: use_cases/molecular_nucleation/explorer
 description: >
-  Use-case-specific explorer rules for water crystallization nucleation workflow
-  via LAMMPS + OVITO. Covers LAMMPS Python API usage, OVITO diamond structure
-  detection, file layout, and known pitfalls.
+  Use-case-specific explorer rules for the water crystallization nucleation workflow
+  via LAMMPS + OVITO. Covers expressing the whole pipeline as ONE generated workflow
+  file, the LAMMPS MPI and Python-API run paths, OVITO diamond structure detection,
+  file layout, and known pitfalls.
 ---
 
 # Molecular Nucleation -- Explorer Skill
@@ -20,11 +21,27 @@ molecular nucleation / water crystallization simulation.
 
 ---
 
-## Domain-Specific Tools (this use case)
+## Overall Shape: One Workflow File, All Stages
 
-| Tool | Purpose |
-|---|---|
-| `run_lammps` | Run the LAMMPS simulation. Auto-selects mpirun+binary on HPC, Python API locally. Call directly — never reimplement with `submit_task`. |
+Setup, LAMMPS, OVITO analysis, rendering, GIF assembly, and the timeseries plot are
+**one workflow**, written into a single file with `write_workflow(python_code, filename)`
+and executed with `run_workflow(filename)`. You never run any of it yourself: no
+subprocess from your tools, no CLI call, no bash script, no PBS script, no `qsub`, no
+`mpirun` typed by you.
+
+What that file looks like depends on the engine — see the engine reference injected in
+your context (`systems/parsl` / `systems/pycompss` / `systems/adios`) for the exact
+constructs. In short:
+
+| Engine | Python work (OVITO, rendering, GIF, plot) | CLI/MPI work (LAMMPS) |
+|---|---|---|
+| parsl | `@python_app` | `@bash_app` whose body returns the command **string** |
+| pycompss | `@task` | `@mpi(binary="lmp", runner="mpirun", processes=N)` stacked above `@task` |
+| adios | a top-level stage function called from `main()` | a stage function using `subprocess` **inside its body** |
+
+Ordering between stages is expressed with the engine's own dependency mechanism
+(Parsl futures / `File` objects, COMPSs `FILE_IN`/`FILE_OUT` parameter types, the call
+order inside ADIOS2's `main()`), never by polling or wall-clock timing.
 
 ---
 
@@ -37,17 +54,90 @@ The workflow has 3 main stages:
 
 ---
 
+## Stage 0: Setup
+
+Directory creation and input staging are steps **inside** the generated file, not
+separate calls you make. Express them as pure Python (`os.makedirs`, `shutil.copy2`)
+so they work identically on every engine:
+
+```python
+import os, shutil
+os.makedirs("/app/work/run0/frames", exist_ok=True)
+os.makedirs("/app/work/run0/renders", exist_ok=True)
+for f in ("AW.tersoff", "data.init", "in.watbox"):
+    shutil.copy2(f"/app/data/{f}", f"/app/work/run0/{f}")
+```
+
+Copy all three fresh on every run — the user may have edited `in.watbox`.
+
+---
+
 ## Stage 1: LAMMPS Simulation
 
-### Setup
-Use `submit_shell_task` to create directories and copy all input files:
+### Clear stale frames first
+
+Before the run, delete `/app/work/run0/frames/*.lammpstrj`. Otherwise trajectory files
+left over from a previous run can be mistaken for this run's output and a failed
+simulation looks like a successful one.
+
+### Path A: MPI run (inside PBS with a launcher)
+
+Use this when `get_resources` reports `in_pbs: true` and a launcher. The pip `lammps`
+wheel's bundled `lmp` binary does **not** load on this cluster's kernel (elf
+segment-layout mismatch) — use the cluster module instead:
+
+- `module load lammps/22Jul2025` (built with gcc 13.2.0 + OpenMPI 5.0.6)
+- `module` is a shell function, so the command needs a login shell: `bash -lc "..."`
+- Intel-MPI singleton variables must be unset before a real `mpirun`, or MPI init
+  fails: `env -u PMI_SIZE -u PMI_RANK -u I_MPI_HYDRA_BOOTSTRAP`
+
+The command is:
+
 ```
-mkdir -p /app/work/run0/frames /app/work/run0/renders
-cp /app/data/AW.tersoff /app/work/run0/
-cp /app/data/data.init /app/work/run0/
-cp /app/data/in.watbox /app/work/run0/
+bash -lc "module load lammps/22Jul2025 && cd /app/work/run0 && \
+  env -u PMI_SIZE -u PMI_RANK -u I_MPI_HYDRA_BOOTSTRAP mpirun -n <ranks> lmp -in in.watbox"
 ```
 
+Per engine:
+- **parsl**: that whole string is the return value of a `@bash_app`. Size the executor
+  slot for the job: `cores_per_worker=<ranks>`.
+- **pycompss**: `mpirun` is never typed — use
+  `@mpi(binary="lmp", runner="mpirun", processes=<ranks>)` above
+  `@task(script={Type: FILE_IN, Prefix: "-in"})`, with `working_dir="/app/work/run0"`.
+  The module environment and the `PMI_SIZE`/`PMI_RANK`/`I_MPI_HYDRA_BOOTSTRAP`
+  removals must already be in place in the driver's `os.environ` before the task is
+  submitted, because the decorator launches the binary directly with no shell.
+  Set `fail_by_exit_value=False` so the exit code comes back for the check below.
+- **adios**: a stage function whose body calls `subprocess.run(["bash", "-lc", cmd],
+  check=False)` — `subprocess` is legal there but only inside the stage body.
+
+### Path B: Python API, single process (no launcher)
+
+When there is no PBS allocation / no MPI launcher, run LAMMPS in-process from Python
+work (a `@python_app`, a `@task`, or an ADIOS2 stage function):
+
+```python
+import os
+os.chdir("/app/work/run0")          # BEFORE constructing lammps()
+from lammps import lammps
+lmp = lammps(cmdargs=["-screen", "none"])
+lmp.file("/app/work/run0/in.watbox")
+lmp.close()
+```
+
+`os.chdir('/app/work/run0')` MUST happen before the `lammps` instance is created,
+because the dump paths in `in.watbox` are relative to the current working directory.
+Do not pip install `lammps`; the bindings are already available.
+
+### Exit code handling
+
+- **Exit 11 is a SIGSEGV during LAMMPS cleanup.** If trajectory frames were written,
+  treat the step as **SUCCESS**, not failure. Have the step check for
+  `frames/*.lammpstrj` and only propagate a failure when none exist.
+- **Exit 143** is an MPI init SIGTERM — a real failure. Confirm `get_resources`
+  reported `in_pbs: true` and that the `env -u ...` unsets are present.
+
+Never modify `in.watbox` — it is user-controlled.
 
 ### Expected output
 - `/app/work/run0/frames/step.*.lammpstrj` — trajectory files
@@ -57,7 +147,8 @@ cp /app/data/in.watbox /app/work/run0/
 
 ## Stage 2: OVITO Analysis
 
-### Run analysis (run_python)
+Python work in the generated file:
+
 ```python
 import os, csv
 from ovito.io import import_file
@@ -105,9 +196,10 @@ print(f"Analysis complete: {pipeline.source.num_frames} frames -> {output_csv}")
 
 There are THREE visualization tasks. All three are REQUIRED -- do not skip any.
 
-### 3a: Render individual frames (run_python)
+### 3a: Render individual frames
 
-Render each trajectory frame as a PNG with color-coded atom types using matplotlib scatter plots.
+Render each trajectory frame as a PNG with color-coded atom types using matplotlib
+scatter plots.
 
 ```python
 import os, glob
@@ -167,7 +259,7 @@ print(f"Rendered {pipeline.source.num_frames} frames")
 - Hexagonal diamond (types 4-6): color `#FF2200` (red), alpha >= 0.8
 - Do NOT use OVITO's default yellow/white rendering
 
-### 3b: Generate animation GIF (run_python)
+### 3b: Generate animation GIF
 
 Combine the rendered frame PNGs into an animated GIF.
 
@@ -196,7 +288,7 @@ else:
 - `duration=100` means 100ms per frame
 - `loop=0` means infinite loop
 
-### 3c: Nucleation timeseries plot (run_python)
+### 3c: Nucleation timeseries plot
 ```python
 import os, csv
 import matplotlib
@@ -241,19 +333,21 @@ this cluster's LAMMPS module: ADIOS is not compiled in. Attempting it just
 fails with "Unrecognized dump style." `in.watbox` also stays untouched
 regardless, per the existing rule.
 
-The real inter-stage numerical data this applies to is Stage 2's per-frame
-diamond-structure counts (frame, timestep, cubic_diamond_count,
+The generated file calls the `adios2` library **directly** inside the stage
+functions. The real inter-stage numerical data this applies to is Stage 2's
+per-frame diamond-structure counts (frame, timestep, cubic_diamond_count,
 hexagonal_diamond_count) -- the only numbers that flow from one stage to
 another in this workflow:
 
-- **Stage 2 (OVITO analysis)**: write the per-frame counts with `write_bp`
-  instead of (or in addition to) `results.csv` -- one `stream.write(...)`
-  call per column per frame inside the same loop that currently builds the
-  CSV rows. This is the producer side of the real transport, not a
-  conversion step bolted on after the fact.
-- **Stage 3c (nucleation timeseries plot)**: read those counts back with
-  `read_bp` -- `for _ in stream.steps(): cubic = stream.read("cubic_diamond_count")`
-  etc. -- instead of opening `results.csv` directly.
+- **Stage 2 (OVITO analysis stage)**: accumulate the per-frame counts and write
+  them through `adios2.Stream(path, "w")` with `stream.write(...)`, in the same
+  loop that builds the `results.csv` rows. This is the producer side of the real
+  transport, not a conversion step bolted on after the fact.
+- **Stage 3c (nucleation timeseries stage)**: read those arrays back with
+  `adios2.Stream(path, "r")` --
+  `for _ in stream.steps(): cubic = stream.read("cubic_diamond_count")` etc. --
+  instead of opening `results.csv` directly. Write it, then actually read it
+  back; do not keep using the in-memory copy, or no real I/O happened.
 - **Stage 3a (per-frame rendering) and 3b (GIF assembly) do NOT need
   ADIOS2.** Stage 3a re-reads the raw trajectory frames directly via OVITO
   for per-atom coloring (not Stage 2's aggregate counts), and 3b just
@@ -261,8 +355,8 @@ another in this workflow:
   artifacts -- same as cosmology's final density-slice PNG, plain files
   regardless of engine mode.
 
-See `systems/adios` skill for the general `write_bp`/`read_bp` API and the
-three-state `engine` field (`adios2` / `adios2-unused` / `adios2-fallback`)
+See `systems/adios` skill for the `adios2.Stream` API, the staged-pipeline rules,
+and the three-state `engine` field (`adios2` / `adios2-unused` / `adios2-fallback`)
 that the trace checks this against.
 
 ---
@@ -271,11 +365,17 @@ that the trace checks this against.
 
 | Pitfall | Solution |
 |---|---|
-| LAMMPS can't find data.init | Copy ALL data files to work_dir BEFORE calling run_lammps |
-| Frames directory empty | Verify data files were copied before run_lammps; check run_lammps stderr |
+| LAMMPS can't find data.init | Stage the copies of AW.tersoff, data.init, in.watbox into /app/work/run0/ as a step ordered BEFORE the LAMMPS step |
+| Frames directory empty | Check the LAMMPS step's stderr; confirm the copies ran first and that frames/ exists |
+| Old frames counted as new output | Delete `frames/*.lammpstrj` at the start of the LAMMPS step |
+| LAMMPS exits 11 and the workflow reports failure | Exit 11 is a SIGSEGV on cleanup — if `frames/*.lammpstrj` exist, treat it as success |
+| LAMMPS exits 143 | MPI init SIGTERM — confirm `get_resources` reports `in_pbs: true` and that `env -u PMI_SIZE -u PMI_RANK -u I_MPI_HYDRA_BOOTSTRAP` precedes `mpirun` |
+| `lmp` fails to load / elf segment-layout error | The pip wheel's bundled binary does not run on this kernel — `module load lammps/22Jul2025` and use that `lmp` |
+| `module: command not found` | `module` is a shell function — the command needs a login shell (`bash -lc "..."`) |
+| Dump files land in the wrong directory | `os.chdir('/app/work/run0')` before creating the lammps instance (Python API), or `cd /app/work/run0` / `working_dir` for the MPI path |
 | OVITO counts are all zero | Use types 1+2+3 for cubic and 4+5+6 for hexagonal (not just 1 and 4) |
 | matplotlib display error | Use `matplotlib.use("Agg")` for headless rendering |
-| run_lammps fails exit 143 | MPI init error — the run_lammps tool handles this; check get_resources first |
+| Reaching for a subprocess, shell script, or `qsub` | None of it. Every step lives in the one generated workflow file |
 
 ---
 
@@ -284,11 +384,3 @@ that the trace checks this against.
 - `/app/data/in.watbox` -- LAMMPS input script. Parameters: `run 9000`, `timestep 0.01`, `variable T equal 180`, `variable P equal 1.0`. DO NOT modify.
 - `/app/data/data.init` -- initial atom positions
 - `/app/data/AW.tersoff` -- Tersoff force field for water
-
-
-### Run LAMMPS
-Call the `run_lammps` tool directly — do NOT use `submit_task` or write Python code for this:
-```
-run_lammps(script="in.watbox", work_dir="/app/work/run0")
-```
-The server handles HPC vs local execution automatically. Never modify in.watbox.

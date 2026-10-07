@@ -235,31 +235,23 @@ this is a final human-facing artifact, plain `.png` is correct (no ADIOS2 needed
 
 ## ADIOS2 Engine Notes (when `--engine adios`)
 
-This section applies only when the run uses `--engine adios`. (On the parsl
-engine there are no `write_bp`/`read_bp` tools at all.)
+When the run uses `--engine adios`, routing the inter-stage arrays through
+ADIOS2 is **required, not an optional enhancement.** `import adios2` in the
+generated workflow file and use `adios2.Stream(path, mode)` directly, with a
+genuine `stream.write(...)` in the producing stage and `stream.read(...)` in
+the consuming stage — write the array to the `.bp` file and then actually read
+it back before using it, rather than writing it and continuing with the
+in-memory copy.
 
-The `write_bp`/`read_bp` MCP *tools* can't be called from inside the analysis
-code — that code runs inside the workflow engine's task, with no MCP session
-available, and those are MCP tools like any other. But that's a constraint on the
-*tools*, not on ADIOS2 itself: `adios2` is a plain Python library (already
-installed in the venv) with no dependency on any session, server process, or IPC
-— it just reads/writes `.bp` files on disk. There's nothing stopping the analysis
-code from using the library directly.
+This applies to the real inter-stage numerical data: `particles_step<N>.bp`
+(the snapshot arrays x,y,z,vx,vy,vz,phi,mass) and `density_slice.bp` (the
+projected density grid), matching the `.bp` variants listed under Output Files
+below.
 
-So: when `--engine adios` is selected, **this is required, not an optional
-enhancement.** `import adios2` inside the analysis code itself and use
-`adios2.Stream(path, mode)` directly (not the `write_bp`/`read_bp` tools, which
-aren't reachable from here) with a genuine `stream.write(...)` then
-`stream.read(...)` round trip — write the array to the `.bp` file and then
-actually read it back from that file before using it, don't just write it and
-keep using the in-memory copy. This applies to the real inter-stage numerical
-data: `particles_step<N>.bp` (the raw snapshot arrays: x,y,z,vx,vy,vz,phi,mass)
-and `density_slice.bp` (the projected density grid), matching the `.bp` variants
-already listed under Output Files below. `halo_catalog` and `most_massive_halo`
-stay `.csv`/`.txt` — they're small, one-shot metadata reads from HACC's own
-halo-finder output, not numerical arrays flowing between processing stages.
-`dm_density_slice.png` and `summary.txt` stay plain human-facing files regardless
-of engine mode.
+`halo_catalog` and `most_massive_halo` stay `.csv`/`.txt` — they're small,
+one-shot metadata reads from HACC's own halo-finder output, not numerical
+arrays flowing between stages. `dm_density_slice.png` and `summary.txt` stay
+plain human-facing files regardless of engine.
 
 ---
 

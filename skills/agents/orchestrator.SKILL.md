@@ -61,21 +61,25 @@ Follow this flow unless you have a specific reason to deviate.
 - An `ENGINE USAGE WARNING` appears in the exploration summary -- a call didn't
   demonstrably exercise the real workflow engine. Route to **explorer** with
   feedback naming the specific task.
-  **The fix differs by engine -- don't give the wrong instruction:**
-  - **Parsl**: the explorer writes one standalone Parsl file via `write_workflow`
-    and runs it via `run_workflow`; that file is *supposed* to define
-    `@bash_app`/`@python_app` functions and call `parsl.load()` itself. A warning
-    here means the *server's* own runtime fell back when launching the file
-    (`engine_backend` ends in `-fallback`) -- an environment/install problem. If it
-    keeps happening, route to **installer** instead.
-  - **PyCOMPSs**: `submit_task` already wraps every call in the real runtime
-    automatically (see the explorer's engine skill). A warning means the server's
-    runtime fell back -- again an environment problem, not something the explorer
-    fixes by rewriting code. Do NOT tell it to call `compss_start()` itself.
-  - **ADIOS**: a warning here (with `engine_backend="adios2"`, not `-fallback`) means
-    ADIOS2 was available but the explorer's code never called a real API (e.g.
-    `adios2.open`/`Stream`/`.write(`/`.read(`) -- this IS something the explorer did
-    wrong. Feedback should name the exact ADIOS2 call required for that task.
+
+  On every engine the explorer writes ONE workflow file via `write_workflow`
+  and runs it via `run_workflow`; that file is *supposed* to contain the
+  engine's own constructs. **The fix differs by engine -- don't give the wrong
+  instruction:**
+  - **Parsl**: a warning means the *server's* own runtime fell back when
+    launching the file (`engine_backend` ends in `-fallback`) -- an
+    environment/install problem, not something the explorer fixes by rewriting
+    code. If it keeps happening, route to **installer** instead.
+  - **PyCOMPSs**: same -- `-fallback` means the COMPSs runtime wasn't available,
+    which is an environment problem. Note the file's `compss_start()`/
+    `compss_stop()` requirement depends on `launch_mode`, so do not tell the
+    explorer to add or remove them without checking which mode the server
+    reported.
+  - **ADIOS**: a warning with `engine_backend="adios2-unused"` (not
+    `-fallback`) means ADIOS2 was available but the generated file never called
+    a real API, or wrote to BP without reading it back. This IS something the
+    explorer did wrong. Feedback should name the stage that must do the real
+    `stream.write(...)`/`stream.read(...)` round trip.
 - Route to **explorer** again with specific feedback about what to fix or retry
 - Route to **installer** ONLY if the explorer reports a missing package that needs to be added to requirements.txt
 

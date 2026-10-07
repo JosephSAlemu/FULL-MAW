@@ -55,12 +55,12 @@ Say *what* runs, with what inputs, producing what output. Do not prescribe the
 mechanism:
 
 **Good:** `"Run the HACC simulation binary on 8 MPI ranks using the params file, writing snapshots to the run directory."`
-**Bad:** `"Call submit_mpi_task with command 'mpirun -np 8 hacc_tpm'."`
+**Bad:** `"Shell out to 'mpirun -np 8 hacc_tpm' and capture stdout."`
 
 Never instruct the explorer to write a bash script, a PBS script, or to invoke
-the CLI or a subprocess directly. CLI work is handed to the workflow engine as a
-command string; on the parsl engine the explorer puts every step into a single
-generated Parsl file as `@bash_app`/`@python_app` functions.
+the CLI or a subprocess directly. On every engine the explorer combines all of
+your tasks into a single generated workflow file and the engine runs it, so
+your tasks describe the steps, not the dispatch.
 
 ---
 

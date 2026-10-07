@@ -75,7 +75,7 @@ def archive_run(metadata: RunMetadata, trace_path: str) -> str:
     Does NOT clear work/run0 afterward -- it used to (wipe + recreate, gated
     behind a successful copy), but since work/run0 is a single fixed directory
     shared by every run, the next run's own setup tasks (re-copying input
-    files, run_lammps's own pre-run frame cleanup, etc.) are what's actually
+    files, the workflow's own pre-run frame cleanup, etc.) are what's actually
     responsible for not stepping on stale output, not a blanket wipe here.
     Leaving the directory alone after archiving means a run is never one
     archive-step bug away from losing both the copy and the original.

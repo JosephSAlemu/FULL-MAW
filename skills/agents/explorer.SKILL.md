@@ -51,10 +51,10 @@ Always available, regardless of engine:
 | `list_files` | List directory contents | After execution, to verify output files were created |
 | `read_file` | Read file contents | Inspect results, check CSV data, debug errors |
 
-Execution tools are engine-specific. On the **parsl** engine they are exactly
-`write_workflow` and `run_workflow`; `submit_task`, `submit_shell_task`,
-`submit_mpi_task`, and `run_lammps` do not exist there. On other engines the
-`submit_*` tools are what you get. Use what is actually bound for this run.
+Execution is the same on every engine: `write_workflow` and `run_workflow`.
+There are no other execution tools — you write ONE workflow file and the server
+runs it. What differs per engine is the constructs that file must use, which
+the engine reference in your context specifies.
 
 ---
 
@@ -83,23 +83,19 @@ After the PBS check (or immediately, for local env):
 The planner's tasks are a description of the workflow, not a list of tool calls.
 Read **all** of them first, then express them to the engine together.
 
-On the **parsl** engine:
-1. Combine every task from the planner into **one** Parsl file
-2. Each CLI step becomes a `@bash_app` whose body returns the command string
-3. Each Python step becomes a `@python_app` in that same file
-4. Order them by passing futures between apps, or by `.result()` in the driver
-5. `write_workflow(python_code=..., filename="workflow.py")`
-6. If it is rejected, read the `errors`, fix the file, and call `write_workflow` again
-7. `run_workflow(filename="workflow.py")`
-8. Verify the output (`list_files`, `read_file`)
-9. If it failed, diagnose, fix the file, and repeat from step 5
+1. Combine every task from the planner into **one** workflow file, using this
+   engine's constructs (see the engine reference in your context)
+2. Express the ordering between steps the way that engine does it — not by
+   running them one at a time yourself
+3. `write_workflow(python_code=..., filename="workflow.py")`
+4. If it is rejected, read the `errors`, fix the file, and call `write_workflow` again
+5. `run_workflow(filename="workflow.py")`
+6. Verify the output (`list_files`, `read_file`)
+7. If it failed, diagnose, fix the file, and repeat from step 3
 
-For example, a workflow with an 8-rank MPI simulation and a Python visualization
-of its output is **one** file containing one `@bash_app` and one `@python_app` —
-not two files, not two tool calls, and never a shell script.
-
-On other engines, submit each task with the `submit_*` tool that matches it,
-noting the returned task_id and using `depends_on` to chain them.
+A workflow with an 8-rank MPI simulation and a Python visualization of its
+output is **one** file with both steps in it — not two files, not two tool
+calls, and never a shell script.
 
 ### Phase 3: Validation
 
@@ -136,12 +132,12 @@ When writing the Python code you hand to the engine:
 - Print results to stdout so you can observe them
 - Handle errors gracefully with try/except and informative error messages
 
-In a generated **Parsl** file specifically:
-- Put all imports **inside** each app's function body — workers do not share the
-  driver's namespace. (Only the driver's own `parsl`/`Config` imports go at the top.)
-- Return values from a `@python_app` must be picklable (strings, ints, simple dicts)
-- Call `.result()` only in the driver, never inside an app — it deadlocks the worker
-- Set `matplotlib.use("Agg")` inside any rendering app; nodes are headless
+- Set `matplotlib.use("Agg")` before importing pyplot in any rendering step;
+  compute nodes are headless
+
+Engine-specific code rules — where imports go, how return values are passed,
+how futures are resolved — are in the engine reference in your context. Follow
+that rather than guessing.
 
 ---
 
@@ -150,8 +146,8 @@ In a generated **Parsl** file specifically:
 When running with `--env hpc`, `get_resources` must be your first tool call.
 Check the `warning` field in the response:
 
-- If `in_pbs` is `false` — **STOP immediately.** Do not attempt to run LAMMPS,
-  submit_mpi_task, or any compute task. Report to the user:
+- If `in_pbs` is `false` — **STOP immediately.** Do not attempt to run any
+  compute task. Report to the user:
   > "Not inside a PBS allocation. Start an interactive PBS job first:
   > `qsub -I -l nodes=N:ppn=M -l walltime=HH:MM:SS -A <project>`
   > then re-run the agent from the compute node shell."
@@ -165,14 +161,14 @@ Check the `warning` field in the response:
 - The venv has the packages listed in stack_decision from the planner
 - Do NOT modify input data files
 - Do NOT assume packages are installed -- always verify first
-- NEVER create a bash script, `.sh` file, or PBS script to run CLI commands. Every
-  CLI command must be expressed to the workflow engine as a command string — on
-  parsl, that means the return value of a `@bash_app`.
-- NEVER call a subprocess, and never invoke the CLI yourself. The engine runs it.
-- NEVER type `mpirun`/`srun` outside an engine task. An MPI run is a `@bash_app`
-  returning `f"mpirun -n {ranks} ..."`, not something you launch.
-- NEVER write Python that runs outside the engine. On parsl, every Python function
-  that does work carries `@python_app` and lives in the generated workflow file.
+- NEVER create a bash script, `.sh` file, or PBS script to run CLI commands.
+  Every CLI command is expressed to the workflow engine using that engine's own
+  construct (see the engine reference in your context).
+- NEVER invoke the CLI yourself. The engine runs it.
+- NEVER type `mpirun`/`srun` as something you launch. Rank count is expressed
+  through the engine.
+- NEVER write Python that runs outside the engine. Every function that does
+  work lives in the generated workflow file.
 
 ---
 
@@ -188,15 +184,8 @@ summary message (no tool calls) listing:
 
 ## Run LAMMPS (IMPORTANT)
 
-**On engines that bind `run_lammps`** (pycompss, adios), call that tool directly —
-do NOT use `submit_task` or write Python code for this:
-```
-run_lammps(script="in.watbox", work_dir="/app/work/run0")
-```
-The server handles HPC vs local execution automatically.
-
-**On the parsl engine there is no `run_lammps` tool.** LAMMPS is a `@bash_app` in
-the generated workflow file like any other CLI step; follow the use-case skill for
-the exact command, module loads, and rank count.
+LAMMPS is a CLI step in the generated workflow file like any other, expressed
+with this engine's own construct. Follow the use-case skill for the exact
+command, module loads, and rank count.
 
 Never modify in.watbox.

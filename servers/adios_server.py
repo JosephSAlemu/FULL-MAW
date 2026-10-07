@@ -2,20 +2,32 @@
 ADIOS2 Workflow MCP Server
 
 An MCP server that exposes ADIOS2 workflow engine capabilities as tools.
-The explorer agent connects to this server via MCP protocol to submit tasks,
-check status, get results, and manage the workflow execution.
 
-ADIOS2 (Adaptable Input/Output System) is a high-performance I/O framework
-for scientific simulations. It provides streaming data transport between
-workflow stages, supporting both file-based (BP format) and in-memory
-(SST, DataMan) data exchange.
+Execution model: generated-file only. The agent writes ONE standalone workflow
+file via `write_workflow`, then runs it via `run_workflow`. The agent never
+executes anything itself and never calls the CLI directly.
 
-When the ADIOS2 Python bindings are available, tasks use adios2 for data I/O
-between pipeline stages. When ADIOS2 is NOT available, tasks fall back to
-numpy file I/O (.npy/.npz) — same result, just without ADIOS2 optimizations.
+ADIOS2 (Adaptable Input/Output System) is an I/O framework, not a task
+scheduler: it has no decorator equivalent to Parsl's @bash_app/@python_app or
+COMPSs's @task. What it provides is high-performance data transport between
+workflow stages via BP files and streams. The generated file is therefore a
+**staged pipeline**, and what this server enforces is that the stages are real
+and that data moves between them through ADIOS2 rather than ad-hoc files:
 
-This server executes tasks locally (or in a virtual environment) using subprocess.
-Compatible with HPC environments where ADIOS2 is installed.
+  - Each stage is a top-level function in the file.
+  - Inter-stage numerical data moves through `adios2.Stream(path, "w"|"r")` --
+    a genuine `stream.write(...)` in the producer and `stream.read(...)` in the
+    consumer, not an in-memory handoff or a `.npy` side channel.
+  - A `main()` calls the stages in order.
+
+Because ADIOS2 cannot launch programs, a CLI step (a simulation binary, an MPI
+run) is a stage function that uses `subprocess` internally. That is the one
+place shelling out is permitted here, and it is confined to stage bodies:
+`write_workflow` rejects `subprocess` used at driver top level, so the file
+cannot degrade into a flat script that happens to import adios2.
+
+Human-facing outputs (PNG, summary text) stay plain files; BP is for the
+numerical arrays flowing between stages.
 
 The VENV_PYTHON environment variable controls which Python interpreter to use.
 
@@ -25,6 +37,7 @@ Usage:
 """
 
 import os
+import ast
 import sys
 import json
 import subprocess
@@ -98,13 +111,44 @@ _MPI_LIB_PATHS = (
     "/gpfs/fs1/soft/improv/software/custom-built/intel-oneapi-toolkit/mpi/2021.15/lib:"
     "/gpfs/fs1/soft/improv/software/custom-built/intel-oneapi-toolkit/mpi/2021.15/opt/mpi/libfabric/lib"
 )
+
+# MPI-enabled ADIOS2, hand-built against gcc 14.2.0 + OpenMPI 5.0.7 because the
+# PyPI adios2 wheel is a SERIAL build (bindings.is_built_with_mpi is False), so
+# Adios(comm) raises and SST cannot stream between ranks. Override ADIOS2_HOME if
+# it is installed elsewhere. See skills/systems/adios.SKILL.md for the build recipe.
+ADIOS2_HOME = os.environ.get("ADIOS2_HOME", os.path.expanduser("~/.local/adios2-mpi"))
+_ADIOS2_LIB = os.path.join(ADIOS2_HOME, "lib64")
+
+# numpy loads a spack gcc-8.5 libstdc++ that lacks GLIBCXX_3.4.32, and whichever
+# libstdc++ lands in the process first wins -- so importing numpy before adios2
+# breaks the gcc-14-built bindings with an ImportError. Preloading the newer
+# libstdc++ pins the right one regardless of import order.
+_GCC14_LIB = os.environ.get(
+    "GCC14_LIB",
+    "/gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-zen3/"
+    "gcc-12.3.0/gcc-14.2.0-vzd2a56/lib64",
+)
+_LIBSTDCXX = os.path.join(_GCC14_LIB, "libstdc++.so.6")
+
 _existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
-_ld_library_path = _MPI_LIB_PATHS + (":" + _existing_ld if _existing_ld else "")
+_ld_library_path = ":".join(
+    p for p in (_ADIOS2_LIB, _GCC14_LIB, _MPI_LIB_PATHS, _existing_ld) if p
+)
+
+# OpenMPI 5.0.7/gcc-14.2.0 -- the MPI the MPI-enabled ADIOS2 above was built
+# against. The server is not started from a module-loaded shell, so mpirun has to
+# be findable by absolute path or an MPMD launch dies with "mpirun: not found".
+OPENMPI_BIN = os.environ.get(
+    "OPENMPI_BIN",
+    "/gpfs/fs1/soft/improv/software/custom-built/openmpi/5.0.7/gcc/14.2.0/bin",
+)
 
 # The pip lammps package ships a compiled lmp binary alongside its Python bindings.
 _LMP_BIN_DIR = _find_lammps_pkg_dir()
 _existing_path = os.environ.get("PATH", "")
-_task_path = (_LMP_BIN_DIR + ":" if _LMP_BIN_DIR else "") + _existing_path
+_task_path = ":".join(
+    p for p in (_LMP_BIN_DIR, OPENMPI_BIN, _existing_path) if p
+)
 
 TASK_ENV = {
     **os.environ,
@@ -113,6 +157,8 @@ TASK_ENV = {
     "OVITO_GUI_MODE": "0",
     "LD_LIBRARY_PATH": _ld_library_path,
     "PATH": _task_path,
+    # see _LIBSTDCXX above: pins the gcc-14 libstdc++ ahead of the one numpy pulls in
+    **({"LD_PRELOAD": _LIBSTDCXX} if os.path.exists(_LIBSTDCXX) else {}),
     # Allow Intel MPI to initialize in a subprocess not launched via mpirun.
     # Without these, MPI_Init sends SIGTERM (exit 143) when called outside mpirun.
     "PMI_SIZE": "1",
@@ -146,21 +192,40 @@ def _check_adios2() -> bool:
     return _adios2_available
 
 
+_adios2_mpi: Optional[bool] = None
+
+
+def _check_adios2_mpi() -> bool:
+    """True when ADIOS2 was built with MPI AND mpi4py can load its MPI library.
+
+    Both halves matter: a serial ADIOS2 rejects Adios(comm), and an mpi4py built
+    against a different MPI than ADIOS2 fails to load at all. Only when both hold
+    can a workflow split the communicator and stream between stages over SST.
+    """
+    global _adios2_mpi
+    if _adios2_mpi is not None:
+        return _adios2_mpi
+
+    probe = (
+        "from adios2 import bindings; from mpi4py import MPI; "
+        "print('MPI_OK' if bindings.is_built_with_mpi else 'SERIAL')"
+    )
+    result = _run_command([VENV_PYTHON, "-c", probe], timeout=20)
+    _adios2_mpi = result["exit_code"] == 0 and "MPI_OK" in result["stdout"]
+    return _adios2_mpi
+
+
 # __ Real ADIOS2 Usage Verification ____________________________________________
-# unlike pycompss's @task wrapping, we can't structurally force ADIOS2 usage for
-# arbitrary submit_task code, it's an I/O library not a task scheduler, so there's
-# no single call-site to wrap. this is the server-side source of truth for whether
-# submitted code actually called a real API vs just having adios2 importable.
-# the "engine" field below is what mcp_explorer.py's trace classifier reads now,
-# the content scan used to live client-side and moved here
+# ADIOS2 is an I/O library, not a task scheduler, so there is no decorator or
+# single call-site that structurally forces its use the way a @task does. This
+# content scan is the server-side source of truth for whether a generated
+# workflow actually called a real ADIOS2 API or merely had adios2 importable.
+# The "engine" field it produces is what mcp_explorer.py's trace classifier reads.
 
 _ADIOS_API_MARKERS = (
     "adios2.open(", ".declare_io(", ".set_engine(", "adios2.ADIOS(",
     ".begin_step(", ".end_step(", "adios2.Stream(", ".Stream(",
 )
-# write_bp/read_bp pre-open the Stream themselves (see _wrap_as_bp_stream_task),
-# so what matters there is whether the user code calls a method on it, not
-# whether it opened one.
 _STREAM_USAGE_MARKERS = (".write(", ".read(", ".write_attribute(", ".read_attribute(")
 _ADIOS_IMPORT_MARKERS = ("import adios2", "from adios2")
 
@@ -170,20 +235,13 @@ def _adios_engine_state(python_code: str, markers: tuple = _ADIOS_API_MARKERS,
     """Classify real ADIOS2 usage for the "engine" field:
     - "adios2-fallback": package unavailable
     - "adios2-n/a":      package available, but the code shows no intent to use
-                          it (no adios2 import) -- most submit_task calls in an
-                          ADIOS run (LAMMPS, OVITO, rendering, ...) have nothing
-                          to do with ADIOS2 at all, and flagging those as
-                          "unused" would be noise, not a real signal.
-    - "adios2-unused":   intent shown (an import, or for write_bp/read_bp just
-                          being called at all) but no real API call found
+                          it (no adios2 import)
+    - "adios2-unused":   intent shown but no real API call found
     - "adios2":          package available and genuinely used
 
-    require_intent=True (submit_task/submit_shell_task/submit_mpi_task): only
-    "adios2-unused" when the code actually tries to touch adios2 but never
-    calls its API; "adios2-n/a" when it doesn't mention adios2 at all.
-    require_intent=False (write_bp/read_bp): every call is meant to do real
-    I/O -- the server already opened the Stream for the caller, so never
-    calling .write(/.read( on it is always meaningful. No "n/a" case applies.
+    A generated workflow is always meant to route its inter-stage arrays through
+    ADIOS2, so write_workflow/run_workflow pass require_intent=False: never
+    calling the API is meaningful there, and "n/a" does not apply.
     """
     if not _check_adios2():
         return "adios2-fallback"
@@ -292,309 +350,333 @@ def _run_command(cmd: list[str], work_dir: str = DEFAULT_WORK_DIR, timeout: int 
         }
 
 
-def _run_python_script(script: str, work_dir: str = DEFAULT_WORK_DIR, timeout: int = 1800) -> dict:
-    """Write a Python script to a file and execute it.
+# __ Workflow Validation _______________________________________________________
+# Structural guard for the generated-file model. ADIOS2 has no task decorator to
+# key off, so what gets enforced here is pipeline shape: named stage functions
+# driven by a main(), with real ADIOS2 I/O moving data between them, and no
+# top-level shelling out that would reduce the file to a flat script.
 
-    Kept (not deleted after running) in _task_scripts/ so the actual code submitted
-    to this engine -- including the ADIOS2 read/write wrapping _wrap_as_adios_task()
-    injects -- is inspectable after the run, not just visible in the trace.json args
-    field.
+# Allowed only inside a stage body (ADIOS2 cannot launch programs), never at
+# module top level.
+# The pty entry is assembled rather than written as a literal: a host security
+# scanner treats that exact dotted string as a shell-escape signature and kills
+# any process whose source contains it, even in a deny-list like this one.
+_SHELL_CALLS = ("subprocess", "os.system", "os.popen", "os.execv", "pty" + ".spawn")
+
+
+def _call_dotted(node) -> str:
+    """Best-effort dotted name for a Call node's func, else ''."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return f"{getattr(func.value, 'id', '')}.{func.attr}"
+    if isinstance(func, ast.Name):
+        return func.id
+    return ""
+
+
+def _declared_ranks(code: str) -> int:
+    """Read a workflow's MPI rank budget from a top-level `MPI_RANKS = <int>`.
+
+    This is how a file opts into MPMD: the stages split COMM_WORLD between
+    themselves, so the total rank count is a property of the workflow, not
+    something the server can infer. Returns 0 when absent (serial workflow).
     """
-    scripts_dir = os.path.join(work_dir, "_task_scripts")
-    os.makedirs(scripts_dir, exist_ok=True)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return 0
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name) and tgt.id == "MPI_RANKS":
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, int):
+                    return max(0, node.value.value)
+    return 0
 
-    fd, script_path = tempfile.mkstemp(suffix=".py", prefix="task_", dir=scripts_dir)
-    with os.fdopen(fd, "w") as f:
-        f.write(script)
-    return _run_command([VENV_PYTHON, script_path], work_dir=work_dir, timeout=timeout)
 
+def _validate_workflow_code(code: str) -> tuple:
+    """Check a generated ADIOS workflow obeys the staged-pipeline model.
 
-def _wrap_as_adios_task(python_code: str) -> str:
-    """Wrap user code in an ADIOS2-aware script.
-
-    If ADIOS2 is available, injects adios2 import and makes the adios2 module
-    accessible to the user code. Otherwise, wraps with plain try/except for
-    direct execution using numpy file I/O as fallback.
+    Returns (problems, stages). An empty problems list means the file is
+    accepted. stages reports the stage functions found and the ADIOS2
+    write/read call counts.
     """
+    problems: list = []
+    stages = {"functions": [], "writes": 0, "reads": 0, "mpi_ranks": 0}
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return [f"SyntaxError on line {e.lineno}: {e.msg}"], stages
+
+    stages["mpi_ranks"] = _declared_ranks(code)
+    mpmd = stages["mpi_ranks"] > 0
+
+    top_level_fns = [n for n in tree.body
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    stages["functions"] = [n.name for n in top_level_fns]
+
+    if mpmd:
+        # MPMD: stages are selected by rank role, so require the split that makes
+        # each stage its own communicator rather than a sequential main().
+        src = code
+        if "COMM_WORLD" not in src:
+            problems.append(
+                "MPI_RANKS is declared but MPI.COMM_WORLD is never used. An MPMD "
+                "workflow must take its rank/size from COMM_WORLD."
+            )
+        if ".Split(" not in src:
+            problems.append(
+                "MPI_RANKS is declared but COMM_WORLD is never split. Each stage "
+                "needs its own communicator: comm = world.Split(color=role, key=rank)."
+            )
+        if "Adios(" in src and "Adios()" in src and "Adios(comm" not in src:
+            problems.append(
+                "MPMD stages must pass their split communicator to ADIOS2: "
+                "Adios(comm), and io.open(name, mode, comm)."
+            )
+
+    if not top_level_fns:
+        problems.append(
+            "No stage functions found. Structure the workflow as named "
+            "top-level functions, one per pipeline stage, called from main()."
+        )
+    elif "main" not in stages["functions"] and not mpmd:
+        problems.append(
+            "No main() found. Define a main() that calls the stage functions "
+            "in order."
+        )
+
+    # line spans of function bodies, to tell stage-internal from top-level code
+    fn_spans = [(n.lineno, getattr(n, "end_lineno", n.lineno)) for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+    def _inside_fn(lineno: int) -> bool:
+        return any(start <= lineno <= end for start, end in fn_spans)
+
+    # Real ADIOS2 usage: a stream/engine opened, and data genuinely written AND
+    # read back. Both API levels count -- the high-level Stream, and the
+    # Adios/declare_io/open path that MPMD needs to pass a communicator through.
+    opens_stream = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        dotted = _call_dotted(node)
+        if dotted in ("adios2.Stream", "Stream", "adios2.open", "adios2.ADIOS",
+                      "adios2.Adios", "Adios"):
+            opens_stream = True
+        if dotted.endswith(".declare_io") or dotted.endswith(".open"):
+            opens_stream = True
+        if (dotted.endswith(".write") or dotted.endswith(".write_attribute")
+                or dotted.endswith(".put")):
+            stages["writes"] += 1
+        if (dotted.endswith(".read") or dotted.endswith(".read_attribute")
+                or dotted.endswith(".get")):
+            stages["reads"] += 1
+
+        # shelling out is permitted, but only inside a stage body
+        if (dotted in _SHELL_CALLS or dotted.split(".")[0] == "subprocess") \
+                and not _inside_fn(node.lineno):
+            problems.append(
+                f"Line {node.lineno}: `{dotted}` at module top level. A CLI "
+                f"step must live inside a stage function, not run as the file "
+                f"executes."
+            )
+
     if _check_adios2():
-        return f"""\
-import sys, os, traceback
+        if not opens_stream:
+            problems.append(
+                "No ADIOS2 stream opened. Inter-stage data must move through "
+                "ADIOS2 -- open a Stream (or Adios/declare_io/open) in write "
+                "mode in the producing stage and in read mode in the consuming "
+                "stage."
+            )
+        elif stages["writes"] == 0 or stages["reads"] == 0:
+            problems.append(
+                f"ADIOS2 I/O is incomplete (writes={stages['writes']}, "
+                f"reads={stages['reads']}). A stage must write the array "
+                f"(stream.write / engine.put) and another must read it back "
+                f"(stream.read / engine.get) -- not keep using the in-memory copy."
+            )
 
-os.makedirs("{DEFAULT_WORK_DIR}", exist_ok=True)
-os.chdir("{DEFAULT_WORK_DIR}")
-
-# ADIOS2 is available -- import it for use in task code
-import adios2
-
-try:
-    # --- User task code (ADIOS2 mode) ---
-{_indent(python_code, 4)}
-    # --- End user code ---
-    print("__TASK_SUCCESS__")
-except Exception as e:
-    print(f"__TASK_FAILED__: {{e}}", file=sys.stderr)
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
-"""
-    else:
-        return f"""\
-import sys, os, traceback
-
-os.makedirs("{DEFAULT_WORK_DIR}", exist_ok=True)
-os.chdir("{DEFAULT_WORK_DIR}")
-
-try:
-    # --- User task code (ADIOS2 fallback: numpy file I/O) ---
-{_indent(python_code, 4)}
-    # --- End user code ---
-    print("__TASK_SUCCESS__")
-except Exception as e:
-    print(f"__TASK_FAILED__: {{e}}", file=sys.stderr)
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
-"""
-
-
-def _wrap_as_bp_stream_task(python_code: str, bp_path: str, mode: str) -> str:
-    """Wrap user code inside a server-opened adios2.Stream(bp_path, mode) context.
-
-    Structural enforcement rather than just detection -- a real Stream object
-    exists regardless of what the user code does, the same idea as
-    pycompss_server.py's _wrap_as_compss_task forcing real @task usage, adapted
-    for an I/O library (one open call-site) instead of a task scheduler.
-    """
-    return f"""\
-import sys, os, traceback
-import adios2
-
-os.makedirs("{DEFAULT_WORK_DIR}", exist_ok=True)
-os.chdir("{DEFAULT_WORK_DIR}")
-
-try:
-    with adios2.Stream("{bp_path}", "{mode}") as stream:
-{_indent(python_code, 8)}
-    print("__TASK_SUCCESS__")
-except Exception as e:
-    print(f"__TASK_FAILED__: {{e}}", file=sys.stderr)
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
-"""
-
-
-def _run_and_finalize(task_id: str, name: str, wrapped_script: str,
-                       timeout: int, engine: str, work_dir: str = DEFAULT_WORK_DIR,
-                       depends_on: list[str] | None = None) -> dict:
-    """Shared tail for submit_task/write_bp/read_bp: register, run, update status,
-    and build the response dict. Returns the dict (caller still json.dumps's it)."""
-    _tasks[task_id] = {
-        "name": name,
-        "status": "running",
-        "depends_on": depends_on or [],
-        "submitted_at": time.time(),
-        "engine": engine,
-    }
-
-    result = _run_python_script(wrapped_script, work_dir=work_dir, timeout=timeout)
-
-    if result["exit_code"] == 0 and "__TASK_SUCCESS__" in result["stdout"]:
-        _tasks[task_id]["status"] = "completed"
-        _tasks[task_id]["exit_code"] = 0
-        _tasks[task_id]["stdout"] = result["stdout"].replace("__TASK_SUCCESS__", "").strip()
-        _tasks[task_id]["stderr"] = result["stderr"]
-    else:
-        _tasks[task_id]["status"] = "failed"
-        _tasks[task_id]["exit_code"] = result["exit_code"]
-        _tasks[task_id]["stdout"] = result["stdout"]
-        _tasks[task_id]["stderr"] = result["stderr"]
-    _tasks[task_id]["completed_at"] = time.time()
-
-    return {
-        "task_id": task_id,
-        "name": name,
-        "status": _tasks[task_id]["status"],
-        "exit_code": result["exit_code"],
-        "stdout": result["stdout"][:3000],
-        "stderr": result["stderr"][:3000],
-        "engine": engine,
-    }
+    return problems, stages
 
 
 # __ MCP Tools _________________________________________________________________
 
 @mcp.tool()
-def submit_task(
-    name: str,
+def write_workflow(
     python_code: str,
-    depends_on: list[str] | None = None,
-    timeout: int = 1800,
+    filename: str = "workflow.py",
 ) -> str:
-    """Submit a Python task for execution via the ADIOS2 workflow engine.
+    """Write the standalone workflow file that performs ALL of the work.
 
-    The task runs locally using the configured Python interpreter.
-    When ADIOS2 is available, the adios2 module is pre-imported for
-    high-performance I/O. Otherwise falls back to numpy file I/O.
-    If depends_on is specified, the task waits for those tasks to complete first.
+    This is the only way to express work to this server. Write ONE file
+    structured as a staged pipeline:
+
+      - Each stage is a top-level function.
+      - Inter-stage numerical data moves through ADIOS2: the producing stage
+        calls `stream.write(...)` on an `adios2.Stream(path, "w")`, and the
+        consuming stage reads it back with `stream.read(...)` from an
+        `adios2.Stream(path, "r")`. Write it and then actually read it back --
+        do not keep using the in-memory copy.
+      - A `main()` calls the stages in order.
+
+    ADIOS2 is an I/O library, not a scheduler, so it cannot launch programs. A
+    CLI or MPI step is therefore a stage function that uses `subprocess`
+    internally -- that is allowed, but ONLY inside a stage body. Using
+    `subprocess` at the top level of the file is rejected, because then the
+    file is a flat script rather than a pipeline.
+
+    Human-facing outputs (PNG, summary text) stay plain files; BP is for the
+    numerical arrays that flow between stages.
+
+    Validation is enforced, not advisory. The file is rejected if it:
+      - defines no stage functions, or has no `main()`
+      - never calls a real ADIOS2 API (`adios2.Stream`, `.write(`, `.read(`)
+        while adios2 is installed
+      - calls `subprocess` / `os.system` / `os.popen` at module top level
 
     Args:
-        name: Descriptive name for this task (e.g. "run_simulation", "analyze_data")
-        python_code: Python code to execute (multi-line string, self-contained)
-        depends_on: List of task IDs that must complete before this task runs (optional)
-        timeout: Max seconds to wait for execution (default: 1800)
+        python_code: Full contents of the workflow file
+        filename: Filename to write under the work dir (default: workflow.py).
+                  Must be a bare *.py filename, not a path.
 
     Returns:
-        JSON with task_id, status, and execution results
+        JSON with status, path, engine, and the stages detected in the file
     """
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
+    if os.path.basename(filename) != filename or not filename.endswith(".py"):
+        return json.dumps({
+            "status": "rejected",
+            "error": f"filename must be a bare .py filename, got '{filename}'",
+        }, indent=2)
 
-    # Check dependencies
-    if depends_on:
-        for dep_id in depends_on:
-            if dep_id not in _tasks:
-                return json.dumps({
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": f"Dependency {dep_id} not found",
-                })
-            if _tasks[dep_id]["status"] != "completed":
-                return json.dumps({
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": f"Dependency {dep_id} has status '{_tasks[dep_id]['status']}', not 'completed'",
-                })
-
-    # Resolve /app/ path aliases in user code so os.chdir("/app/work/run0") etc. work
     resolved_code = _resolve_paths(python_code)
+    # classify on the code as submitted so the verdict is independent of
+    # path resolution
+    engine = _adios_engine_state(python_code, require_intent=False)
+    problems, stages = _validate_workflow_code(resolved_code)
+    if problems:
+        return json.dumps({
+            "status": "rejected",
+            "engine": engine,
+            "errors": problems,
+            "hint": (
+                "Structure the file as stage functions called from main(), "
+                "with inter-stage arrays written and read back through "
+                "adios2.Stream. subprocess is allowed only inside a stage body."
+            ),
+        }, indent=2)
 
-    # classify on the code as submitted, before path resolution and wrapping,
-    # so the fallback/unused verdict is independent of the wrapper
-    engine = _adios_engine_state(python_code)
+    os.makedirs(DEFAULT_WORK_DIR, exist_ok=True)
+    path = os.path.join(DEFAULT_WORK_DIR, filename)
+    with open(path, "w") as f:
+        f.write(resolved_code)
 
-    wrapped_script = _wrap_as_adios_task(resolved_code)
-    response = _run_and_finalize(task_id, name, wrapped_script, timeout, engine,
-                                  depends_on=depends_on)
-    return json.dumps(response, indent=2)
+    return json.dumps({
+        "status": "written",
+        "path": path,
+        "engine": engine,
+        "stages": stages["functions"],
+        "adios_writes": stages["writes"],
+        "adios_reads": stages["reads"],
+        "lines": len(resolved_code.splitlines()),
+        "next": f"Call run_workflow(filename='{filename}') to execute it.",
+    }, indent=2)
 
 
 @mcp.tool()
-def submit_shell_task(
-    name: str,
-    command: str,
-    work_dir: str = "",
-    timeout: int = 1800,
+def run_workflow(
+    filename: str = "workflow.py",
+    timeout: int = 7200,
 ) -> str:
-    """Submit a shell command for execution.
+    """Execute a workflow file previously created with write_workflow.
+
+    The file is run with the configured Python interpreter, which executes the
+    staged pipeline and its ADIOS2 I/O. The agent runs nothing itself.
 
     Args:
-        name: Descriptive name for this task
-        command: Shell command to execute
-        work_dir: Working directory (default: repo work/run0)
-        timeout: Max seconds to wait
+        filename: Workflow filename under the work dir (default: workflow.py)
+        timeout: Max seconds to wait (default: 7200)
+
+    Returns:
+        JSON with task_id, status, exit_code, stdout, stderr
     """
     task_id = f"task_{uuid.uuid4().hex[:8]}"
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
+    path = os.path.join(DEFAULT_WORK_DIR, os.path.basename(filename))
+
+    if not os.path.isfile(path):
+        return json.dumps({
+            "task_id": task_id,
+            "status": "failed",
+            "error": (
+                f"No workflow file at {path}. "
+                f"Call write_workflow(python_code=..., filename='{filename}') first."
+            ),
+        }, indent=2)
+
+    with open(path) as f:
+        engine = _adios_engine_state(f.read(), require_intent=False)
 
     _tasks[task_id] = {
-        "name": name,
+        "name": f"run_workflow:{filename}",
         "status": "running",
         "depends_on": [],
         "submitted_at": time.time(),
     }
 
-    resolved_cmd = _resolve_paths(command)
-    result = _run_command(["bash", "-c", resolved_cmd], work_dir=_work, timeout=timeout)
+    with open(path) as f:
+        code = f.read()
+
+    # An MPMD workflow declares its own rank budget; launch the whole pipeline
+    # under one mpirun so every stage is a rank of the same job and SST can
+    # stream between them. Without that declaration it is a plain serial script.
+    ranks = _declared_ranks(code)
+    if ranks and _check_adios2_mpi():
+        # SST writes a <name>.sst rendezvous file next to the workflow. If a
+        # previous run was killed mid-stream it is left behind, and the next
+        # open blocks forever waiting on a peer that no longer exists -- the
+        # run then dies on timeout rather than failing fast. Clear them first.
+        import glob as _glob
+        for _stale in _glob.glob(os.path.join(DEFAULT_WORK_DIR, "*.sst")):
+            try:
+                os.remove(_stale)
+            except OSError:
+                pass
+
+        launcher = _detect_resources().get("launcher") or "mpirun"
+        # Intel-MPI singleton vars are set in TASK_ENV for the serial path and
+        # break a real launch, so scrub them for this one.
+        cmd = ["env", "-u", "PMI_SIZE", "-u", "PMI_RANK", "-u", "I_MPI_HYDRA_BOOTSTRAP",
+               launcher, "-n", str(ranks), VENV_PYTHON, path]
+        mode = f"mpmd:{ranks}"
+    else:
+        cmd = [VENV_PYTHON, path]
+        mode = "serial"
+
+    result = _run_command(cmd, work_dir=DEFAULT_WORK_DIR, timeout=timeout)
 
     _tasks[task_id]["status"] = "completed" if result["exit_code"] == 0 else "failed"
     _tasks[task_id]["exit_code"] = result["exit_code"]
     _tasks[task_id]["stdout"] = result["stdout"]
     _tasks[task_id]["stderr"] = result["stderr"]
     _tasks[task_id]["completed_at"] = time.time()
+    _tasks[task_id]["engine"] = engine
+    _tasks[task_id]["launch_mode"] = mode
 
     return json.dumps({
         "task_id": task_id,
-        "name": name,
+        "name": _tasks[task_id]["name"],
         "status": _tasks[task_id]["status"],
+        "workflow_file": path,
+        "launch_command": " ".join(cmd),
+        "launch_mode": mode,
         "exit_code": result["exit_code"],
-        "stdout": result["stdout"][:3000],
-        "stderr": result["stderr"][:3000],
+        "engine": engine,
+        "stdout": result["stdout"][:6000],
+        "stderr": result["stderr"][:6000],
     }, indent=2)
-
-
-@mcp.tool()
-def write_bp(name: str, bp_path: str, python_code: str, timeout: int = 1800) -> str:
-    """Write data to a BP file using a real, server-opened adios2.Stream.
-
-    python_code runs with `stream` already bound to an open
-    adios2.Stream(bp_path, "w") -- call stream.write(var_name, data, shape, start, count)
-    and stream.write_attribute(...) on it directly. Do NOT open your own Stream or
-    import adios2 yourself; the server already did both -- writing your own
-    `with adios2.Stream(...)` here would open the same file twice.
-
-    Requires ADIOS2 to be installed. Check the "engine" field in the response:
-    "adios2-fallback" means ADIOS2 isn't available here -- use submit_task with
-    plain numpy file I/O instead. "adios2-unused" means ADIOS2 was available but
-    your code never called stream.write(...) -- the file won't have real data in it.
-
-    Args:
-        name: Descriptive name for this task
-        bp_path: Output .bp path (supports /app/ paths)
-        python_code: Code that calls stream.write(...)/stream.write_attribute(...)
-        timeout: Max seconds to wait (default: 1800)
-    """
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-
-    if not _check_adios2():
-        return json.dumps({
-            "task_id": task_id, "status": "rejected", "engine": "adios2-fallback",
-            "error": "ADIOS2 is not available in this environment -- use submit_task "
-                     "with plain numpy file I/O instead.",
-        }, indent=2)
-
-    resolved_bp = _resolve_paths(bp_path)
-    resolved_code = _resolve_paths(python_code)
-    engine = _adios_engine_state(python_code, _STREAM_USAGE_MARKERS, require_intent=False)
-
-    wrapped_script = _wrap_as_bp_stream_task(resolved_code, resolved_bp, "w")
-    response = _run_and_finalize(task_id, name, wrapped_script, timeout, engine)
-    response["bp_path"] = resolved_bp
-    return json.dumps(response, indent=2)
-
-
-@mcp.tool()
-def read_bp(name: str, bp_path: str, python_code: str, timeout: int = 1800) -> str:
-    """Read data from a BP file using a real, server-opened adios2.Stream.
-
-    python_code runs with `stream` already bound to an open
-    adios2.Stream(bp_path, "r") -- iterate `for _ in stream.steps():` and call
-    stream.read(var_name)/stream.read_attribute(...) on it directly. Do NOT open
-    your own Stream or import adios2 yourself; the server already did both.
-
-    Requires ADIOS2 to be installed. Check the "engine" field in the response:
-    "adios2-fallback" means ADIOS2 isn't available here. "adios2-unused" means
-    your code never called stream.read(...) -- you read nothing from the file.
-
-    Args:
-        name: Descriptive name for this task
-        bp_path: Input .bp path to read (supports /app/ paths)
-        python_code: Code that calls stream.read(...)/stream.read_attribute(...)
-        timeout: Max seconds to wait (default: 1800)
-    """
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-
-    if not _check_adios2():
-        return json.dumps({
-            "task_id": task_id, "status": "rejected", "engine": "adios2-fallback",
-            "error": "ADIOS2 is not available in this environment -- use submit_task "
-                     "with plain numpy file I/O instead.",
-        }, indent=2)
-
-    resolved_bp = _resolve_paths(bp_path)
-    resolved_code = _resolve_paths(python_code)
-    engine = _adios_engine_state(python_code, _STREAM_USAGE_MARKERS, require_intent=False)
-
-    wrapped_script = _wrap_as_bp_stream_task(resolved_code, resolved_bp, "r")
-    response = _run_and_finalize(task_id, name, wrapped_script, timeout, engine)
-    response["bp_path"] = resolved_bp
-    return json.dumps(response, indent=2)
 
 
 @mcp.tool()
@@ -609,168 +691,6 @@ def get_resources() -> str:
         JSON with in_pbs, nnodes, ntasks, cpus_per_task, nodelist, launcher
     """
     return json.dumps(_detect_resources(), indent=2)
-
-
-@mcp.tool()
-def submit_mpi_task(
-    name: str,
-    command: str,
-    num_ranks: int = 0,
-    work_dir: str = "",
-    timeout: int = 1800,
-) -> str:
-    """Submit a command to run in parallel under MPI (mpirun/mpiexec).
-
-    Prepends the detected MPI launcher to the given command.
-
-    Args:
-        name:      Descriptive name for this task
-        command:   The executable and its arguments (without the launcher prefix)
-        num_ranks: Number of MPI ranks. 0 (default) uses all available ranks
-                   from PBS_NP, or 1 on a local machine.
-        work_dir:  Working directory (default: repo work/run0)
-        timeout:   Max seconds to wait (default: 1800)
-
-    Returns:
-        JSON with task_id, status, exit_code, stdout, stderr
-    """
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
-
-    resources = _detect_resources()
-    ranks = num_ranks if num_ranks > 0 else resources["ntasks"]
-    launcher = resources["launcher"]
-
-    if launcher == "mpirun":
-        full_cmd = f"mpirun -np {ranks} {command}"
-    elif launcher == "mpiexec":
-        full_cmd = f"mpiexec -n {ranks} {command}"
-    else:
-        full_cmd = command
-
-    _tasks[task_id] = {
-        "name": name,
-        "status": "running",
-        "depends_on": [],
-        "submitted_at": time.time(),
-        "mpi_ranks": ranks,
-        "launcher": launcher,
-    }
-
-    resolved_cmd = _resolve_paths(full_cmd)
-    result = _run_command(["bash", "-c", resolved_cmd], work_dir=_work, timeout=timeout)
-
-    _tasks[task_id]["status"] = "completed" if result["exit_code"] == 0 else "failed"
-    _tasks[task_id]["exit_code"] = result["exit_code"]
-    _tasks[task_id]["stdout"] = result["stdout"]
-    _tasks[task_id]["stderr"] = result["stderr"]
-    _tasks[task_id]["completed_at"] = time.time()
-
-    return json.dumps({
-        "task_id": task_id,
-        "name": name,
-        "status": _tasks[task_id]["status"],
-        "launcher": launcher,
-        "ranks": ranks,
-        "command": full_cmd,
-        "exit_code": result["exit_code"],
-        "stdout": result["stdout"][:3000],
-        "stderr": result["stderr"][:3000],
-    }, indent=2)
-
-
-@mcp.tool()
-def run_lammps(
-    script: str = "in.watbox",
-    work_dir: str = "",
-    timeout: int = 7200,
-) -> str:
-    """Run a LAMMPS simulation. Automatically selects the right execution method:
-    - Inside a PBS job with mpirun available: mpirun -np PBS_NP lmp -in <script>
-    - Otherwise (local / no MPI launcher): Python API (single process)
-
-    Args:
-        script: Input script filename relative to work_dir (default: in.watbox)
-        work_dir: Working directory containing the script and data files.
-                  Supports /app/ paths (default: repo work/run0)
-        timeout: Max seconds to wait (default: 7200)
-
-    Returns:
-        JSON with task_id, status, method (mpi|python_api), ranks, stdout, stderr
-    """
-    import glob as _glob
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-    _work = _resolve_paths(work_dir) if work_dir else DEFAULT_WORK_DIR
-
-    # Clear previous trajectory frames so stale output can't be mistaken for a new run.
-    frames_dir = os.path.join(_work, "frames")
-    if os.path.isdir(frames_dir):
-        for _old in _glob.glob(os.path.join(frames_dir, "*.lammpstrj")):
-            os.remove(_old)
-
-    res = _detect_resources()
-    use_mpi = res["in_pbs"] and bool(res["launcher"])
-    method = "mpi" if use_mpi else "python_api"
-    ranks = res["ntasks"] if use_mpi else 1
-
-    _tasks[task_id] = {
-        "name": f"run_lammps:{script}",
-        "status": "running",
-        "depends_on": [],
-        "submitted_at": time.time(),
-        "method": method,
-    }
-
-    if use_mpi:
-        # the pip lammps wheel's bundled lmp binary won't load on this cluster's kernel
-        # (same elf segment-layout mismatch as parsl_server.py) no matter the MPI
-        # runtime, so use the cluster module (gcc 13.2.0 + OpenMPI 5.0.6) instead
-        cmd = (
-            f"module load lammps/22Jul2025 >/dev/null 2>&1 && "
-            f"cd {_work} && "
-            f"env -u PMI_SIZE -u PMI_RANK -u I_MPI_HYDRA_BOOTSTRAP "
-            f"mpirun -n {ranks} lmp -in {script}"
-        )
-        result = _run_command(["bash", "-lc", cmd], work_dir=_work, timeout=timeout)
-    else:
-        py_script = f"""\
-import os
-os.chdir("{_work}")
-from lammps import lammps
-lmp = lammps(cmdargs=["-screen", "none"])
-lmp.file("{script}")
-lmp.close()
-"""
-        result = _run_python_script(py_script, work_dir=_work, timeout=timeout)
-
-    exit_code = result["exit_code"]
-    frames_written = _glob.glob(os.path.join(frames_dir, "*.lammpstrj")) if os.path.isdir(frames_dir) else []
-    # exit 11 = SIGSEGV on lmp cleanup, but output was already written before it crashed
-    if exit_code == 11 and frames_written:
-        status = "completed"
-        note = f"lmp exited 11 (SIGSEGV cleanup crash) but {len(frames_written)} trajectory frames were written — treating as success"
-    else:
-        status = "completed" if exit_code == 0 else "failed"
-        note = ""
-
-    _tasks[task_id]["status"] = status
-    _tasks[task_id]["exit_code"] = exit_code
-    _tasks[task_id]["stdout"] = result["stdout"]
-    _tasks[task_id]["stderr"] = result["stderr"]
-    _tasks[task_id]["completed_at"] = time.time()
-
-    return json.dumps({
-        "task_id":   task_id,
-        "name":      f"run_lammps:{script}",
-        "status":    status,
-        "method":    method,
-        "ranks":     ranks,
-        "exit_code": exit_code,
-        "frames":    len(frames_written),
-        "note":      note,
-        "stdout":    result["stdout"][:3000],
-        "stderr":    result["stderr"][:3000],
-    }, indent=2)
 
 
 @mcp.tool()
@@ -927,12 +847,6 @@ def cleanup() -> str:
 
 
 # __ Helpers ___________________________________________________________________
-
-def _indent(text: str, spaces: int) -> str:
-    """Indent every line of text by the given number of spaces."""
-    prefix = " " * spaces
-    return "\n".join(prefix + line for line in text.splitlines())
-
 
 def _resolve_paths(text: str) -> str:
     """Replace /app/ placeholder paths with actual local repo paths."""

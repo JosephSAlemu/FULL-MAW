@@ -67,7 +67,7 @@ class ToolCallEvent(BaseEvent):
     succeeded: bool
     duration_s: float = 0
     iteration: Optional[int] = None
-    # only populated for submit_task/submit_shell_task/submit_mpi_task. engine_backend
+    # only populated for write_workflow/run_workflow. engine_backend
     # is the raw "engine" string the MCP server reports back (e.g "parsl-fallback").
     # engine_verified: for parsl/pycompss, did the runtime actually dispatch it (not
     # fallback). for adios, did the code call a real adios2 API, not just import it.

@@ -144,42 +144,6 @@ ENV_NOTES = {
 
 
 @tool
-def submit_task(name: str, python_code: str, depends_on: list[str] | None = None, timeout: int = 1800) -> str:
-    """Submit a Python task for execution via the workflow engine.
-
-    The task runs in the local venv environment. Write complete, self-contained
-    Python code with all imports at the top.
-
-    Args:
-        name: Descriptive name for this task (e.g. "run_lammps", "analyze_ovito")
-        python_code: Python code to execute (multi-line string, all imports included)
-        depends_on: List of task IDs that must complete before this task runs (optional)
-        timeout: Max seconds to wait (default: 600)
-    """
-    args = {"name": name, "python_code": python_code, "timeout": timeout}
-    if depends_on:
-        args["depends_on"] = depends_on
-    return _call_mcp_tool("submit_task", args)
-
-
-@tool
-def submit_shell_task(name: str, command: str, work_dir: str = "/app/work/run0", timeout: int = 1800) -> str:
-    """Submit a shell command for execution in the local environment.
-
-    Use this for file operations, system commands, and non-Python tasks.
-
-    Args:
-        name: Descriptive name (e.g. "copy_data_files", "create_directories")
-        command: Shell command to execute (e.g. "mkdir -p /app/work/run0/frames")
-        work_dir: Working directory (default: /app/work/run0)
-        timeout: Max seconds to wait (default: 600)
-    """
-    return _call_mcp_tool("submit_shell_task", {
-        "name": name, "command": command, "work_dir": work_dir, "timeout": timeout,
-    })
-
-
-@tool
 def write_workflow(python_code: str, filename: str = "workflow.py") -> str:
     """Write the single standalone Parsl workflow file that performs ALL the work.
 
@@ -223,7 +187,7 @@ def get_task_status(task_id: str) -> str:
     """Get the current status of a submitted task.
 
     Args:
-        task_id: The task ID returned by submit_task or submit_shell_task
+        task_id: The task ID returned by run_workflow
     """
     return _call_mcp_tool("get_task_status", {"task_id": task_id})
 
@@ -233,7 +197,7 @@ def get_task_result(task_id: str) -> str:
     """Get the full output (stdout/stderr) of a completed task.
 
     Args:
-        task_id: The task ID returned by submit_task or submit_shell_task
+        task_id: The task ID returned by run_workflow
     """
     return _call_mcp_tool("get_task_result", {"task_id": task_id})
 
@@ -305,147 +269,119 @@ def get_resources() -> str:
     return _call_mcp_tool("get_resources", {})
 
 
-@tool
-def submit_mpi_task(name: str, command: str, num_ranks: int = 0,
-                     work_dir: str = "/app/work/run0", timeout: int = 1800) -> str:
-    """Submit a command to run in parallel under MPI (mpirun/srun).
-
-    Only use this after get_resources confirms in_pbs=true. Prepends the detected
-    MPI launcher to the given command.
-
-    Args:
-        name: Descriptive name for this task
-        command: The executable and its arguments, without the launcher prefix
-                 (e.g. "lmp -in /app/work/run0/in.watbox")
-        num_ranks: Number of MPI ranks. 0 (default) uses all ranks from get_resources.
-        work_dir: Working directory (default: /app/work/run0)
-        timeout: Max seconds to wait (default: 1800)
-    """
-    return _call_mcp_tool("submit_mpi_task", {
-        "name": name, "command": command, "num_ranks": num_ranks,
-        "work_dir": work_dir, "timeout": timeout,
-    })
-
-
-@tool
-def run_lammps(script: str = "in.watbox", work_dir: str = "", timeout: int = 7200) -> str:
-    """Run a LAMMPS simulation. Automatically selects the right execution method:
-    - Inside a PBS job with mpirun available: mpirun -np PBS_NP lmp -in <script>
-    - Otherwise (local / no MPI launcher): Python API (single process)
-
-    Implemented identically by every engine's server (parsl/pycompss/adios) --
-    always call this directly for LAMMPS, never reimplement it with submit_task.
-
-    Args:
-        script: Input script filename relative to work_dir (default: in.watbox)
-        work_dir: Working directory containing the script and data files.
-                  Supports /app/ paths (default: repo work/run0)
-        timeout: Max seconds to wait (default: 7200)
-    """
-    return _call_mcp_tool("run_lammps", {
-        "script": script, "work_dir": work_dir, "timeout": timeout,
-    })
-
-
-@tool
-def write_bp(name: str, bp_path: str, python_code: str, timeout: int = 1800) -> str:
-    """Write data to a BP file using a real, server-opened adios2.Stream.
-
-    Only available when --engine adios. python_code runs with `stream` already
-    bound to an open adios2.Stream(bp_path, "w") -- call
-    stream.write(var_name, data, shape, start, count) and
-    stream.write_attribute(...) on it directly. Do NOT open your own Stream or
-    import adios2 yourself; the server already did both.
-
-    Args:
-        name: Descriptive name for this task
-        bp_path: Output .bp path (supports /app/ paths)
-        python_code: Code that calls stream.write(...)/stream.write_attribute(...)
-        timeout: Max seconds to wait (default: 1800)
-    """
-    return _call_mcp_tool("write_bp", {
-        "name": name, "bp_path": bp_path, "python_code": python_code, "timeout": timeout,
-    })
-
-
-@tool
-def read_bp(name: str, bp_path: str, python_code: str, timeout: int = 1800) -> str:
-    """Read data from a BP file using a real, server-opened adios2.Stream.
-
-    Only available when --engine adios. python_code runs with `stream` already
-    bound to an open adios2.Stream(bp_path, "r") -- iterate
-    `for _ in stream.steps():` and call stream.read(var_name)/
-    stream.read_attribute(...) on it directly. Do NOT open your own Stream or
-    import adios2 yourself; the server already did both.
-
-    Args:
-        name: Descriptive name for this task
-        bp_path: Input .bp path to read (supports /app/ paths)
-        python_code: Code that calls stream.read(...)/stream.read_attribute(...)
-        timeout: Max seconds to wait (default: 1800)
-    """
-    return _call_mcp_tool("read_bp", {
-        "name": name, "bp_path": bp_path, "python_code": python_code, "timeout": timeout,
-    })
-
 
 _KNOWLEDGE_SKILLS = {
     "local": "knowledge/local",
     "hpc":   "knowledge/lcrc",
 }
 
-# Per-engine execution contract, appended to the system prompt. Each engine binds
-# a different set of execution tools (_ENGINE_EXEC_TOOLS), so the prompt has to
-# say which ones actually exist for this run rather than listing all of them.
-_ENGINE_EXEC_PROMPTS = {
-    "parsl": """\
-## How You Execute Work (parsl -- generated file only)
+# Per-engine execution contract, appended to the system prompt. Every engine is
+# generated-file only and binds the same two execution tools; what differs is the
+# constructs the generated file must use, which is what this text supplies.
+_EXEC_PROMPT_HEAD = """\
+## How You Execute Work (generated file only)
 
 You have exactly two execution tools: `write_workflow` and `run_workflow`.
-There is no submit_task, no submit_shell_task, no submit_mpi_task, no run_lammps.
-They do not exist on this server. Do not attempt to call them.
+These are the only execution tools. No tool takes a code string or a command
+string and runs it for you.
 
 1. `write_workflow(python_code=..., filename="workflow.py")` -- write ONE
-   standalone Parsl driver file containing EVERY step of the workflow.
+   standalone file containing EVERY step of the workflow.
 2. `run_workflow(filename="workflow.py")` -- the server executes that file.
 
-In that file, every unit of work is a decorated function:
+A simulation plus its visualization is ONE file with multiple steps in it, not
+two files and not two tool calls.
+
+If `write_workflow` rejects your file, read the `errors` list, fix the file, and
+call `write_workflow` again. Do not try to route around it with another tool.
+"""
+
+_ENGINE_EXEC_PROMPTS = {
+    "parsl": _EXEC_PROMPT_HEAD + """
+### What the file must contain (Parsl)
+
+Every unit of work is a decorated function:
 
 - `@bash_app` for ANY command-line work (simulation binaries, MPI runs, file
   conversion). The function body returns the command **string**; Parsl runs it.
   An 8-rank MPI run is a @bash_app returning `f"mpirun -n 8 {exe} {params}"`.
 - `@python_app` for pure Python work (analysis, plotting, writing summaries).
 
-Both kinds of app live in the SAME file. A simulation plus its visualization is
-one file with a @bash_app and a @python_app, not two files and not two tools.
-
 The file must build its own Parsl `Config`, call `parsl.load(config)`, invoke the
-apps, resolve futures with `.result()`, and call `parsl.clear()` at the end. This
-is the one place you DO write Parsl config code yourself.
+apps, wire them together with futures and `File` objects, and call
+`parsl.clear()` at the end.
 
-Forbidden inside the generated file (the server rejects the file if present):
-`import subprocess`, `subprocess.run/Popen`, `os.system`, `os.popen`, and any
-`mpirun`/`srun`/`mpiexec` string outside a `@bash_app` body.
+Rejected: `import subprocess`, `subprocess.run/Popen`, `os.system`, `os.popen`,
+and any `mpirun`/`srun`/`mpiexec` string outside a `@bash_app` body.
+""",
 
-If `write_workflow` rejects your file, read the `errors` list, fix the file, and
-call `write_workflow` again. Do not try to route around it with another tool.
+    "pycompss": _EXEC_PROMPT_HEAD + """
+### What the file must contain (PyCOMPSs)
+
+Every unit of work is a decorated function:
+
+- `@task` for pure Python work.
+- `@binary(binary="...")` stacked ABOVE `@task` for a command-line program.
+  The body is `pass`. Arguments come from the function signature plus `@task`
+  parameter types (`FILE_IN`, `FILE_OUT`, `FILE_IN_STDIN`, `FILE_OUT_STDOUT`,
+  `Prefix`), or from an `args` string with `{{name}}` placeholders.
+- `@mpi(binary="...", runner="mpirun", processes=N)` stacked above `@task` for
+  an MPI program on N ranks. Body is `pass`. This is how rank count is
+  expressed -- you never type `mpirun` yourself.
+
+Dependencies come from passing values between tasks and from FILE_IN/FILE_OUT
+parameters; call `compss_wait_on()` only where the driver needs a real value.
+
+The runtime lifecycle depends on how this server launches the file, which
+`write_workflow` reports as `launch_mode`:
+- `runcompss`: the launcher owns the runtime -- do NOT call compss_start/stop.
+- `direct`: the file MUST call `compss_start()` first and `compss_stop()` last.
+
+Rejected: `subprocess` anywhere, `os.system`/`os.popen`, `@binary`/`@mpi`
+without `@task` beneath it, and `mpirun`/`srun` named outside an `@mpi`
+decorator.
+""",
+
+    "adios": _EXEC_PROMPT_HEAD + """
+### What the file must contain (ADIOS2)
+
+ADIOS2 is an I/O library, not a scheduler -- it has no task decorator. The file
+is a **staged pipeline**:
+
+- Each stage is a top-level function; a `main()` calls them in order.
+- Inter-stage numerical data MUST move through ADIOS2: the producing stage
+  writes with `stream.write(...)` on an `adios2.Stream(path, "w")`, and the
+  consuming stage reads it back with `stream.read(...)` from an
+  `adios2.Stream(path, "r")`. Write it and actually read it back -- do not keep
+  using the in-memory copy.
+- Human-facing outputs (PNG, summary text) stay plain files; BP is for the
+  numerical arrays flowing between stages.
+
+Because ADIOS2 cannot launch programs, a CLI step for an external compiled
+binary is a stage function that uses `subprocess` internally. That is allowed
+ONLY inside a stage body. Never subprocess another Python stage -- Python
+stages live in this same file and talk to each other through ADIOS2.
+
+For true in-situ streaming (producer and consumer running CONCURRENTLY rather
+than one after the other), declare a top-level `MPI_RANKS = <int>`. The server
+then launches the whole file under one `mpirun -n <MPI_RANKS>`, and the stages
+dispatch on MPI rank: split `MPI.COMM_WORLD` with `world.Split(color=role,
+key=rank)`, pass the split `comm` to `adios2.Adios(comm)` and
+`io.open(name, mode, comm)`, and use the SST engine. See the engine skill for
+a full example. Without `MPI_RANKS` the pipeline runs sequentially, which is
+fine when stages don't need to overlap.
+
+Rejected: `subprocess`/`os.system`/`os.popen` at module top level, no stage
+functions, no `main()` (serial mode), opening no ADIOS2 stream, never reading
+back what was written, or declaring `MPI_RANKS` without splitting COMM_WORLD
+and passing the split comm to ADIOS2.
 """,
 }
 
 
 def _engine_exec_prompt(engine: str) -> str:
-    """Execution-contract text for this engine, or the legacy submit_* contract."""
-    return _ENGINE_EXEC_PROMPTS.get(engine, """\
-## How You Execute Work
-
-- `submit_task` -- run Python code (scientific computation, analysis, plotting)
-- `submit_shell_task` -- run shell commands (cp, mkdir, ls)
-- `submit_mpi_task` -- run an MPI-capable command, only once get_resources
-  confirms in_pbs=true
-- `run_lammps` -- call directly for LAMMPS; never reimplement it with submit_task
-
-Track task_ids from submit_task results and use depends_on for dependencies.
-""")
+    """Execution-contract text for this engine's generated workflow file."""
+    return _ENGINE_EXEC_PROMPTS.get(engine, _EXEC_PROMPT_HEAD)
 
 # engine-specific skills, force-loaded into the system prompt in _explorer_async
 # instead of leaving it to load_skill (systems/<engine>, knowledge/<ENGINE>)
@@ -456,8 +392,7 @@ _ENGINE_SKILLS = {
 }
 
 _ENGINE_RELEVANT_TOOLS = (
-    "submit_task", "submit_shell_task", "submit_mpi_task", "write_bp", "read_bp",
-    "run_lammps", "run_workflow",
+    "write_workflow", "run_workflow",
 )
 
 
@@ -468,21 +403,16 @@ def _classify_engine_usage(engine: str, tool_name: str, tool_args: dict,
     engine_backend is the raw "engine" field self-reported by the MCP server (e.g.
     "parsl-fallback", "adios2-unused"), when the tool's JSON result has one.
 
-    All three engines now use the same shape: the server itself is authoritative
-    on whether the engine was genuinely used, not just available --
-    parsl/pycompss_server.py track whether their runtime actually dispatched the
-    task (vs. fallback); adios_server.py's _adios_engine_state additionally scans
-    the submitted code for a real adios2 API call and reports "adios2-unused" when
-    the package was available but never actually called (see adios_server.py --
-    that content-scan used to live here, moved server-side so it's the single
-    source of truth instead of being duplicated client- and server-side).
-    "-fallback" maps to None for adios specifically (package unavailable isn't the
-    explorer's fault), but to False for parsl/pycompss (their fallback always
-    means a genuine runtime-dispatch failure worth flagging). "adios2-n/a" also
-    maps to None -- most submit_task calls in an ADIOS run (LAMMPS, OVITO,
-    rendering, ...) have nothing to do with ADIOS2 at all, so "didn't use it"
-    isn't a meaningful signal for those; only "imported it but never called it"
-    ("adios2-unused") is.
+    All three engines use the same shape: the server is authoritative on whether
+    the engine was genuinely used, not just available. parsl/pycompss_server.py
+    report whether their runtime actually dispatched the workflow (vs. fallback);
+    adios_server.py's _adios_engine_state scans the generated file for a real
+    adios2 API call and reports "adios2-unused" when the package was available
+    but never actually called.
+
+    "-fallback" maps to None for adios (package unavailable isn't the explorer's
+    fault), but to False for parsl/pycompss, whose fallback always means a real
+    runtime-dispatch failure worth flagging. "adios2-n/a" also maps to None.
     """
     if tool_name not in _ENGINE_RELEVANT_TOOLS:
         return None, None
@@ -521,8 +451,8 @@ def load_skill(name: str) -> str:
     return content or ENV_NOTES.get(name, ENV_NOTES["local"])
 
 
-# Inspection/environment tools every engine exposes. These never execute
-# workflow work, they only observe it or prepare the venv.
+# Inspection/environment tools. These never execute workflow work, they only
+# observe it or prepare the venv.
 _COMMON_TOOLS = [
     get_task_status, get_task_result, list_tasks,
     install_package, check_package,
@@ -530,30 +460,17 @@ _COMMON_TOOLS = [
     get_resources, load_skill,
 ]
 
-# Execution tools, which differ by engine.
-#
-# parsl is generated-file only: the agent writes one Parsl driver where every step
-# is a @bash_app or @python_app, then runs that file. It gets no submit_* tools and
-# no run_lammps, because each of those let the agent hand the server a command or
-# code string to execute -- the exact bypass this model removes. parsl_server.py
-# does not implement them any more either.
-#
-# pycompss and adios still use the older submit_* model and are unchanged.
-_ENGINE_EXEC_TOOLS = {
-    "parsl":    [write_workflow, run_workflow],
-    "pycompss": [submit_task, submit_shell_task, submit_mpi_task, run_lammps],
-    "adios":    [submit_task, submit_shell_task, submit_mpi_task, run_lammps,
-                 write_bp, read_bp],
-}
+# Execution tools. Every engine is generated-file only: the agent writes ONE
+# workflow file expressed in that engine's own constructs, then runs it. No
+# engine accepts a code or command string to execute, which is what used to let
+# work bypass the engine entirely.
+_EXEC_TOOLS = [write_workflow, run_workflow]
 
-_DEFAULT_EXEC_TOOLS = [submit_task, submit_shell_task, submit_mpi_task, run_lammps]
-
-# Kept for callers/tests that imported the old flat list.
-EXPLORER_TOOLS = _COMMON_TOOLS + _DEFAULT_EXEC_TOOLS
+EXPLORER_TOOLS = _COMMON_TOOLS + _EXEC_TOOLS
 
 
 def _tools_for_engine(engine: str) -> list:
-    return _COMMON_TOOLS + _ENGINE_EXEC_TOOLS.get(engine, _DEFAULT_EXEC_TOOLS)
+    return EXPLORER_TOOLS
 
 
 # __ Explorer System Prompt ____________________________________________________
@@ -1361,10 +1278,10 @@ async def _explorer_async(state: dict, engine: str) -> dict:
 
                 console.print(f"[dim cyan][explorer] calling tool: {tool_name}({json.dumps(tool_args, indent=2)[:200]})[/dim cyan]")
 
-                if tool_name == "run_lammps":
+                if tool_name == "run_workflow":
                     console.print(Panel(
-                        f"script={tool_args.get('script', 'in.watbox')}  work_dir={tool_args.get('work_dir') or '(default)'}",
-                        title="[bold yellow]Running LAMMPS simulation[/bold yellow]",
+                        f"file={tool_args.get('filename', 'workflow.py')}",
+                        title=f"[bold yellow]Running {engine} workflow[/bold yellow]",
                         border_style="yellow",
                     ))
 
@@ -1492,24 +1409,23 @@ async def _explorer_async(state: dict, engine: str) -> dict:
 
                 color = "green" if tool_succeeded else "red"
                 console.print(f"[{color}][explorer] {tool_name} -> {display_status}[/{color}]")
-                if tool_name != "run_lammps":
-                    try:
-                        _launch_cmd = json.loads(tool_result).get("launch_command")
-                        if _launch_cmd:
-                            console.print(f"[dim {color}][explorer]   $ {_launch_cmd}[/dim {color}]")
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
-                if tool_name == "run_lammps":
+                try:
+                    _launch_cmd = json.loads(tool_result).get("launch_command")
+                    if _launch_cmd:
+                        console.print(f"[dim {color}][explorer]   $ {_launch_cmd}[/dim {color}]")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                if tool_name == "write_workflow":
+                    # surface the apps/tasks/stages the server actually found, so a
+                    # structurally-wrong file is visible before it ever runs
                     try:
                         r = json.loads(tool_result)
-                        console.print(
-                            f"[bold {color}][explorer] LAMMPS {r.get('status', '?')}: "
-                            f"method={r.get('method', '?')} ranks={r.get('ranks', '?')} "
-                            f"frames={r.get('frames', '?')} launched_via={r.get('launched_via', '?')}"
-                            f"[/bold {color}]"
-                        )
-                        if r.get("launch_command"):
-                            console.print(f"[dim {color}][explorer]   $ {r['launch_command']}[/dim {color}]")
+                        _shape = {k: v for k, v in r.items() if k in (
+                            "bash_apps", "python_apps", "tasks", "binary_tasks",
+                            "mpi_tasks", "stages", "adios_writes", "adios_reads",
+                            "launch_mode")}
+                        if _shape:
+                            console.print(f"[dim {color}][explorer]   {json.dumps(_shape)}[/dim {color}]")
                     except (json.JSONDecodeError, AttributeError):
                         pass
                 if engine_verified is False:

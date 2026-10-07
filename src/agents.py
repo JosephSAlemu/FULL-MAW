@@ -304,6 +304,7 @@ class Orchestrator(Agent):
         agent_state: AgentState
     ):
         self.model = model
+        self.checking_model = ""
         self.base_url = base_url
         self.api_key = api_key
         self.agents = agents
@@ -375,7 +376,7 @@ class Orchestrator(Agent):
                 status_str = "OK" if entry.get("succeeded", False) else "FAILED"
                 parts.append(f"  [{entry['tool']}] {status_str} - {entry.get('result', '')[:200]}")
             # engine_verified comes from mcp_explorer.py's _classify_engine_usage. False means
-            # a submit_task/submit_shell_task/submit_mpi_task call didn't actually hit the real engine
+            # a write_workflow/run_workflow call did not actually hit the real engine
             unverified = [e for e in log if e.get("engine_verified") is False]
             if unverified:
                 parts.append(

@@ -92,8 +92,8 @@ Execution Layer (Python venv)
 The MCP server runs as a single long-lived subprocess started by the explorer agent.
 Communication is stdio-based JSON-RPC. This keeps the agent logic (LangGraph, LLM
 calls, retries) completely decoupled from the engine logic (how a task actually gets
-scheduled and run) — the explorer calls the same tool names (`submit_task`,
-`get_task_status`, etc.) no matter which engine is behind the server.
+scheduled and run) — the explorer calls the same tool names (`write_workflow`,
+`run_workflow`, `get_task_status`, etc.) no matter which engine is behind the server.
 
 ### Agent Roles
 
@@ -228,21 +228,34 @@ is identical regardless of which one is selected with `--engine`. Each falls bac
 plain subprocess execution if the real engine library isn't installed, so the system
 still runs (just without that engine's scheduling/optimizations).
 
+Every engine exposes the **same 11 tools**. Execution is generated-file only:
+the explorer writes ONE workflow file and the server runs it. No tool accepts a
+code string or command string to execute.
+
 | Tool | Parsl | PyCOMPSs | ADIOS2 | Description |
 |---|:---:|:---:|:---:|---|
-| `submit_task` | ✓ | ✓ | ✓ | Submit Python code for execution, with dependency tracking |
-| `submit_shell_task` | ✓ | ✓ | ✓ | Run a shell command via the engine |
-| `submit_mpi_task` | ✓ | ✓ | ✓ | Run an MPI command (`mpirun -np $PBS_NP ...`) |
-| `run_lammps` | ✓ | ✓ | ✓ | Purpose-built LAMMPS task launcher |
+| `write_workflow` | ✓ | ✓ | ✓ | Write the single workflow file; validated and rejected if malformed |
+| `run_workflow` | ✓ | ✓ | ✓ | Execute that file through the engine |
 | `get_task_status` | ✓ | ✓ | ✓ | pending / running / completed / failed |
-| `get_task_result` | ✓ | ✓ | ✓ | Full stdout/stderr of a completed task |
-| `list_tasks` | ✓ | ✓ | ✓ | List all submitted tasks and statuses |
+| `get_task_result` | ✓ | ✓ | ✓ | Full stdout/stderr of a completed run |
+| `list_tasks` | ✓ | ✓ | ✓ | List all submitted runs and statuses |
 | `get_resources` | ✓ | ✓ | ✓ | PBS node/rank info — **explorer must call this first on HPC** |
 | `install_package` | ✓ | ✓ | ✓ | `pip install` into the venv, mid-run |
 | `check_package` | ✓ | ✓ | ✓ | Verify a package is importable |
 | `list_files` / `read_file` | ✓ | ✓ | ✓ | Inspect working directory contents |
-| `write_bp` / `read_bp` | – | – | ✓ | ADIOS2 BP-format I/O between pipeline stages |
 | `cleanup` | ✓ | ✓ | ✓ | Stop and clean up the MCP server process |
+
+What the generated file must contain differs per engine:
+
+| Engine | Python work | CLI work | MPI work |
+|---|---|---|---|
+| Parsl | `@python_app` | `@bash_app` returning the command string | `@bash_app` returning `mpirun -n N ...` |
+| PyCOMPSs | `@task` | `@binary(binary=...)` + `@task` | `@mpi(binary=..., processes=N)` + `@task` |
+| ADIOS2 | stage function | `subprocess` inside a stage body | `subprocess` inside a stage body |
+
+ADIOS2 is an I/O library with no task decorator, so its workflow is a staged
+pipeline whose inter-stage arrays must move through `adios2.Stream` write/read
+round trips.
 
 - **Parsl**: tasks run as real `@python_app`s on a `HighThroughputExecutor` (falls back to subprocess if not installed).
 - **PyCOMPSs**: tasks run under the real COMPSs runtime with `compss_wait_on()` dependency tracking when available; falls back to direct execution otherwise. Built by BSC.
@@ -460,9 +473,9 @@ size MPI launches automatically:
 | `PBS_NUM_PPN` | Processors per node |
 | `PBS_NODEFILE` | Path to file listing allocated hostnames |
 
-The `submit_mpi_task` MCP tool reads `PBS_NP` and automatically runs
-`mpirun -np $PBS_NP <command>` — **`mpirun`, not `srun`** (this is a PBS cluster, not
-SLURM).
+`get_resources` reports `PBS_NP` so the generated workflow can size its rank
+count from the allocation rather than hardcoding it — and it must use
+**`mpirun`, not `srun`** (this is a PBS cluster, not SLURM).
 
 ### Storage paths on LCRC
 

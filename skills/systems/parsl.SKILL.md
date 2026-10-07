@@ -24,8 +24,8 @@ The parsl engine is **generated-file only**. You have exactly two execution tool
 | `write_workflow(python_code, filename)` | Writes ONE standalone Parsl driver file to `/app/work/run0/` |
 | `run_workflow(filename)` | The server executes that file |
 
-There is **no `submit_task`, no `submit_shell_task`, no `submit_mpi_task`, and no
-`run_lammps`** on this server. They were removed. Do not try to call them.
+These are the only execution tools this server has. There is no tool that takes
+a code string or a command string and runs it for you.
 
 **You never execute anything yourself.** No subprocess, no direct CLI call, no bash
 script, no PBS script, no `mpirun` typed by you. Every command line in the workflow
@@ -733,7 +733,7 @@ that moves is `GenericIOPrint`'s stdout, consumed by `awk` in the same pipe.
 
 | Pitfall | Rule |
 |---|---|
-| Reaching for `submit_task`/`submit_shell_task`/`submit_mpi_task`/`run_lammps` | They do not exist on this server. Use `write_workflow` + `run_workflow` |
+| Looking for a tool that runs a code or command string | There isn't one. Use `write_workflow` + `run_workflow` |
 | Running a CLI command any way other than `@bash_app` | Every command line must be a string returned by a `@bash_app` |
 | `import subprocess` / `os.system` in the generated file | Rejected by `write_workflow` — express it as a `@bash_app` |
 | `mpirun`/`srun` in the driver body instead of inside a `@bash_app` | Rejected by `write_workflow` — move it into the app body |

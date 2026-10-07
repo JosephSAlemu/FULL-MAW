@@ -108,10 +108,11 @@ over all 11 files serially — that throws away the only real parallelism in
 this workflow.
 
 Describe the work; let the explorer choose the dispatch mechanism for its
-engine. On parsl it becomes 11 `@python_app` invocations inside the single
-generated workflow file, which Parsl runs concurrently on its worker pool. On
-other engines it becomes 11 separate `submit_task` calls. Either way the
-per-file logic is identical, so do not prescribe the tool in the task text.
+engine. All steps — producer and all 11 per-file steps — end up in one
+generated workflow file, where the 11 steps become 11 separate invocations of
+the engine's own construct and the engine runs them concurrently. The per-file
+logic is identical across engines, so do not prescribe the mechanism in the
+task text, and never ask the explorer to build its own thread or process pool.
 
 ---
 

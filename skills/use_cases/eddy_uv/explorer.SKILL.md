@@ -2,10 +2,10 @@
 name: use_cases/eddy_uv/explorer
 description: >
   Eddy_uv (Nek5000 CFD) execution facts for the explorer -- running the producer
-  via submit_mpi_task inside the existing allocation (no qsub), cluster-specific
-  quirks from subeddy.pbs (rank count, sourced env), field-file naming, and which
-  files to ignore. Does not prescribe the CFD/visualization math -- that's left to
-  the explorer's own reasoning.
+  under MPI inside the existing allocation (no qsub), cluster-specific quirks from
+  subeddy.pbs (rank count, sourced env), field-file naming, and which files to
+  ignore. Does not prescribe the CFD/visualization math -- that's left to the
+  explorer's own reasoning.
 ---
 
 # Eddy_uv (Nek5000 CFD) — Explorer Skill
@@ -15,81 +15,72 @@ skill covers only what isn't derivable by reading the case files in isolation
 or from general CFD/Nek5000 knowledge -- the actual mechanics of running this
 specific case on this specific cluster.
 
+It describes **the work**, not the dispatch mechanism. Every step below belongs
+in the single workflow file you generate with `write_workflow` and execute with
+`run_workflow`; how that file expresses a step (`@bash_app`, `@binary`/`@mpi`
+over `@task`, or a stage function) is defined by the engine reference in your
+context, which is authoritative.
+
 ---
 
 ## When to Use This Skill
 
-Load whenever the explorer is executing a workflow that submits/reads a
+Load whenever the explorer is executing a workflow that runs/reads a
 Nek5000 `eddy_uv` run (paths under
 `/lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv/`).
 
 ---
 
-## Note on Tool Names in This Skill
+## Stage 1: Run the Producer (MPI, inside the existing allocation)
 
-This skill names `submit_mpi_task` and `submit_task` throughout. Those are the
-tools on the **pycompss** and **adios** engines.
-
-**On the parsl engine they do not exist.** There, you write one Parsl file via
-`write_workflow` and run it with `run_workflow`: the `./nek5000` producer becomes
-a `@bash_app` returning the MPI command string, and each per-field-file analysis
-step becomes a `@python_app` in that same file. The *facts* below — rank count,
-sourced env, working directory, file naming — all still apply exactly as written;
-only the dispatch mechanism differs. Your engine reference is authoritative.
-
----
-
-## Stage 1: Run the Producer (submit_mpi_task, inside the existing allocation)
-
-**No new PBS job here, and no `qsub`.** The producer runs via `submit_mpi_task`
-inside the same allocation this whole run is already using — the same allocation
-the field-file analysis/visualization stages run in — so producer and consumer are
-always one job, never two separate submissions.
+**No new PBS job here, and no `qsub`.** The producer runs inside the same
+allocation this whole run is already using — the same allocation the field-file
+analysis/visualization stages run in — so producer and consumer are always one
+job, never two separate submissions.
 
 `subeddy.pbs` still exists on disk as the vendor sample script — read it first, but
 only as a reference for the env file and executable name, not something to submit.
 
-```
-get_resources()   # confirm in_pbs is true AND ntasks/cpus_per_task >= NRANKS
+The step the workflow file must express:
 
-submit_mpi_task(
-    name="run_eddy_uv_producer",
-    command="bash -c 'source /lcrc/project/PEDAL/jalemu/HACC/HACC_go/env/bashrc.improv.cpu && export OMP_NUM_THREADS=1 && ./nek5000'",
-    num_ranks=<NRANKS>,
-    work_dir="/lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv",
-)
+```
+command:  bash -c 'source /lcrc/project/PEDAL/jalemu/HACC/HACC_go/env/bashrc.improv.cpu && export OMP_NUM_THREADS=1 && ./nek5000'
+ranks:    <NRANKS>
+work dir: /lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv
 ```
 
+- Before building the file, call `get_resources()` and confirm `in_pbs` is true
+  AND `ntasks`/`cpus_per_task` >= `NRANKS`.
 - `NRANKS` comes from the task (the user may override it); default to `8` — the
-  value confirmed working for this producer. Pass it explicitly as `num_ranks`
-  rather than relying on `submit_mpi_task`'s `num_ranks=0` default (which uses
-  however many ranks the interactive allocation happens to have).
+  value confirmed working for this producer. Set it explicitly in the workflow
+  file rather than letting the engine default to whatever rank count the
+  interactive allocation happens to have.
 - If `get_resources` reports fewer than `NRANKS` ranks available, stop and tell the
   user to restart their interactive PBS job with enough resources — do not fall
   back to a smaller rank count silently, and do not work around it by submitting a
   separate batch job.
-- `work_dir` must be the `eddy_uv/` directory so `./nek5000` (relative) is found and
-  field-file output lands alongside the case files.
+- The working directory must be the `eddy_uv/` directory so `./nek5000` (relative)
+  is found and field-file output lands alongside the case files.
 - Sourcing `bashrc.improv.cpu` inside the `bash -c` wrapper is required before the
   binary can find its shared libraries — the same shared cluster env the
   `cosmology` use case's HACC build also uses; not a sign of misconfiguration.
 - `nek5000` in this directory is **already built** (`build.log` exists) --
   never try to rebuild it.
-- This call blocks until the run finishes (or times out) — there's no separate job
-  to poll with `qstat`; when `submit_mpi_task` returns, the producer is done.
+- The producer completes within the run of the workflow file — there's no separate
+  job to poll with `qstat`.
 
-### Quirks in the original `subeddy.pbs` (for reference only — this file is no longer submitted)
+### Quirks in the original `subeddy.pbs` (for reference only — this file is never submitted)
 - `#PBS -l select=1:mpiprocs=32` requests a node with headroom for 32 procs,
   but the script's `mpiexec -np ${NTOTRANKS}` only launches **8** ranks
   (`NRANKS=8` is set explicitly in the script body) -- 8 is the actual rank
-  count for this producer, not 32. Pass `num_ranks=8` to `submit_mpi_task`
-  directly; there's no headroom concept to replicate.
+  count for this producer, not 32. Use 8 ranks directly; there's no headroom
+  concept to replicate.
 - The script sources
   `/lcrc/project/PEDAL/jalemu/HACC/HACC_go/env/bashrc.improv.cpu` to set up
   the Polaris/Improv module environment. That's the shared cluster bashrc
   reused from the `cosmology` use case's HACC build -- it is not a sign the
   script is misconfigured or belongs to a different project; keep sourcing it
-  in the `submit_mpi_task` command too.
+  before `./nek5000`.
 
 ---
 
@@ -127,39 +118,34 @@ Fortran) -- read them rather than assuming values from a paper or description.
 
 ## The Deliverable Includes a Rendered Image
 
-Whatever derived quantity the task asks for, the consumer stage is not done
+Whatever derived quantity the task asks for, the consumer work is not done
 until it has rendered and saved a visualization per field file (matplotlib,
 `Agg` backend, saved as PNG) -- not just printed or pickled numeric arrays.
-The consumer overall is single-process work (do not wrap the whole thing in
-`submit_mpi_task`).
+The consumer is single-process Python work per file; it is never an MPI step.
 
 ---
 
-## Where Real Parallelism Lives: Per Field File, via Separate `submit_task` Calls
+## Where Real Parallelism Lives: Per Field File
 
-`submit_task` already runs the `python_code` you give it through the
-selected engine's task machinery automatically -- the server wraps it in
-`@python_app` (Parsl) or `@task`/`compss_start()` (PyCOMPSs) on its own
-persistent worker pool, for every call, with zero code from you (see
-`systems/parsl` / `systems/pycompss`).
-
-**Never write `import parsl`, `Config`, `parsl.load(...)`, `compss_start()`,
-`@task`, or `@python_app` yourself inside the code you submit.** That nests
-a second runtime inside one the server already started. Confirmed in a real
-run of this exact workflow: doing exactly that let Parsl auto-detect the
-node's full core count and spin up **128 worker processes** (certs, ZeroMQ
-sockets, manager/interchange processes) to run one synchronous function call
-once -- multiple seconds of pure overhead for work that runs in a fraction
-of a second, with zero benefit.
+The producer is one indivisible unit of work: its only parallelism (8 MPI ranks)
+happens inside the pre-built `nek5000` executable, so never split or fan it out.
 
 The field-file series (`eddy_uv0.f00001` .. `f00011`) is the one place
 independent units of work exist here -- each file's (read -> compute ->
-render) is fully independent of every other file. **The correct way to
-parallelize it: call `submit_task` 11 separate times, once per file, each
-with plain Python code.** The server's own worker pool already runs those
-concurrently. This is the same whether the engine is `parsl`, `pycompss`, or
-`adios` -- the consumer's code never changes, only what the server does with
-it underneath does.
+render) is fully independent of every other file. Express those **11 per-file
+steps as 11 separate invocations inside the single generated workflow file**,
+using the engine's own construct:
+
+- **parsl** — 11 `@python_app` invocations; collect the futures, then
+  `.result()` them in the driver body.
+- **pycompss** — 11 `@task` invocations, with the per-file paths declared
+  through `FILE_IN`/`FILE_OUT` parameter types.
+- **adios** — 11 calls to the per-file stage function from `main()`.
+
+The engine is what runs them concurrently. **Do not build your own
+`ThreadPoolExecutor`, `ProcessPoolExecutor`, `multiprocessing` pool, or
+threads** — and do not collapse the series into one step that loops over all 11
+files serially, which throws away the only real parallelism in this workflow.
 
 ---
 
@@ -167,14 +153,14 @@ it underneath does.
 
 | Pitfall | Solution |
 |---|---|
-| Assuming the producer needs 32 MPI ranks | That was the original `subeddy.pbs`'s headroom quirk (`mpiprocs=32` vs. `mpiexec -np` 8). Pass `num_ranks=8` to `submit_mpi_task` directly -- 8 unless the task says otherwise. |
-| Explorer calls `qsub`/`qstat` for this project | Don't -- run `./nek5000` via `submit_mpi_task` (num_ranks=8, work_dir=eddy_uv/) inside the existing allocation instead. |
-| `submit_mpi_task` fails with a launcher/env error | Wrap the command in `bash -c '...'`, sourcing `bashrc.improv.cpu` before `./nek5000`, and confirm `work_dir` is the `eddy_uv/` directory. |
+| Assuming the producer needs 32 MPI ranks | That was the original `subeddy.pbs`'s headroom quirk (`mpiprocs=32` vs. `mpiexec -np` 8). Use 8 ranks unless the task says otherwise. |
+| Explorer calls `qsub`/`qstat` for this project | Don't -- the workflow file runs `./nek5000` on 8 ranks with `eddy_uv/` as the working directory, inside the existing allocation. |
+| The producer step fails with a launcher/env error | Wrap the command in `bash -c '...'`, sourcing `bashrc.improv.cpu` before `./nek5000`, and confirm the working directory is the `eddy_uv/` directory. |
 | Globbing picks up `erreddy_uv0.f00001` alongside the main series | Glob `eddy_uv0.f*` specifically -- it won't match the `err`-prefixed file. |
 | Assuming 4-digit field indices (`f0001`) | This case's files are 5-digit (`f00001`) -- check `eddy_uv.nek5000`'s `filetemplate`. |
 | `ModuleNotFoundError: No module named 'pymech'` | `install_package("pymech")` -- it's a normal pip package, not a cluster binary. |
-| Writing `import parsl`/`Config`/`@python_app` (or PyCOMPSs equivalents) inside `python_code` | Never -- `submit_task` already wraps it for you. Write plain Python only. |
-| Trying to parallelize the file series with your own executor instead of multiple `submit_task` calls | Don't build concurrency yourself -- call `submit_task` once per file and let the server's worker pool handle it. |
+| Parallelizing the file series with your own thread/process pool | Don't build concurrency yourself -- emit 11 separate engine invocations in the workflow file and let the engine schedule them. |
+| Splitting the workflow across several generated files or several runs | One file contains every step: producer plus all 11 per-file steps. |
 
 ---
 

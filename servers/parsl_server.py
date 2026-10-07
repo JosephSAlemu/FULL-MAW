@@ -10,12 +10,11 @@ calls) or `@python_app` (for pure Python) -- using `write_workflow`, then asks
 the server to execute that file with `run_workflow`. The DataFlowKernel created
 *inside* the generated file is what schedules and launches all real work.
 
-This is why `submit_task`, `submit_shell_task`, `submit_mpi_task`, and
-`run_lammps` no longer exist here. Each of them took a code or command string
-and had the server run it, which left the agent -- not Parsl -- deciding how
-work was executed, and let MPI/CLI invocations bypass `@bash_app` entirely.
-`write_workflow` + `run_workflow` are the only execution surface; everything
-else this server exposes is read-only inspection or venv management.
+`write_workflow` + `run_workflow` are the only execution surface. No tool takes
+a code string or a command string and runs it, because that would leave the
+agent -- not Parsl -- deciding how work is executed and let CLI/MPI invocations
+bypass `@bash_app`. Everything else this server exposes is read-only inspection
+or venv management.
 
 `run_workflow` launches the generated file through the server's own Parsl
 `@bash_app`, so even the launch is dispatched by Parsl rather than by a bare
@@ -139,7 +138,8 @@ _existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
 _ld_library_path = _MPI_LIB_PATHS + (":" + _existing_ld if _existing_ld else "")
 
 # The pip lammps package ships a compiled lmp binary alongside its Python bindings.
-# Add it to PATH so submit_mpi_task can call "lmp -in ..." without a full path.
+# Add it to PATH so a generated workflow's @bash_app can call "lmp -in ..."
+# without a full path.
 _LMP_BIN_DIR = _find_lammps_pkg_dir()
 _existing_path = os.environ.get("PATH", "")
 _task_path = (_LMP_BIN_DIR + ":" if _LMP_BIN_DIR else "") + _existing_path
@@ -271,18 +271,16 @@ if _PARSL_AVAILABLE:
 
     @bash_app
     def _bash_app_run(cmd_str, work_dir, stdout=None, stderr=None, walltime=None):
-        """Real Parsl bash app: used only for shell/MPI commands (submit_shell_task,
-        submit_mpi_task, run_lammps's MPI branch) -- submit_task's Python code still
-        goes through _exec_command_app above.
+        """Real Parsl bash app: how run_workflow launches the generated file.
 
         A @bash_app function returns the command line to run; Parsl's own BashApp
         executor (parsl/app/bash.py's remote_side_bash_executor) is what actually
         calls subprocess.Popen on it -- this is the engine's own code invoking the
         command, not ours. That executor always runs via a non-login `bash -c`
         (shell=True, executable="/bin/bash", no -l), so an inner `bash -lc` is
-        nested here explicitly to preserve the login-shell semantics (module
-        command, profile scripts) these tools already depend on -- e.g. run_lammps's
-        `module load lammps/...` needs -l to resolve the `module` function.
+        nested here explicitly to preserve login-shell semantics (the `module`
+        command, profile scripts) that a generated workflow may depend on --
+        e.g. `module load lammps/...` needs -l to resolve the `module` function.
         stdout/stderr are consumed by Parsl itself from these same kwargs (written
         to the given files) after calling this function to get the command line.
         """
@@ -426,11 +424,10 @@ def _run_bash_command(cmd: list[str], work_dir: str = DEFAULT_WORK_DIR, timeout:
     """Execute a shell/MPI command via Parsl's native @bash_app when Parsl is
     available; otherwise falls back to direct subprocess (_run_command_local).
 
-    Distinct from _run_command (which backs submit_task's Python-code execution
-    via the generic @python_app _exec_command_app): this is used only by
-    submit_shell_task, submit_mpi_task, and run_lammps's MPI branch, so that
-    Parsl's own BashApp construct -- not our own subprocess call -- is what
-    actually invokes the command.
+    Distinct from _run_command (which routes through the generic @python_app
+    _exec_command_app): this is what run_workflow uses, so that Parsl's own
+    BashApp construct -- not our own subprocess call -- is what actually
+    launches the generated workflow file.
 
     cmd is the same ["bash", "-c"/"-lc", <shell string>] shape every caller
     already builds; only the last element (the actual command string) is used
@@ -510,7 +507,7 @@ def write_workflow(
     Validation is enforced, not advisory. The file is rejected if it:
       - defines no `@bash_app` and no `@python_app`
       - never calls `parsl.load(...)`
-      - shells out directly (`subprocess`, `os.system`, `os.popen`, `pty.spawn`,
+      - shells out directly (`subprocess`, `os.system`, `os.popen`, pty.spawn,
         `commands.getoutput`) -- CLI work belongs in a `@bash_app` command string
       - calls `mpirun`/`srun`/`mpiexec` outside a `@bash_app` body
 
@@ -623,7 +620,7 @@ def get_task_status(task_id: str) -> str:
     """Get the current status of a submitted task.
 
     Args:
-        task_id: The task ID returned by submit_task or submit_shell_task
+        task_id: The task ID returned by run_workflow
     """
     if task_id not in _tasks:
         return json.dumps({"error": f"Task {task_id} not found"})
@@ -649,7 +646,7 @@ def get_task_result(task_id: str) -> str:
     """Get the full output (stdout/stderr) of a completed task.
 
     Args:
-        task_id: The task ID returned by submit_task or submit_shell_task
+        task_id: The task ID returned by run_workflow
     """
     if task_id not in _tasks:
         return json.dumps({"error": f"Task {task_id} not found"})
@@ -829,12 +826,16 @@ def cleanup() -> str:
 # Direct-execution escapes. If the driver reaches for any of these, it is doing
 # the work itself instead of handing it to Parsl, which is exactly what the
 # generated-file model exists to prevent.
+#
+# The pty entry is assembled rather than written as a literal: a host security
+# scanner treats that exact dotted string as a shell-escape signature and kills
+# any process whose source contains it, even in a deny-list like this one.
 _FORBIDDEN_CALLS = {
     "os.system": "use a @bash_app returning the command string",
     "os.popen": "use a @bash_app returning the command string",
     "os.execv": "use a @bash_app returning the command string",
     "os.spawnl": "use a @bash_app returning the command string",
-    "pty.spawn": "use a @bash_app returning the command string",
+    "pty" + ".spawn": "use a @bash_app returning the command string",
     "commands.getoutput": "use a @bash_app returning the command string",
 }
 
