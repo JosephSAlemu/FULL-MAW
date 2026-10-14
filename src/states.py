@@ -42,7 +42,10 @@ class AgentState(TypedDict):
     run_succeeded:         bool             # user's answer to "has the workflow executed properly?"
     reported_issue:        str              # user's description of the issue, when run_succeeded is False
     skill_recommendations: list[dict]       # explorer's suggested skill-file edits
-    skill_edits_applied:   bool             # whether the user let the explorer append them
+    skill_edits_applied:   bool             # whether the user let the explorer append them,
+    mpi_nodes:         int   # nodes the MPI application may use (excludes the spare)
+    mpi_cpus_per_node: int   # ncpus, and also mpiprocs, per node
+    mpi_slots:         int   # mpi_nodes * mpi_cpus_per_node -- the rank ceiling
 
 
 class OrchestratorOutput(BaseModel):
@@ -69,4 +72,6 @@ class UserInput:
     pdf: str = ""
     image: str = ""
     goal: str = ""
+    nodes: int = 1
+    ncpus: int = 1
     data_files: list[str] = field(default_factory=list)

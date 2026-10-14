@@ -11,6 +11,7 @@ It calls the same tools regardless of backend (Parsl, PyCOMPSs, ADIOS).
 """
 
 import os
+import re
 import sys
 import json
 import asyncio
@@ -76,6 +77,26 @@ def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
         return asyncio.run(_call())
 
 
+# __ LLM configuration _________________________________________________________
+# Load the project's .env here, in whatever process imports this module.
+#
+# academy_agents.py calls load_dotenv() too, but only in the launching process.
+# Under --env local and --env hpc the Explorer lives in that process and
+# inherits it; under --env multi-node it does not -- it is a Parsl worker on
+# another node, whose environment is whatever worker_init built (modules, venv,
+# setup_hpc.sh, PYTHONPATH) and nothing else. There MODEL_NAME and
+# CODER_MODEL_NAME came back None and ChatOpenAI(model=None) failed pydantic
+# validation before the first LLM call.
+#
+# The path is absolute and __file__-derived on purpose: worker_init does
+# `cd <run_dir>`, so a bare load_dotenv() searching upward from the cwd is
+# searching from the wrong place. load_dotenv does not override variables
+# already set, so this is a no-op in the launching process.
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+
 # __ Skill file helpers ________________________________________________________
 
 _SKILLS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
@@ -120,9 +141,36 @@ def _read_skill(rel_path: str, agent_name: str = "explorer", enabled: bool = Tru
     return ""
 
 
+def _peek_skill(rel_path: str, nchars: int = 500) -> str:
+    """Read only the first `nchars` of a skill file, for match probing.
+
+    Deliberately not _read_skill: this is a candidacy test over every entry in
+    a directory, and _read_skill both reads the whole file and logs a
+    skill_load trace event -- which would record skills as loaded that were
+    only ever sniffed and discarded.
+    """
+    full = os.path.join(_SKILLS_ROOT, _redirect_skill(rel_path) + ".SKILL.md")
+    try:
+        with open(full) as f:
+            return f.read(nchars)
+    except OSError:
+        return ""
+
+
 # set once per explorer run, lets the module-level load_skill tool see the
 # current condition even though it has no access to AgentState when the LLM calls it
 _current_condition: str = "B"
+
+
+def set_condition(condition: str) -> None:
+    """Set the run condition that the module-level load_skill tool reads.
+
+    Callers in other modules cannot do this with a `global` statement:
+    that binds a name in *their* module, leaving this one at its default
+    and silently disabling condition A's skill suppression.
+    """
+    global _current_condition
+    _current_condition = condition
 
 # Skill paths actually read during this run, in first-load order. The post-run
 # review needs to know which domain file was in play so it can propose (and
@@ -394,6 +442,75 @@ _ENGINE_SKILLS = {
 _ENGINE_RELEVANT_TOOLS = (
     "write_workflow", "run_workflow",
 )
+
+
+
+# Directories under work/ that hold the engine's own bookkeeping rather than
+# anything the run produced: Parsl's run_dir (interchange and block logs,
+# submit scripts), the multi-node Parsl scratch, and the per-launch stdout/
+# stderr temp files _run_bash_command creates. In the sample runs these are
+# the majority of the tree -- 90% of the files in the cosmology archive -- and
+# every one of them is walked, stat'd, written into the trace, schema-validated
+# and JSON-dumped on *each* explorer pass, then copied again by run_archiver.
+# They say nothing about whether the workflow produced its outputs.
+_SCRATCH_DIRS = {".parsl", "runinfo", "_task_scripts", "__pycache__", "_compss_config"}
+
+
+def _walk_artifacts(root: str):
+    """Yield (path, size_bytes) for real output files under `root`.
+
+    Prunes scratch directories in place via os.walk's dirnames list, so their
+    contents are never stat'd rather than merely filtered out afterwards.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SCRATCH_DIRS]
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = -1
+            yield full, size
+
+_SKILL_NAME_RE = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
+
+
+def _dedupe_skills(contents: list[str]) -> list[str]:
+    """Drop blank entries and any skill that is already in the list.
+
+    The two files named for an engine in _ENGINE_SKILLS are concatenated into
+    the explorer's system prompt verbatim, and that prompt is resent on every
+    iteration of the ReAct loop -- so anything in there twice is paid for up to
+    max_iterations times.
+
+    Two files can be the same skill: knowledge/PARSL.SKILL.md declares
+    `name: systems/parsl` in its own front matter, because it was copied from
+    systems/parsl.SKILL.md and never re-headed. Matching on that declared name
+    is what identifies the duplicate -- not a guess from how similar the text
+    looks -- and a byte-identical fallback catches a copy with no front matter
+    at all. Genuinely distinct references (adios, pycompss) declare different
+    names or none, and are both kept.
+    """
+    kept: list[str] = []
+    seen_names: set[str] = set()
+    seen_bodies: set[str] = set()
+    for content in contents:
+        if not content:
+            continue
+        body = content.strip()
+        match = _SKILL_NAME_RE.search(content)
+        name = match.group(1) if match else None
+        if (name and name in seen_names) or body in seen_bodies:
+            console.print(
+                f"[dim yellow][explorer] skipped duplicate engine skill "
+                f"({name or 'identical content'})[/dim yellow]"
+            )
+            continue
+        if name:
+            seen_names.add(name)
+        seen_bodies.add(body)
+        kept.append(content)
+    return kept
 
 
 def _classify_engine_usage(engine: str, tool_name: str, tool_args: dict,
@@ -728,15 +845,7 @@ def _build_run_digest(state: dict, exploration_log: list, final_summary: str,
     # single most diagnostic fact available, and the log alone does not show it.
     work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work")
     if os.path.isdir(work_dir):
-        produced = []
-        for dirpath, _, filenames in os.walk(work_dir):
-            for fn in filenames:
-                full = os.path.join(dirpath, fn)
-                try:
-                    size = os.path.getsize(full)
-                except OSError:
-                    size = -1
-                produced.append(f"  {full} ({size} bytes)")
+        produced = [f"  {full} ({size} bytes)" for full, size in _walk_artifacts(work_dir)]
         lines += ["", f"Files present under work/ after the run ({len(produced)}):"]
         lines += produced[:200]
 
@@ -1117,6 +1226,16 @@ async def _explorer_async(state: dict, engine: str) -> dict:
         if tasks:
             context_parts.append("Tasks to execute:\n" +
                                  "\n".join(f"  {i+1}. {t}" for i, t in enumerate(tasks)))
+        if state.get("mpi_slots"):
+            # get_resources reports nnodes INCLUDING the allocation's spare
+            # node, so an mpiexec sized from the environment alone would
+            # claim one more node than it should.
+            context_parts.append(
+                f"MPI capacity: {state['mpi_nodes']} nodes x "
+                f"{state['mpi_cpus_per_node']} cores = {state['mpi_slots']} "
+                f"slots. Size mpiexec to this, not to what get_resources "
+                f"reports -- the allocation holds one extra spare node."
+            )
 
         # condition A never touches skills/ at all, not even to list use_cases/,
         # so the whole auto-detection block below just gets skipped
@@ -1131,14 +1250,27 @@ async def _explorer_async(state: dict, engine: str) -> dict:
             # ways since domain labels don't always match the folder name exactly
             # (--domain MOLECULAR vs the use_cases/molecular_nucleation/ folder)
             if _domain_lower and os.path.isdir(_uc_dir):
-                for uc_name in os.listdir(_uc_dir):
+                # Exact folder-name match first, then substring matches. Two
+                # things made the old plain os.listdir() loop unreliable:
+                # os.listdir order is arbitrary, and the substring test matches
+                # both ways -- so "molecular_nucleation" matches the folder
+                # new_molecular_nucleation, which has only domain.SKILL.md and
+                # no explorer.SKILL.md. Reading that returned "" and the
+                # unconditional `break` then ended the search, leaving the run
+                # with no domain skill at all, depending purely on listdir
+                # order. Sorting exact-first makes the choice deterministic,
+                # and only breaking once something was actually read means a
+                # near-miss no longer shadows the real match.
+                _names = sorted(os.listdir(_uc_dir),
+                                key=lambda n: (n.lower() != _domain_lower, n.lower()))
+                for uc_name in _names:
                     uc_lower = uc_name.lower()
                     if _domain_lower in uc_lower or uc_lower in _domain_lower:
                         content = _read_skill(f"use_cases/{uc_name}/explorer")
                         if content:
                             _uc_skill = content
                             console.print(f"[dim cyan][explorer] loaded use case skill via --domain: {uc_name}[/dim cyan]")
-                        break
+                            break
 
             # fallback if --domain wasn't passed or didn't match: scan every
             # use_cases/*/explorer.SKILL.md and match on stack_decision package names.
@@ -1147,12 +1279,18 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                 _stack_lower = [p.lower() for p in stack_decision]
                 if os.path.isdir(_uc_dir):
                     for uc_name in os.listdir(_uc_dir):
-                        content = _read_skill(f"use_cases/{uc_name}/explorer")
-                        if not content:
+                        # Probe the header only. The match is decided on the
+                        # first 500 characters, but _read_skill reads whole
+                        # files -- across the use_cases/ tree that is ~39KB
+                        # pulled off disk to look at ~1.5KB of it, and the
+                        # discarded reads also land in the trace as skill_load
+                        # events for skills that were never used. The full read
+                        # happens once, below, for the one that actually matched.
+                        desc_lower = _peek_skill(f"use_cases/{uc_name}/explorer").lower()
+                        if not desc_lower:
                             continue
-                        desc_lower = content[:500].lower()
                         if any(pkg in desc_lower for pkg in _stack_lower):
-                            _uc_skill = content
+                            _uc_skill = _read_skill(f"use_cases/{uc_name}/explorer")
                             console.print(f"[dim cyan][explorer] loaded use case skill via stack match: {uc_name}[/dim cyan]")
                             break
 
@@ -1163,7 +1301,7 @@ async def _explorer_async(state: dict, engine: str) -> dict:
         _sys_skill_path, _know_skill_path = _ENGINE_SKILLS.get(engine, (None, None))
         _engine_skill = ""
         if _sys_skill_path:
-            _engine_skill = "\n\n".join(filter(None, [
+            _engine_skill = "\n\n".join(_dedupe_skills([
                 _read_skill(_sys_skill_path, enabled=_enabled),
                 _read_skill(_know_skill_path, enabled=_enabled),
             ]))
@@ -1240,7 +1378,13 @@ async def _explorer_async(state: dict, engine: str) -> dict:
             _t0 = time.time()
             response = await asyncio.to_thread(llm_with_tools.invoke, messages)
             _latency_s = round(time.time() - _t0, 2)
-            _usage = extract_usage(response)
+            # `or {...}`: extract_usage returns None when the response carries
+            # no usage info, and subscripting it below killed the whole
+            # exploration on an LLM call that had actually succeeded. The
+            # log_token_usage block further down already guarded for this.
+            _usage = extract_usage(response) or {
+                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            }
             _model_name = getattr(llm, "model_name", None) or os.getenv(
                 "CODER_MODEL_NAME", os.getenv("MODEL_NAME", ""))
             tracer.log_llm_call(
@@ -1347,10 +1491,28 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                     if status_val == "failed":
                         tool_succeeded = False
                         display_status = f"failed (exit {exit_code})"
+                    elif status_val == "rejected":
+                        # write_workflow's validation refusal. Previously fell
+                        # through to "unknown response", which scored it as a
+                        # failure for the right reason by pure accident and gave
+                        # the orchestrator no way to tell a malformed file apart
+                        # from a broken tool.
+                        tool_succeeded = False
+                        display_status = "rejected (validation)"
                     elif has_error:
                         tool_succeeded = False
                         display_status = f"error: {parsed['error'][:80]}"
-                    elif status_val in ("completed", "success"):
+                    elif status_val in ("completed", "success", "written", "cleaned up"):
+                        # "written" is what write_workflow returns on success.
+                        # It was in none of the accepted sets, so every
+                        # successful write_workflow fell through every branch to
+                        # the "unknown shape -> call it a failure" default and
+                        # was recorded as a FAILED tool call -- in the console,
+                        # in exploration_log, and in the trace. The orchestrator
+                        # reads that log to decide whether to re-route to the
+                        # explorer, so a clean run looked partly broken to it,
+                        # and the trace's success counts were wrong for every
+                        # run this project has ever done.
                         tool_succeeded = True
                         display_status = status_val
                     elif exit_code == 0:
@@ -1483,14 +1645,8 @@ async def _explorer_async(state: dict, engine: str) -> dict:
         work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work")
         artifacts = []
         if os.path.isdir(work_dir):
-            for dirpath, _, filenames in os.walk(work_dir):
-                for fn in filenames:
-                    full = os.path.join(dirpath, fn)
-                    try:
-                        size_bytes = os.path.getsize(full)
-                    except OSError:
-                        size_bytes = -1
-                    artifacts.append({"path": full, "size_bytes": size_bytes})
+            artifacts = [{"path": full, "size_bytes": size}
+                         for full, size in _walk_artifacts(work_dir)]
         tracer.log_artifact_manifest(artifacts)
 
         tracer.log_agent_output("explorer", {

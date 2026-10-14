@@ -1,0 +1,5 @@
+1791923673.421278 2026-10-13 15:34:33 MainProcess-673848 MainThread-23456247715648 parsl.executors.high_throughput.interchange:129 __init__ INFO: Attempting connection to client at 127.0.0.1 on ports: 55083,55661,55496
+1791923673.425097 2026-10-13 15:34:33 MainProcess-673848 MainThread-23456247715648 parsl.executors.high_throughput.interchange:141 __init__ INFO: Connected to client
+1791923673.425531 2026-10-13 15:34:33 MainProcess-673848 MainThread-23456247715648 parsl.executors.high_throughput.interchange:170 __init__ INFO: Bound to port 54924 for incoming worker connections
+1791923673.425646 2026-10-13 15:34:33 MainProcess-673848 MainThread-23456247715648 parsl.executors.high_throughput.interchange:188 __init__ INFO: Platform info: {'parsl_v': '2026.08.10', 'python_v': '3.12.13', 'os': 'Linux', 'hostname': 'ilogin2.lcrc.anl.gov', 'dir': '/gpfs/fs1/home/jalemu/FULL-MAW'}
+1791923673.425734 2026-10-13 15:34:33 MainProcess-673848 MainThread-23456247715648 parsl.executors.high_throughput.interchange:289 start INFO: Starting main interchange method

@@ -1,0 +1,15 @@
+Found cores : 128
+Launching worker: 1
+Launching worker: 2
+
+ starting interactive workflow execution...
+ connecting to parsl MCP server...
+ MCP server tools: ['write_workflow', 'run_workflow', 'get_task_status', 
+'get_task_result', 'list_tasks', 'install_package', 'check_package', 
+'list_files', 'read_file', 'get_resources', 'cleanup']
+ loaded use case skill via --domain: cosmology
+╭───────────────────────────── Explorer Starting ──────────────────────────────╮
+│ Tasks: 14                                                                    │
+│ Findings: 15                                                                 │
+│ Engine: parsl                                                                │
+╰──────────────────────────────────────────────────────────────────────────────╯

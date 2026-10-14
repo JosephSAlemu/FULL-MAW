@@ -175,27 +175,44 @@ _PARSL_LOADED = False
 
 
 def _build_parsl_config():
-    """Build a Parsl Config sized to the actual allocation (PBS_NODEFILE/PBS_NUM_PPN).
+    """Build the Config for the server's own DataFlowKernel.
 
-    We are always launched *inside* an already-granted PBS allocation (the explorer
-    skill requires `qsub -I` before starting the agent) -- so we never submit a new
-    job via PBSProProvider. Instead we stay on LocalProvider (use what we already
-    have) but size and launch it correctly:
+    Under the generated-file execution model this DFK schedules almost nothing.
+    `_run_bash_command` uses it once per run_workflow, to launch a file that
+    builds and loads its *own* Config -- that inner DFK is what schedules every
+    real unit of work -- and `_run_command` reaches it only for check_package
+    and install_package, which are `python -c "import x"` probes and pip calls.
 
-    - Outside PBS (local dev): 1 node, 1 worker, SingleNodeLauncher.
-    - Inside PBS, single node: 1 node, one worker per allocated core
-      (cpus_per_task from PBS_NUM_PPN/PBS_NODEFILE), SingleNodeLauncher.
-    - Inside PBS, multiple nodes: nodes_per_block = nnodes, MpiRunLauncher spreads
-      the worker pool across every host in PBS_NODEFILE via mpirun, with workers
-      per node again sized to cpus_per_task. address_by_hostname() is required here
-      so workers on other hosts can reach the interchange (loopback only works
-      for the launching node).
+    So the default is ThreadPoolExecutor, not HighThroughputExecutor. Both make
+    the apps real Parsl apps: the same @bash_app/@python_app decorators, the
+    same AppFutures, the same `used_parsl` accounting, Parsl's own BashApp
+    executor still being what calls Popen. The difference is only the worker
+    backend -- and HTEX's backend is an interchange process, ZMQ sockets and a
+    worker pool, paid for on the first tool call to dispatch a 30ms import
+    check. (It mattered in the artifact-submission design, where this DFK ran
+    the science; it does not here.)
+
+    MAW_SERVER_EXECUTOR=htex restores the old pool, sized to the allocation as
+    before. Note it is also actively harmful under multi-node: the HTEX branch
+    spreads a worker pool across every host in PBS_NODEFILE via MpiRunLauncher,
+    competing for the allocation the generated workflow's own mpirun is meant
+    to own outright.
     """
     from parsl.config import Config
-    from parsl.executors import HighThroughputExecutor
+    from parsl.executors import HighThroughputExecutor, ThreadPoolExecutor
     from parsl.providers import LocalProvider
     from parsl.launchers import SingleNodeLauncher, MpiRunLauncher
     from parsl.addresses import address_by_hostname
+
+    if os.environ.get("MAW_SERVER_EXECUTOR", "threads").lower() != "htex":
+        return Config(
+            # max_threads is a ceiling on concurrent launches, not on the ranks
+            # a generated workflow may request -- that is decided by the mpirun
+            # string inside its @bash_app, long after this.
+            executors=[ThreadPoolExecutor(label="mcp_htex", max_threads=8)],
+            run_dir=os.path.join(DEFAULT_WORK_DIR, ".parsl"),
+            initialize_logging=False,
+        )
 
     res = _detect_resources()
     nnodes = max(res["nnodes"], 1) if res["in_pbs"] else 1
@@ -276,11 +293,22 @@ if _PARSL_AVAILABLE:
         A @bash_app function returns the command line to run; Parsl's own BashApp
         executor (parsl/app/bash.py's remote_side_bash_executor) is what actually
         calls subprocess.Popen on it -- this is the engine's own code invoking the
-        command, not ours. That executor always runs via a non-login `bash -c`
-        (shell=True, executable="/bin/bash", no -l), so an inner `bash -lc` is
-        nested here explicitly to preserve login-shell semantics (the `module`
-        command, profile scripts) that a generated workflow may depend on --
-        e.g. `module load lammps/...` needs -l to resolve the `module` function.
+        command, not ours. That executor already runs the returned line through
+        `bash -c` (shell=True, executable="/bin/bash"), so nesting a second shell
+        here is only worth it for what the outer one lacks: `-l`.
+
+        It is off by default. The one command this app ever launches is
+        `<VENV_PYTHON> <work_dir>/workflow.py` (see run_workflow), which needs no
+        `module` function and no profile scripts -- the MPI library paths and
+        VENV_PYTHON come from setup_hpc.sh, sourced in the shell that started the
+        agent and inherited through TASK_ENV, and under multi-node from the
+        worker_init prelude. A login shell re-sources /etc/profile and every
+        /etc/profile.d/*.sh (lmod init included) on each run_workflow call to
+        arrive at an environment that was already correct.
+
+        MAW_LOGIN_SHELL=1 restores the nested `bash -lc`, for a site where the
+        generated workflow genuinely does need `module load` at launch time.
+
         stdout/stderr are consumed by Parsl itself from these same kwargs (written
         to the given files) after calling this function to get the command line.
         """
@@ -288,7 +316,9 @@ if _PARSL_AVAILABLE:
         import shlex
         os.makedirs(work_dir, exist_ok=True)
         inner = f"cd {shlex.quote(work_dir)} && {cmd_str}"
-        return f"bash -lc {shlex.quote(inner)}"
+        if os.environ.get("MAW_LOGIN_SHELL", "") == "1":
+            return f"bash -lc {shlex.quote(inner)}"
+        return inner
 
 
 # __ Resource Detection ________________________________________________________
@@ -612,7 +642,53 @@ def run_workflow(
         "engine": _tasks[task_id]["engine"],
         "stdout": result["stdout"][:6000],
         "stderr": result["stderr"][:6000],
+        # On failure, attach the generated workflow's own per-app logs. Without
+        # them a failed run_workflow returns only the launch command, and the
+        # agent has to go hunting -- which in practice cost ~12 tool calls per
+        # failure, most of them reading the wrong log tree.
+        **({"task_logs": _collect_task_logs(DEFAULT_WORK_DIR)}
+           if result["exit_code"] != 0 else {}),
     }, indent=2)
+
+
+def _collect_task_logs(work_dir: str, max_files: int = 4, tail_chars: int = 1500) -> dict:
+    """Tail the generated workflow's own per-app stdout/stderr files.
+
+    When run_workflow fails, the server's captured stdout/stderr is often empty:
+    the generated driver typically routes its apps' output to parsl.AUTO_LOGNAME,
+    and a driver that redirects its own shell output to a log file leaves nothing
+    on the pipe at all. The real error is in the per-task files Parsl writes.
+
+    Those live under the *generated file's* run_dir, which defaults to
+    `runinfo/` relative to its CWD (i.e. work/run0/runinfo/...), NOT under
+    work/run0/.parsl -- that is this server's own run_dir and holds only
+    interchange/manager logs. Agents reliably searched the wrong one of the two
+    and burned a dozen tool calls finding nothing, so surface it here instead.
+    """
+    import glob as _glob
+
+    patterns = [
+        os.path.join(work_dir, "runinfo", "*", "task_logs", "*", "*.std*"),
+        os.path.join(work_dir, "runinfo", "*", "*.std*"),
+        os.path.join(work_dir, "*.std*"),
+    ]
+    paths: list[str] = []
+    for pattern in patterns:
+        paths.extend(_glob.glob(pattern))
+
+    # Newest first, and only files with something in them.
+    paths = [p for p in dict.fromkeys(paths) if os.path.isfile(p) and os.path.getsize(p) > 0]
+    paths.sort(key=os.path.getmtime, reverse=True)
+
+    logs = {}
+    for path in paths[:max_files]:
+        try:
+            with open(path, errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        logs[os.path.relpath(path, work_dir)] = text[-tail_chars:]
+    return logs
 
 
 @mcp.tool()
@@ -684,7 +760,14 @@ def install_package(package: str) -> str:
     Args:
         package: Package name to install (e.g. "numpy", "ovito==3.10.0")
     """
-    result = _run_command(
+    # _run_command_local, not _run_command: pip is venv management, not a unit
+    # of workflow work, so there is nothing for Parsl to schedule here. Routing
+    # it through the DFK only adds a serialize -> worker -> deserialize hop (and
+    # under MAW_SERVER_EXECUTOR=htex, pays full pool startup on the first call).
+    # This server's own module docstring already draws that line: write_workflow
+    # and run_workflow are "the only execution surface", everything else is
+    # "read-only inspection or venv management".
+    result = _run_command_local(
         [VENV_PYTHON, "-m", "pip", "install", package],
         timeout=300,
     )
@@ -702,7 +785,10 @@ def check_package(package: str) -> str:
     Args:
         package: Package name to check (e.g. "numpy", "lammps", "ovito")
     """
-    result = _run_command(
+    # See install_package: an import probe is venv management, not workflow
+    # work. The explorer calls this several times per run while checking
+    # prerequisites, so the per-call dispatch hop is paid repeatedly.
+    result = _run_command_local(
         [VENV_PYTHON, "-c",
          f"import {package}; v = getattr({package}, '__version__', 'unknown'); print(v)"],
         timeout=30,
@@ -942,8 +1028,17 @@ def _resolve_paths(text: str) -> str:
 
     The explorer and skill files use /app/data/, /app/work/run0/ etc.
     as path aliases. This resolves them to local paths.
+
+    The trailing-slash strip on REPO_ROOT replaces what used to be a blanket
+    .replace("//", "/") on the result. That collapse existed only to tidy the
+    "/app/" -> REPO_ROOT + "/" join when REPO_ROOT itself ended in a slash,
+    but it rewrites every other double slash in the text too. write_workflow
+    now feeds this the whole generated driver file rather than a single path,
+    so any "https://..." in that file came back as "https:/..." -- a download
+    or dataset URL in a workflow silently became an invalid one. Normalising
+    the root instead fixes the join without touching the rest of the file.
     """
-    return text.replace("/app/", REPO_ROOT + "/").replace("//", "/")
+    return text.replace("/app/", REPO_ROOT.rstrip("/") + "/")
 
 
 # __ Main ______________________________________________________________________

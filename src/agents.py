@@ -19,11 +19,13 @@ from rich.console import Console
 from rich.panel import Panel
 
 
+import mcp_explorer
 from mcp_explorer import _explorer_async
 from trace_logger import tracer, extract_usage, message_to_dict
 from pypdf import PdfReader
 from src.states import PlannerOutput, InstallerOutput, OrchestratorOutput, AgentState, AgentSteps
 from src.utility import _list_skills, _env_knowledge, _invoke_structured, _read_skill
+from common.consts import BUILDS_PATH
 from systemprompts.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_SYSTEM_PROMPT_NO_SKILLS
 from systemprompts.planner import PLANNER_PROMPT, PLANNER_PROMPT_NO_SKILLS
 from systemprompts.context import PROJECT_LAYOUT
@@ -34,13 +36,121 @@ import mimetypes
 
 console = Console()
 
-class Planner(Agent):
-    def __init__(self, model=None):
+_PDF_TEXT_CACHE: dict[tuple, str] = {}
+
+
+def _extract_pdf_text(pdf_path: str) -> str:
+    """Extract and cache a paper's text, keyed on (path, mtime, size).
+
+    The orchestrator can route back to the planner, and each of those passes
+    re-parsed the whole PDF with pypdf to produce byte-identical text. Keying
+    on mtime and size rather than path alone means editing or swapping the
+    paper mid-session still re-parses.
+    """
+    try:
+        stat = os.stat(pdf_path)
+        key = (os.path.abspath(pdf_path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = None
+
+    if key is not None and key in _PDF_TEXT_CACHE:
+        console.print("[dim cyan][planner] reusing cached PDF text[/dim cyan]")
+        return _PDF_TEXT_CACHE[key]
+
+    reader = PdfReader(pdf_path)
+    # Extract once per page, then filter. The original
+    #   "\n".join(p.extract_text() for p in reader.pages if p.extract_text())
+    # ran extract_text TWICE on every page -- once for the `if`, once for the
+    # value -- and extract_text is the expensive part, not the iteration. The
+    # output is identical either way; the filter only drops empty pages, which
+    # the comprehension below does from the already-extracted text.
+    pages = [page.extract_text() for page in reader.pages]
+    text = "\n".join(t for t in pages if t)
+    console.print(f"[dim cyan][planner] loaded {len(reader.pages)} pages[/dim cyan]")
+    if key is not None:
+        _PDF_TEXT_CACHE[key] = text
+    return text
+
+
+# __ Remote-agent output ______________________________________________________
+# Under --env multi-node an agent runs in another process on another node, so
+# it has neither this terminal nor this process's tracer. Each such agent is
+# launched with a log_path and a trace_path on the shared filesystem: stdout
+# goes to the log (academy_agents.follow() prints it here as it grows) and the
+# tracer events to the JSONL trace.
+#
+# Redirection is per *process*, not per action, because the agents sharing a
+# node share one Parsl worker process and one event loop. Three agents each
+# wrapping their own action in redirect_stdout would nest and interleave
+# redirects on the same file; doing it once at startup cannot.
+
+_redirected_to: str = ""
+
+
+def _redirect_process_stdout(log_path: str) -> None:
+    """Point this process's stdout at log_path. Idempotent, and a no-op for "".
+
+    Line-buffered on purpose: follow() reads the file while it is still open,
+    so a block-buffered stream would show nothing until the process exited.
+    """
+    global _redirected_to
+    if not log_path or _redirected_to == log_path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+    sys.stdout = open(log_path, "a", buffering=1)
+    _redirected_to = log_path
+
+
+def _dump_trace(trace_path: str) -> None:
+    """Write this process's tracer events to trace_path as JSONL.
+
+    Rewritten in full rather than appended to: the orchestrator can route back
+    to an agent, and the tracer still holds every event from earlier passes.
+    Best effort -- losing the side-car trace must not fail a finished run.
+    """
+    if not trace_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(trace_path)), exist_ok=True)
+        with open(trace_path, "w") as f:
+            for event in tracer.get_trace():
+                f.write(json.dumps(event, default=str) + "\n")
+    except OSError as e:
+        console.print(f"[yellow][agents] could not write trace file: {e}[/yellow]")
+
+
+class RemoteLoggingAgent(Agent):
+    """Agent that sends its output to files when it runs off the launching node.
+
+    log_path and trace_path are "" under --env local and --env hpc, where the
+    agent is in the launching process and prints to its terminal directly, and
+    both methods below become no-ops.
+    """
+
+    log_path: str = ""
+    trace_path: str = ""
+
+    async def agent_on_startup(self) -> None:
+        _redirect_process_stdout(self.log_path)
+
+    def _flush_trace(self) -> None:
+        _dump_trace(self.trace_path)
+
+
+class Planner(RemoteLoggingAgent):
+    def __init__(self, model=None, log_path: str = "", trace_path: str = ""):
         self.model = model
+        self.log_path = log_path
+        self.trace_path = trace_path
 
     @action
-    async def set_model(self, model) -> None:
-        self.model = model
+    async def set_model_config(self, model: str, base_url: str, api_key: str) -> None:
+        # Strings, not a built ChatOpenAI: over the HTTP exchange the object
+        # has to serialize, and the httpx client inside it will not pickle.
+        self.model = ChatOpenAI(
+            model=model, api_key=api_key, base_url=base_url,
+            streaming=True, stream_usage=True,
+        )
 
     @action
     async def planner(self, state: AgentState) -> dict:
@@ -49,9 +159,7 @@ class Planner(Agent):
             tracer.log_agent_start("planner")
             tracer.log_agent_input("planner", {"pdf_path": state["pdf_path"], "goal": state["goal"]})
 
-            reader = PdfReader(state["pdf_path"])
-            pdf_text = "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
-            console.print(f"[dim cyan][planner] loaded {len(reader.pages)} pages[/dim cyan]")
+            pdf_text = _extract_pdf_text(state["pdf_path"])
 
             feedback = state.get("orchestrator_feedback", "")
             feedback_section = (f"\n\nOrchestrator feedback -- address these issues before returning:\n{feedback}"
@@ -146,21 +254,32 @@ class Planner(Agent):
             raise
 
 
-class Installer(Agent):
-    def __init__(self, model=None):
+class Installer(RemoteLoggingAgent):
+    def __init__(self, model=None, log_path: str = "", trace_path: str = ""):
         self.model = model
+        self.log_path = log_path
+        self.trace_path = trace_path
 
     @action
-    async def set_model(self, model) -> None:
-        self.model = model
+    async def set_model_config(self, model: str, base_url: str, api_key: str) -> None:
+        self.model = ChatOpenAI(
+            model=model, api_key=api_key, base_url=base_url,
+            streaming=True, stream_usage=True,
+        )
 
     @action
     async def installer(self, state: AgentState) -> dict:
         try:
             tracer.log_agent_start("installer")
-            build_dir         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "builds")
-            os.makedirs(build_dir, exist_ok=True)
-            requirements_path = os.path.join(build_dir, "requirements.txt")
+            # BUILDS_PATH, not __file__-relative: this module moved into src/,
+            # so "the directory holding this file" is now src/ and the
+            # requirements would land in src/builds/. Everything else that
+            # refers to this file -- the installer skills, PROJECT_LAYOUT, the
+            # README, and the explorer resolving /app/builds/ -- means the
+            # repo-root builds/, so writing anywhere else leaves the explorer
+            # reinstalling packages the installer already handled.
+            os.makedirs(BUILDS_PATH, exist_ok=True)
+            requirements_path = os.path.join(BUILDS_PATH, "requirements.txt")
 
             if state.get("requirements_approved"):
                 # __ Phase 2: approved, pip install into the venv __
@@ -247,13 +366,28 @@ class Installer(Agent):
             raise
 
 
-class Explorer(Agent):
-    def __init__(self, model=None):
+class Explorer(RemoteLoggingAgent):
+    def __init__(self, model=None, log_path: str = "", trace_path: str = ""):
+        """
+        log_path / trace_path are set only under --env multi-node, where this
+        agent runs in another process on another node. Manager.launch passes
+        them straight to this constructor, so they have to be accepted here or
+        the launch fails with a TypeError before the agent ever starts.
+
+        Under local and hpc both stay "": the Explorer is in the launching
+        process, printing to its terminal and sharing its tracer, so it needs
+        neither file.
+        """
         self.model = model
+        self.log_path = log_path
+        self.trace_path = trace_path
 
     @action
-    async def set_model(self, model) -> None:
-        self.model = model
+    async def set_model_config(self, model: str, base_url: str, api_key: str) -> None:
+        self.model = ChatOpenAI(
+            model=model, api_key=api_key, base_url=base_url,
+            streaming=True, stream_usage=True,
+        )
 
     @staticmethod
     def explorer_tool(handle: Handle[Agent]) -> Tool:
@@ -274,9 +408,23 @@ class Explorer(Agent):
         Explorer node -- connects to MCP server and runs a ReAct tool-calling loop
         to execute workflow tasks step by step.
         """
-        global _mcp_session, _current_condition
+        # `global _current_condition` here would bind a name in THIS module,
+        # leaving mcp_explorer's own flag at its default and silently
+        # disabling condition A's skill suppression for the explorer.
+        mcp_explorer.set_condition(state.get("condition", "B"))
 
-        _current_condition = state.get("condition", "B")
+        # stdout was already pointed at log_path by agent_on_startup, once for
+        # this process -- see RemoteLoggingAgent. Redirecting again per action
+        # would open the same file a second time and interleave with the first.
+        # The trace is flushed on the way out, including on failure, so a pass
+        # that raises still leaves its events on the shared filesystem.
+        try:
+            return await self._explore(state)
+        finally:
+            self._flush_trace()
+
+    async def _explore(self, state: AgentState) -> dict:
+        """The explorer run itself, with stdout already pointed wherever it goes."""
         console.print("\n[dim cyan][explorer] starting interactive workflow execution...[/dim cyan]")
         tracer.log_agent_start("explorer", {"engine": state.get("engine", "parsl")})
         tracer.log_agent_input("explorer", {
@@ -291,6 +439,7 @@ class Explorer(Agent):
         # Already running inside an event loop (this is an async action) -- just await
         # the coroutine directly instead of spinning up a nested loop.
         return await _explorer_async(state, engine)
+
 
 
 class Orchestrator(Agent):
@@ -312,21 +461,35 @@ class Orchestrator(Agent):
         self.agent_state = agent_state
 
     async def agent_on_startup(self) -> None:
-        llm = ChatOpenAI(
-                         model=self.model,
-                         api_key=self.api_key,
-                         base_url=self.base_url,
-                         streaming=True,
-                         stream_usage=True
-                         )
         # `self.agents` holds Handles, not the actual remote instances -- setting an
         # attribute on a handle does NOT set it on the remote agent. Push the model
         # through an explicit action instead.
-        for agent in self.agents.values():
-            await agent.set_model(llm)
-        # The orchestrator runs its own `orchestrator` action locally, so it needs the
-        # built LLM instance on itself too -- __init__ only stored the model name string.
-        self.model = llm
+        #
+        # Send the three strings rather than a built ChatOpenAI: the agents are on
+        # other nodes, so the argument has to serialize across the exchange, and the
+        # httpx client inside a ChatOpenAI will not pickle. Each agent builds its own.
+        #
+        # Only the Planner. It is the one agent that reads self.model; the
+        # Installer never makes an LLM call, and the Explorer builds its own client
+        # from CODER_MODEL_NAME inside _explorer_async. Pushing to the Explorer was
+        # not just wasted -- it was on the critical path: the Explorer lives in its
+        # own PBS allocation, so awaiting its reply here blocked this startup hook,
+        # and therefore the whole graph, until that job was scheduled and its node
+        # had imported everything from GPFS. Without the call, the Planner and
+        # Installer run while the Explorer's job queues, and the queue wait is
+        # hidden behind work the run had to do anyway.
+        await self.agents["planner"].set_model_config(
+            model=self.model, base_url=self.base_url, api_key=self.api_key,
+        )
+        # The orchestrator runs its own `orchestrator` action locally, so it needs a
+        # built LLM instance on itself too -- __init__ only stored the model name.
+        self.model = ChatOpenAI(
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            streaming=True,
+            stream_usage=True,
+        )
         
 
     @action

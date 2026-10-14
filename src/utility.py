@@ -3,6 +3,7 @@ from systemprompts.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_
 from systemprompts.planner import PLANNER_PROMPT, PLANNER_PROMPT_NO_SKILLS
 from systemprompts.context import PROJECT_LAYOUT
 from common.exceptions import exception_message
+import asyncio
 import os
 import base64
 import json
@@ -21,7 +22,7 @@ from pypdf import PdfReader
 from pathlib import Path
 warnings.filterwarnings("ignore", module="pypdf")
 from dotenv import load_dotenv
-from rich.console import Console as console
+from rich.console import Console
 from rich.panel import Panel
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -32,7 +33,7 @@ from mcp_explorer import explorer
 from trace_logger import tracer, extract_usage, message_to_dict
 from run_archiver import archive_run
 
-
+console = Console()
 def _redirect_skill(rel_path: str) -> str:
     """Rewrite use_cases/<key>/<agent> requests to a single consolidated skill file.
 
@@ -102,10 +103,21 @@ async def _invoke_structured(llm, schema, messages, agent_name, retries=5):
     msg_dicts = [message_to_dict(m) for m in messages]
     for attempt in range(retries):
         _t0 = time.time()
-        response = llm.invoke(messages)
+        # Off the event loop: llm.invoke blocks, and with the Orchestrator
+        # running in the launching process that would stall the Manager's
+        # loop -- exchange messages and heartbeats included -- for the whole
+        # call, up to `retries` times.
+        response = await asyncio.to_thread(llm.invoke, messages)
         latency_s = round(time.time() - _t0, 2)
         text = response.content if hasattr(response, "content") else str(response)
-        usage = extract_usage(response)
+        # extract_usage returns None when the response carries no usage info at
+        # all -- some OpenAI-compatible gateways omit it, and a streamed
+        # response without stream_usage honoured has none either. Subscripting
+        # that None raised TypeError here and killed the run on a call that had
+        # otherwise succeeded, so default the counts to 0 instead.
+        usage = extract_usage(response) or {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+        }
         tracer.log_llm_call(
             agent_name, model_name, msg_dicts, text,
             input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"],

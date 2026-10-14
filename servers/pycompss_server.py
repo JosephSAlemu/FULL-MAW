@@ -925,8 +925,18 @@ def cleanup() -> str:
 # __ Helpers ___________________________________________________________________
 
 def _resolve_paths(text: str) -> str:
-    """Replace /app/ path aliases with actual local repo paths."""
-    return text.replace("/app/", REPO_ROOT + "/").replace("//", "/")
+    """Replace /app/ path aliases with actual local repo paths.
+
+    The trailing-slash strip on REPO_ROOT replaces what used to be a blanket
+    .replace("//", "/") on the result. That collapse existed only to tidy the
+    "/app/" -> REPO_ROOT + "/" join when REPO_ROOT itself ended in a slash,
+    but it rewrites every other double slash in the text too. write_workflow
+    now feeds this the whole generated driver file rather than a single path,
+    so any "https://..." in that file came back as "https:/..." -- a download
+    or dataset URL in a workflow silently became an invalid one. Normalising
+    the root instead fixes the join without touching the rest of the file.
+    """
+    return text.replace("/app/", REPO_ROOT.rstrip("/") + "/")
 
 
 # __ Main ______________________________________________________________________

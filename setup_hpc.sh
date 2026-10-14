@@ -5,7 +5,11 @@
 #
 # Usage:
 #   source setup_hpc.sh
-#   python agent_mcp.py --env hpc --paper 1 --goal "..."
+#   python academy_agents.py --env hpc --paper 1 --goal "..."
+#
+# Under --env multi-node the Explorer runs on a compute node that never saw
+# your shell, so academy_agents.py sources this same file in that node's
+# worker_init. Both processes get one identical environment from one place.
 #
 # Why this is needed:
 #   LAMMPS is compiled with Intel MPI support. Its Python bindings load
@@ -15,8 +19,19 @@
 # The same paths are also baked into TASK_ENV in servers/parsl_server.py so
 # every submit_task subprocess inherits them automatically. This script covers
 # the agent process itself.
+#
+# No `set -euo pipefail` here, deliberately. A sourced script runs in the
+# caller's shell, so those options would stay on after it returned: in an
+# interactive `qsub -I` shell the next failing command -- even a typo --
+# would exit the shell and end the job, and in a Parsl worker_init `set -u`
+# would abort the submit script on the first unset variable after it. This
+# script only sets variables, so it changes nothing else about the shell.
 
-set -euo pipefail
+# Sourcing is the only way the exports can reach the caller.
+if ! (return 0 2>/dev/null); then
+    echo "setup_hpc.sh must be sourced, not executed:  source ${BASH_SOURCE[0]}" >&2
+    exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

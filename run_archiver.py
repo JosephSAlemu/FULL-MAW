@@ -29,6 +29,14 @@ ARCHIVE_ROOT = "/lcrc/project/PEDAL/MAW/TEST_RUNS/mcp_approach"
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _WORK_DIR = os.path.join(_REPO_ROOT, "work", "run0")
 
+# Engine bookkeeping, not run output: Parsl's run_dir and block logs, the
+# per-launch stdout/stderr temp files, COMPSs's generated project/resources
+# XML. Kept out of the archive because it is most of the tree -- 90% of the
+# files in the sample cosmology run -- and copying it to the archive root on
+# GPFS is the last thing a run does before it finishes. Mirrors _SCRATCH_DIRS
+# in mcp_explorer.py, which prunes the same names from the artifact manifest.
+_SCRATCH_DIRS = (".parsl", "runinfo", "_task_scripts", "__pycache__", "_compss_config")
+
 
 def _slugify(value: str) -> str:
     """Filesystem-safe segment for the archive folder name. Mirrors the
@@ -86,7 +94,8 @@ def archive_run(metadata: RunMetadata, trace_path: str) -> str:
         os.makedirs(dest)
 
         if os.path.isdir(_WORK_DIR):
-            shutil.copytree(_WORK_DIR, os.path.join(dest, "work"))
+            shutil.copytree(_WORK_DIR, os.path.join(dest, "work"),
+                            ignore=shutil.ignore_patterns(*_SCRATCH_DIRS))
         if os.path.isfile(trace_path):
             shutil.copy2(trace_path, os.path.join(dest, "trace.json"))
 

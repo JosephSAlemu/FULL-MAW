@@ -1,0 +1,307 @@
+1791923666.656170 2026-10-13 15:34:26 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:123 __init__ INFO: Starting DataFlowKernel with config
+Config(
+    dependency_resolver=None, 
+    executors=(HighThroughputExecutor(
+        address=None, 
+        address_probe_timeout=None, 
+        available_accelerators=[], 
+        block_error_handler=<function simple_error_handler at 0x15554bb9fd80>, 
+        cores_per_worker=1.0, 
+        cpu_affinity='none', 
+        drain_period=None, 
+        encrypted=True, 
+        heartbeat_period=30, 
+        heartbeat_threshold=120, 
+        interchange_launch_cmd=['interchange.py'], 
+        interchange_port_range=(55000, 56000), 
+        label='Explorer', 
+        launch_cmd='process_worker_pool.py {debug} {max_workers_per_node} -a {addresses} -p {prefetch_capacity} -c {cores_per_worker} -m {mem_per_worker} --poll {poll_period} --port={worker_port} --cert_dir {cert_dir} --logdir={logdir} --logconf={logconf} --block_id={{block_id}} --hb_period={heartbeat_period} {address_probe_timeout_string} --hb_threshold={heartbeat_threshold} --drain_period={drain_period} --cpu-affinity {cpu_affinity} {enable_mpi_mode} --mpi-launcher={mpi_launcher} --available-accelerators {accelerators}', 
+        loopback_address='127.0.0.1', 
+        manager_selector=<parsl.executors.high_throughput.manager_selector.RandomManagerSelector object at 0x15554bb96510>, 
+        max_workers_per_node=1, 
+        mem_per_worker=None, 
+        poll_period=10, 
+        prefetch_capacity=0, 
+        provider=PBSProProvider(
+            account='PEDAL', 
+            cmd_timeout=120, 
+            cpus_per_node=32, 
+            init_blocks=1, 
+            launcher=SingleNodeLauncher(debug=True, fail_on_any=False), 
+            max_blocks=1, 
+            min_blocks=1, 
+            nodes_per_block=2, 
+            parallelism=1, 
+            queue=None, 
+            scheduler_options='', 
+            select_options='mpiprocs=32', 
+            walltime='01:00:00', 
+            worker_init='module load gcc/13.2.0 openmpi/4.1.7; source /home/jalemu/FULL-MAW/venv/bin/activate; cd /home/jalemu/FULL-MAW/tmp/run_0; export PYTHONPATH=/home/jalemu/FULL-MAW/src:$PYTHONPATH'
+        ), 
+        remote_monitoring_radio=HTEXRadio(), 
+        storage_access=None, 
+        worker_debug=False, 
+        worker_logdir_root=None, 
+        worker_port=None, 
+        worker_port_range=(54000, 55000), 
+        working_dir=None
+    ),), 
+    exit_mode='cleanup', 
+    garbage_collect=True, 
+    initialize_logging=True, 
+    internal_tasks_max_threads=10, 
+    max_idletime=120.0, 
+    memoizer=None, 
+    monitoring=None, 
+    project_name=None, 
+    retries=0, 
+    retry_handler=None, 
+    run_dir='/home/jalemu/FULL-MAW/tmp/run_0/runinfo', 
+    std_autopath=None, 
+    strategy='simple', 
+    strategy_period=5, 
+    usage_tracking=0
+)
+1791923666.659154 2026-10-13 15:34:26 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:125 __init__ INFO: Parsl version: 2026.08.10
+1791923666.659477 2026-10-13 15:34:26 MainProcess-670445 MainThread-23456247715648 parsl.usage_tracking.usage:119 __init__ DEBUG: Tracking level: 0
+1791923666.659588 2026-10-13 15:34:26 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:147 __init__ INFO: Run id is: 66d79349-cd05-4af9-ae70-513d260611f7
+1791923668.268432 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:154 __init__ DEBUG: Considering candidate for workflow name: /gpfs/fs1/home/jalemu/FULL-MAW/venv3/lib/python3.12/site-packages/parsl/dataflow/dflow.py
+1791923668.268649 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:154 __init__ DEBUG: Considering candidate for workflow name: /gpfs/fs1/home/jalemu/FULL-MAW/venv3/lib/python3.12/site-packages/parsl/dataflow/dflow.py
+1791923668.268729 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:154 __init__ DEBUG: Considering candidate for workflow name: /gpfs/fs1/home/jalemu/FULL-MAW/academy_agents.py
+1791923668.269581 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:160 __init__ DEBUG: Using academy_agents.py as workflow name
+1791923668.269799 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:187 __init__ INFO: Workflow startup information: {'python_version': '3.12.13', 'parsl_version': '2026.08.10', 'time_began': datetime.datetime(2026, 10, 13, 15, 34, 26, 659571), 'run_id': '66d79349-cd05-4af9-ae70-513d260611f7', 'workflow_name': 'academy_agents.py', 'workflow_version': '2026-10-13 15:34:26', 'rundir': '/home/jalemu/FULL-MAW/tmp/run_0/runinfo/000', 'tasks_completed_count': 0, 'tasks_failed_count': 0, 'user': 'jalemu', 'host': 'ilogin2.lcrc.anl.gov'}
+1791923668.270014 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.memoization:335 start INFO: App caching initialized
+1791923668.270118 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.jobs.strategy:145 __init__ DEBUG: Scaling strategy: simple
+1791923668.270940 2026-10-13 15:34:28 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 0 executors
+1791923668.271297 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1091 add_executors INFO: Adding executor Explorer of type parsl.executors.high_throughput.executor.HighThroughputExecutor
+1791923668.271366 2026-10-13 15:34:28 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923668.272344 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:444 start DEBUG: Creating CurveZMQ certificates
+1791923668.281739 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:632 _start_result_queue_thread DEBUG: Starting result queue thread
+1791923668.281989 2026-10-13 15:34:28 MainProcess-670445 HTEX-Result-Queue-Thread-23455926761216 parsl.executors.high_throughput.executor:508 _result_queue_worker DEBUG: Result queue worker starting
+1791923668.282070 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:636 _start_result_queue_thread DEBUG: Started result queue thread: <Thread(HTEX-Result-Queue-Thread, started daemon 23455926761216)>
+1791923668.301263 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:608 _start_local_interchange_process DEBUG: Popened interchange process. Writing config object
+1791923668.301380 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:612 _start_local_interchange_process DEBUG: Sent config object. Requesting worker ports
+1791923668.301461 2026-10-13 15:34:28 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.zmq_pipes:77 run DEBUG: Sending command client command
+1791923673.271692 2026-10-13 15:34:33 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 0 executors
+1791923673.271875 2026-10-13 15:34:33 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923673.428440 2026-10-13 15:34:33 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.zmq_pipes:92 run DEBUG: Polling for command client response or timeout
+1791923673.428738 2026-10-13 15:34:33 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.zmq_pipes:104 run DEBUG: Receiving command client response
+1791923673.428857 2026-10-13 15:34:33 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.zmq_pipes:106 run DEBUG: Received command client response
+1791923673.428938 2026-10-13 15:34:33 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:618 _start_local_interchange_process DEBUG: Interchange process started (<Popen: returncode: None args: ['interchange.py']>).  Worker port: 54924
+1791923673.429066 2026-10-13 15:34:33 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:435 initialize_scaling DEBUG: Launch command: process_worker_pool.py  --max_workers_per_node=1 -a 140.221.60.135,10.128.0.7,127.0.0.1,10.128.16.7 -p 0 -c 1.0 -m None --poll 10 --port=54924 --cert_dir /home/jalemu/FULL-MAW/tmp/run_0/runinfo/000/Explorer/certificates --logdir=/home/jalemu/FULL-MAW/tmp/run_0/runinfo/000/Explorer --logconf=None --block_id={block_id} --hb_period=30  --hb_threshold=120 --drain_period=None --cpu-affinity none  --mpi-launcher=mpiexec --available-accelerators 
+1791923673.429137 2026-10-13 15:34:33 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:437 initialize_scaling DEBUG: Starting HighThroughputExecutor with provider:
+PBSProProvider(
+    account='PEDAL', 
+    cmd_timeout=120, 
+    cpus_per_node=32, 
+    init_blocks=1, 
+    launcher=SingleNodeLauncher(debug=True, fail_on_any=False), 
+    max_blocks=1, 
+    min_blocks=1, 
+    nodes_per_block=2, 
+    parallelism=1, 
+    queue=None, 
+    scheduler_options='', 
+    select_options='mpiprocs=32', 
+    walltime='01:00:00', 
+    worker_init='module load gcc/13.2.0 openmpi/4.1.7; source /home/jalemu/FULL-MAW/venv/bin/activate; cd /home/jalemu/FULL-MAW/tmp/run_0; export PYTHONPATH=/home/jalemu/FULL-MAW/src:$PYTHONPATH'
+)
+1791923673.429840 2026-10-13 15:34:33 MainProcess-670445 MainThread-23456247715648 parsl.jobs.job_status_poller:48 add_executors DEBUG: Adding executor Explorer
+1791923673.429938 2026-10-13 15:34:33 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1091 add_executors INFO: Adding executor _parsl_internal of type parsl.executors.threads.ThreadPoolExecutor
+1791923674.067698 2026-10-13 15:34:34 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:966 submit DEBUG: Task 0 will be sent to executor Explorer
+1791923674.067854 2026-10-13 15:34:34 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:774 _add_output_deps DEBUG: Adding output dependencies
+1791923674.067937 2026-10-13 15:34:34 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1015 submit DEBUG: Added output dependencies
+1791923674.068008 2026-10-13 15:34:34 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1024 submit DEBUG: Gathering dependencies
+1791923674.068122 2026-10-13 15:34:34 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1027 submit DEBUG: Gathered dependencies
+1791923674.068193 2026-10-13 15:34:34 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1039 submit INFO: Task 0 submitted for App _run_agent_on_worker, not waiting on any dependency
+1791923674.068260 2026-10-13 15:34:34 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1041 submit DEBUG: Task 0 has AppFuture: <AppFuture at 0x15554385bd70 state=pending>
+1791923674.068345 2026-10-13 15:34:34 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:567 _update_task_state INFO: Task 0 initializing state to pending
+1791923674.068725 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.dataflow.memoization:379 check_memo DEBUG: Task 0 will not be memoized
+1791923674.069210 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.executors.high_throughput.executor:715 submit DEBUG: Pushing function <function _run_agent_on_worker at 0x1555438f2700> to queue with args ("_RunSpec(agent=<class 'src.agents.Explorer'>, config=RuntimeConfig(cancel_actions_on_shutdown=True, ...",)
+1791923674.073692 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.executors.high_throughput.zmq_pipes:148 put DEBUG: Sending TasksOutgoing message
+1791923674.073836 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.executors.high_throughput.zmq_pipes:150 put DEBUG: Sent TasksOutgoing message
+1791923674.073946 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.dataflow.dflow:565 _update_task_state INFO: Task 0 changing state from pending to launched
+1791923674.074030 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.dataflow.dflow:727 launch_task INFO: Parsl task 0 try 0 launched on executor Explorer with executor id 1
+1791923674.074104 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.dataflow.dflow:1228 log_std_stream INFO: Standard out for task 0 will not be redirected.
+1791923674.074172 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.dataflow.dflow:1228 log_std_stream INFO: Standard error for task 0 will not be redirected.
+1791923674.074244 2026-10-13 15:34:34 MainProcess-670445 Task-Launch_0-23455918339840 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _launch_if_ready_async on thread Task-Launch_0
+1791923678.272106 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.high_throughput.zmq_pipes:77 run DEBUG: Sending command client command
+1791923678.272402 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.high_throughput.zmq_pipes:104 run DEBUG: Receiving command client response
+1791923678.273043 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.high_throughput.zmq_pipes:106 run DEBUG: Received command client response
+1791923678.273216 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923678.273294 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923678.273368 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:201 _general_strategy DEBUG: [Scaling executor Explorer] Scaling out 1 initial blocks
+1791923678.273447 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.status_handling:207 scale_out_facade INFO: [Scaling executor Explorer] Scaling out by 1 blocks
+1791923678.273520 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.status_handling:210 scale_out_facade INFO: [Scaling executor Explorer] Allocated block ID 0
+1791923678.273595 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.status_handling:268 _launch_block DEBUG: [Scaling executor Explorer] Submitting to provider with job_name parsl.Explorer.block-0
+1791923678.273689 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.providers.pbspro.pbspro:161 submit DEBUG: Requesting 2 nodes_per_block, 1 tasks_per_node
+1791923678.273773 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.providers.pbspro.pbspro:188 submit DEBUG: Writing submit script
+1791923678.274538 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.utils:498 execute_wait DEBUG: Creating process with command 'qsub  -A PEDAL /home/jalemu/FULL-MAW/tmp/run_0/runinfo/000/submit_scripts/parsl.Explorer.block-0.1791923678.2736537'
+1791923678.289998 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.utils:506 execute_wait DEBUG: Created process with pid 674314. Performing communicate
+1791923678.472273 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.utils:509 execute_wait DEBUG: Process 674314 returned 0
+1791923678.472560 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.utils:515 execute_wait DEBUG: Execution of command in process 674314 completed normally
+1791923678.472838 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.status_handling:271 _launch_block DEBUG: [Scaling executor Explorer] Launched block 0 with job ID 7811908.imgt1
+1791923678.473051 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923678.473151 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923678.473240 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923678.473327 2026-10-13 15:34:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923683.473789 2026-10-13 15:34:43 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923683.474102 2026-10-13 15:34:43 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923683.474271 2026-10-13 15:34:43 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923683.474351 2026-10-13 15:34:43 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923683.474424 2026-10-13 15:34:43 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923683.474495 2026-10-13 15:34:43 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923688.474860 2026-10-13 15:34:48 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923688.475158 2026-10-13 15:34:48 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923688.475312 2026-10-13 15:34:48 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923688.475439 2026-10-13 15:34:48 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923688.475553 2026-10-13 15:34:48 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923688.475665 2026-10-13 15:34:48 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923693.476063 2026-10-13 15:34:53 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923693.476327 2026-10-13 15:34:53 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923693.476425 2026-10-13 15:34:53 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923693.476501 2026-10-13 15:34:53 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923693.476570 2026-10-13 15:34:53 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923693.476637 2026-10-13 15:34:53 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923698.477086 2026-10-13 15:34:58 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923698.477457 2026-10-13 15:34:58 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923698.477613 2026-10-13 15:34:58 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923698.477740 2026-10-13 15:34:58 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923698.477815 2026-10-13 15:34:58 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923698.477896 2026-10-13 15:34:58 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923703.478276 2026-10-13 15:35:03 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923703.478595 2026-10-13 15:35:03 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923703.478748 2026-10-13 15:35:03 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923703.478888 2026-10-13 15:35:03 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923703.479007 2026-10-13 15:35:03 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923703.479120 2026-10-13 15:35:03 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923708.479522 2026-10-13 15:35:08 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923708.479812 2026-10-13 15:35:08 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923708.479930 2026-10-13 15:35:08 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923708.480004 2026-10-13 15:35:08 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923708.480072 2026-10-13 15:35:08 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923708.480145 2026-10-13 15:35:08 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923713.480485 2026-10-13 15:35:13 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923713.480762 2026-10-13 15:35:13 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923713.480939 2026-10-13 15:35:13 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923713.481071 2026-10-13 15:35:13 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923713.481188 2026-10-13 15:35:13 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923713.481279 2026-10-13 15:35:13 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923718.481630 2026-10-13 15:35:18 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923718.481953 2026-10-13 15:35:18 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923718.482125 2026-10-13 15:35:18 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923718.482249 2026-10-13 15:35:18 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923718.482363 2026-10-13 15:35:18 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923718.482476 2026-10-13 15:35:18 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923723.482836 2026-10-13 15:35:23 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923723.483172 2026-10-13 15:35:23 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923723.483349 2026-10-13 15:35:23 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923723.483495 2026-10-13 15:35:23 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923723.483593 2026-10-13 15:35:23 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923723.483664 2026-10-13 15:35:23 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923728.484071 2026-10-13 15:35:28 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923728.484364 2026-10-13 15:35:28 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923728.484513 2026-10-13 15:35:28 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923728.484637 2026-10-13 15:35:28 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923728.484731 2026-10-13 15:35:28 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923728.484801 2026-10-13 15:35:28 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923733.485142 2026-10-13 15:35:33 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923733.485494 2026-10-13 15:35:33 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:198 _general_strategy DEBUG: [Scaling executor Explorer] Strategizing for executor
+1791923733.485635 2026-10-13 15:35:33 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:224 _general_strategy DEBUG: [Scaling executor Explorer] Executor 1 active tasks, 2 active slots, and 0/1 running/pending blocks
+1791923733.485726 2026-10-13 15:35:33 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:298 _general_strategy DEBUG: [Scaling executor Explorer] Strategy case 4b: more slots than tasks
+1791923733.485809 2026-10-13 15:35:33 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:311 _general_strategy DEBUG: [Scaling executor Explorer] This strategy does not support scaling in
+1791923733.485922 2026-10-13 15:35:33 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923738.486381 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.utils:498 execute_wait DEBUG: Creating process with command 'qstat -x -f -F json 7811908.imgt1'
+1791923738.512485 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.utils:506 execute_wait DEBUG: Created process with pid 677114. Performing communicate
+1791923738.542989 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.utils:509 execute_wait DEBUG: Process 677114 returned 0
+1791923738.543173 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.utils:515 execute_wait DEBUG: Execution of command in process 677114 completed normally
+1791923738.543447 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.providers.pbspro.pbspro:115 _status DEBUG: coerced job_id 7811908.imgt1 -> 7811908.imgt1
+1791923738.543648 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.high_throughput.zmq_pipes:77 run DEBUG: Sending command client command
+1791923738.543832 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.high_throughput.zmq_pipes:104 run DEBUG: Receiving command client response
+1791923738.544529 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.high_throughput.zmq_pipes:106 run DEBUG: Received command client response
+1791923738.544630 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.high_throughput.executor:901 status DEBUG: Rewriting job 0 from status JobState.COMPLETED to MISSING
+1791923738.547872 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.executors.status_handling:145 set_bad_state_and_fail_all ERROR: Setting bad state due to exception
+parsl.jobs.errors.TooManyJobFailuresError: Error 1:
+	Job is marked as MISSING since the workers failed to register to the executor. Check the stdout/stderr logs in the submit_scripts directory for more debug information
+	STDOUT: Found cores : 128
+Launching worker: 1
+Launching worker: 2
+
+	STDERR: /var/spool/pbs/mom_priv/jobs/7811908.imgt1.SC: line 12: /home/jalemu/FULL-MAW/venv/bin/activate: No such file or directory
+/var/spool/pbs/mom_priv/jobs/7811908.imgt1.SC: line 24: process_worker_pool.py: command not found
+/var/spool/pbs/mom_priv/jobs/7811908.imgt1.SC: line 24: process_worker_pool.py: command not found
+
+
+1791923738.548342 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.dataflow.dflow:351 handle_exec_update INFO: Task 0 try 0 failed with exception of type BadStateException
+1791923738.552917 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.dataflow.dflow:390 handle_exec_update ERROR: Task 0 failed after 0 retry attempts
+Traceback (most recent call last):
+  File "/gpfs/fs1/home/jalemu/FULL-MAW/venv3/lib/python3.12/site-packages/parsl/dataflow/dflow.py", line 348, in handle_exec_update
+    res = self._unwrap_remote_exception_wrapper(future)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/gpfs/fs1/home/jalemu/FULL-MAW/venv3/lib/python3.12/site-packages/parsl/dataflow/dflow.py", line 576, in _unwrap_remote_exception_wrapper
+    result = future.result()
+             ^^^^^^^^^^^^^^^
+  File "/gpfs/fs1/home/jalemu/spack/opt/spack/linux-zen/python-3.12.13-m6oswnbauydowvm5hry2qmyhqhpmbbj4/lib/python3.12/concurrent/futures/_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/gpfs/fs1/home/jalemu/spack/opt/spack/linux-zen/python-3.12.13-m6oswnbauydowvm5hry2qmyhqhpmbbj4/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+parsl.executors.errors.BadStateException: Executor Explorer failed due to: Error 1:
+	Job is marked as MISSING since the workers failed to register to the executor. Check the stdout/stderr logs in the submit_scripts directory for more debug information
+	STDOUT: Found cores : 128
+Launching worker: 1
+Launching worker: 2
+
+	STDERR: /var/spool/pbs/mom_priv/jobs/7811908.imgt1.SC: line 12: /home/jalemu/FULL-MAW/venv/bin/activate: No such file or directory
+/var/spool/pbs/mom_priv/jobs/7811908.imgt1.SC: line 24: process_worker_pool.py: command not found
+/var/spool/pbs/mom_priv/jobs/7811908.imgt1.SC: line 24: process_worker_pool.py: command not found
+
+
+1791923738.558340 2026-10-13 15:35:38 MainProcess-670445 HTEX-Result-Queue-Thread-23455926761216 parsl.executors.high_throughput.executor:569 _result_queue_worker INFO: Closing result ZMQ pipe
+1791923738.572939 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.dataflow.dflow:565 _update_task_state INFO: Task 0 changing state from launched to failed
+1791923738.573604 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.dataflow.dflow:1228 log_std_stream INFO: Standard out for task 0 will not be redirected.
+1791923738.573864 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.dataflow.dflow:1228 log_std_stream INFO: Standard error for task 0 will not be redirected.
+1791923738.573947 2026-10-13 15:35:38 MainProcess-670445 HTEX-Result-Queue-Thread-23455926761216 parsl.executors.high_throughput.executor:571 _result_queue_worker INFO: Result queue worker finished
+1791923738.575305 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:186 _general_strategy DEBUG: general strategy starting with strategy_type simple for 1 executors
+1791923738.575464 2026-10-13 15:35:38 MainProcess-670445 HTEX-Result-Queue-Thread-23455926761216 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _result_queue_worker on thread HTEX-Result-Queue-Thread
+1791923738.575641 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.jobs.strategy:195 _general_strategy INFO: [Scaling executor Explorer] Not strategizing for executor because bad state is set
+1791923738.575947 2026-10-13 15:35:38 MainProcess-670445 JobStatusPoller-Timer-Thread-23455964359344-23455941469952 parsl.process_loggers:27 wrapped DEBUG: Normal ending for _general_strategy on thread JobStatusPoller-Timer-Thread-23455964359344
+1791923740.521762 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1151 cleanup INFO: DFK cleanup initiated
+1791923740.521979 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1081 log_task_states INFO: Summary of tasks in DFK:
+1791923740.522122 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.pending: 0
+1791923740.522257 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.running: 0
+1791923740.522393 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.exec_done: 0
+1791923740.522523 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.failed: 1
+1791923740.522656 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.dep_fail: 0
+1791923740.522740 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.launched: 0
+1791923740.522805 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.fail_retryable: 0
+1791923740.522884 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.memo_done: 0
+1791923740.522953 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.joining: 0
+1791923740.523016 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1085 log_task_states INFO: Tasks in state States.running_ended: 0
+1791923740.523082 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1087 log_task_states INFO: End of summary
+1791923740.523160 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1168 cleanup INFO: Closing job status poller
+1791923740.523402 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.jobs.job_status_poller:66 close WARNING: Not scaling in executor Explorer because it is in bad state
+1791923740.523487 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1170 cleanup INFO: Terminated job status poller
+1791923740.523552 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1172 cleanup INFO: Shutting down executors
+1791923740.523617 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1175 cleanup INFO: Shutting down executor Explorer
+1791923740.523691 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:927 shutdown INFO: Attempting HighThroughputExecutor shutdown
+1791923740.523755 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:929 shutdown INFO: Terminating interchange and result queue thread
+1791923740.531245 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:938 shutdown INFO: Closing ZMQ pipes
+1791923740.531324 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:948 shutdown INFO: Closing outgoing_q
+1791923740.531825 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:952 shutdown INFO: Closing command client
+1791923740.532161 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:955 shutdown INFO: Waiting for result queue thread exit
+1791923740.532254 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.high_throughput.executor:964 shutdown INFO: Finished HighThroughputExecutor shutdown attempt
+1791923740.532321 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1177 cleanup INFO: Shut down executor Explorer
+1791923740.532389 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1175 cleanup INFO: Shutting down executor _parsl_internal
+1791923740.532468 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.threads:84 shutdown DEBUG: Shutting down executor, which involves waiting for running tasks to complete
+1791923740.532546 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.executors.threads:89 shutdown DEBUG: Done with executor shutdown
+1791923740.532611 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1177 cleanup INFO: Shut down executor _parsl_internal
+1791923740.532672 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1179 cleanup INFO: Terminated executors
+1791923740.532755 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1188 cleanup INFO: Workflow shutdown information: {'tasks_failed_count': 1, 'tasks_completed_count': 0, 'time_completed': datetime.datetime(2026, 10, 13, 15, 35, 40, 532727), 'run_id': '66d79349-cd05-4af9-ae70-513d260611f7', 'rundir': '/home/jalemu/FULL-MAW/tmp/run_0/runinfo/000'}
+1791923740.532860 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1198 cleanup INFO: Terminating task launch pool
+1791923740.533071 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1200 cleanup INFO: Terminated task launch pool
+1791923740.533141 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1202 cleanup INFO: Unregistering atexit hook
+1791923740.533210 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1204 cleanup INFO: Unregistered atexit hook
+1791923740.533275 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1207 cleanup INFO: Unregistering default DFK
+1791923740.533343 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1209 cleanup INFO: Unregistered default DFK
+1791923740.533407 2026-10-13 15:35:40 MainProcess-670445 MainThread-23456247715648 parsl.dataflow.dflow:1214 cleanup INFO: Unregistering log handler
