@@ -36,16 +36,16 @@ class AgentState(TypedDict):
     engine:                str              # workflow engine: "parsl", "pycompss", etc.
     env:                   str              # execution environment: "local" or "hpc"
     condition:             str              # ablation condition: "A" (no-skills), "B" (full), "C" (single-agent)
-    domain:                str              # paper domain label, e.g. "cosmology"
-                                            # used to look up use_cases/<domain>/* directly instead of keyword matching
+    domain:                str              # skills/use_cases/<folder>, exact name; "" for none.
+                                            # Selects the domain skill AND labels the trace.
     explorer_summary:      str              # explorer's own closing summary of the run
     run_succeeded:         bool             # user's answer to "has the workflow executed properly?"
     reported_issue:        str              # user's description of the issue, when run_succeeded is False
     skill_recommendations: list[dict]       # explorer's suggested skill-file edits
     skill_edits_applied:   bool             # whether the user let the explorer append them,
-    mpi_nodes:         int   # nodes the MPI application may use (excludes the spare)
-    mpi_cpus_per_node: int   # ncpus, and also mpiprocs, per node
-    mpi_slots:         int   # mpi_nodes * mpi_cpus_per_node -- the rank ceiling
+    mpi_nodes:         int   # nodes the MPI application may use = the whole allocation
+    mpi_ranks_per_node: int  # mpiprocs per node -- the rank slots on each
+    mpi_slots:         int   # mpi_nodes * mpi_ranks_per_node -- the rank ceiling
 
 
 class OrchestratorOutput(BaseModel):
@@ -72,6 +72,8 @@ class UserInput:
     pdf: str = ""
     image: str = ""
     goal: str = ""
+    domain: str = ""
+    engine: str = "parsl"
     nodes: int = 1
-    ncpus: int = 1
+    ranks: int = 1
     data_files: list[str] = field(default_factory=list)

@@ -1,9 +1,8 @@
-
 ---
 name: systems/parsl
 description: >
   Parsl parallel scripting library reference for MAW workflows. Covers the generated-file
-  execution model (write_workflow/run_workflow), @python_app/@bash_app rules,
+  execution model (write_file/run_workflow), @python_app/@bash_app rules,
   HighThroughputExecutor config, common pitfalls, and the exact config skeleton used here.
 ---
 
@@ -21,8 +20,8 @@ The parsl engine is **generated-file only**. You have exactly two execution tool
 
 | Tool | What it does |
 |---|---|
-| `write_workflow(python_code, filename)` | Writes ONE standalone Parsl driver file to `/app/work/run0/` |
-| `run_workflow(filename)` | The server executes that file |
+| `write_file(path, content)` | Writes a file under `/app/work/run0/`. The ONE standalone Parsl driver file goes through here, and so does anything that file reads |
+| `run_workflow(filename)` | The server launches that driver as `<python> workflow.py` |
 
 These are the only execution tools this server has. There is no tool that takes
 a code string or a command string and runs it for you.
@@ -54,17 +53,28 @@ Unlike the old model, this file **does** build and load its own Parsl runtime:
 5. `.result()` to block for completion — in the driver body only, never inside an app
 6. `parsl.clear()` at the end
 
-### What is rejected
+### What `write_file` checks
 
-`write_workflow` validates the file and refuses it if it:
+A Python file is parsed before it is written, so a **syntax error** comes back as
+`"status": "rejected"` and nothing reaches disk. Fix it and write again.
+
+Everything structural comes back as `warnings` on a file that *was* written:
 
 - defines no `@bash_app` and no `@python_app`
 - never calls `parsl.load(...)`
-- imports or calls `subprocess`, or calls `os.system` / `os.popen`
-- contains `mpirun` / `srun` / `mpiexec` **outside** a `@bash_app` body
 
-If it is rejected, read the returned `errors`, fix the file, and call
-`write_workflow` again. Do not look for another way to run the command.
+Warnings do not block `run_workflow`, and that is the trap: a driver that never
+loads a config runs, exits 0, and schedules nothing. Treat a warning as a defect
+and fix the file before running it.
+
+These are **not** checked for you any more, and are still forbidden:
+
+- importing or calling `subprocess`, `os.system`, `os.popen`
+- `mpirun` / `srun` / `mpiexec` **outside** a `@bash_app` body
+
+Nothing will stop you writing them. What happens instead is that the work runs
+outside Parsl, the trace records a Parsl run that Parsl never scheduled, and the
+result is not reproducible by the engine it claims to use.
 
 ---
 
@@ -85,7 +95,7 @@ from parsl.providers import LocalProvider
 RANKS = 8
 
 @bash_app
-def run_sim(exe, envfile, paramfile, ranks, rundir,
+def run_sim(exe, envfile, paramfile, ranks, workdir,
             inputs=(), outputs=(),
             stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
     # Return the COMMAND STRING. Parsl runs it; we never do.
@@ -93,10 +103,12 @@ def run_sim(exe, envfile, paramfile, ranks, rundir,
     # File objects so the command writes exactly what Parsl is tracking.
     snapshot = outputs[0].filepath
     return (
+        # cd to the WORK directory, not to the program's reference tree: a
+        # program that writes relative to its cwd must be launched from the
+        # directory the run owns and can write to. paramfile is absolute.
         f"source {envfile} && "
-        f"cd {rundir} && "
-        f"mpirun -n {ranks} {exe} {paramfile} && "
-        f"test -s {snapshot}"
+        f"cd {workdir} && "
+        f"mpirun -n {ranks} {exe} {paramfile}"
     )
 
 @python_app
@@ -122,7 +134,7 @@ def main():
         executors=[
             HighThroughputExecutor(
                 label="wf_htex",
-                cores_per_worker=RANKS,   # one worker slot wide enough for the MPI job
+                max_workers_per_node=1,   # exactly one worker -- it runs the mpiexec
                 provider=LocalProvider(min_blocks=1, max_blocks=1, init_blocks=1),
             )
         ],
@@ -134,7 +146,7 @@ def main():
         # Submit the whole DAG without blocking: the data dependency is expressed
         # by handing sim.outputs to the next app, not by calling sim.result().
         sim = run_sim(exe="/path/to/binary", envfile="/path/to/env",
-                      paramfile="/path/to/indat.params", ranks=RANKS, rundir=work,
+                      paramfile="/path/to/indat.params", ranks=RANKS, workdir=work,
                       outputs=[File(f"{work}/output/snapshot")])
 
         png = visualize(work, inputs=sim.outputs)
@@ -194,6 +206,47 @@ Inside an app body, read paths off the objects (`inputs[0].filepath`,
 `outputs[0].filepath`) rather than re-deriving them, so the command writes exactly
 the file Parsl is tracking.
 
+#### Naming the files, so the wiring is readable
+
+With more than one product, `inputs=A.outputs` hands the consumer a positional
+list and the app has to know which index is which. Create the `File` objects in
+`main()` and pass the individual `DataFuture`s by keyword instead — the
+dependency is identical to Parsl, and the file each stage consumes is stated
+rather than implied:
+
+```python
+def main():
+    snap_file = File(f"{work}/particles_step{step}.txt")
+    halo_file = File(f"{work}/haloproperties_step{step}.txt")
+
+    # Producer declares both products. Order here fixes .outputs order.
+    sim = run_sim(exe=exe, envfile=envfile, workdir=work, step=step,
+                  outputs=[snap_file, halo_file])
+
+    # Each consumer names the product it needs. Both are DataFutures, so both
+    # stay PENDING until the producer has written that file.
+    info = analyze(work,
+                   snap_file=sim.outputs[0],
+                   halo_file=sim.outputs[1],
+                   paramfile=paramfile)
+
+    # `info` is an AppFuture returning a dict. Passed as an ordinary argument,
+    # Parsl resolves it and the body receives the dict itself -- that is a
+    # value dependency, no `inputs=` needed and no `.result()` call.
+    png = visualize(work, snap_file=sim.outputs[0], info=info)
+
+    print(png.result())        # the only block in the file
+```
+
+The app bodies then take those as normal parameters and read
+`snap_file.filepath`. Three stages, two kinds of edge (two files and one return
+value), one `.result()`, and every dependency visible to the DataFlowKernel.
+
+Note `sim.outputs[0]` appearing twice: a `DataFuture` can be consumed by any
+number of apps, and they run concurrently once it resolves. Declaring the file
+once and fanning out is correct; re-declaring the same path in a second
+`outputs=` list is not, and makes two apps claim to produce it.
+
 ---
 
 ## When to Use This Skill
@@ -223,7 +276,7 @@ config = Config(
     executors=[
         HighThroughputExecutor(
             label="local_htex",
-            cores_per_worker=1,
+            max_workers_per_node=1,
             provider=LocalProvider(
                 min_blocks=1,
                 max_blocks=1,
@@ -237,34 +290,80 @@ config = Config(
 parsl.load(config)
 ```
 
-**CRITICAL:** Do NOT add `max_workers`, `max_workers_per_node`, or any kwargs not shown. They cause `TypeError` in recent Parsl versions.
+**`max_workers` is gone** -- it was removed from `HighThroughputExecutor` and
+passing it raises `TypeError`. Its replacement is **`max_workers_per_node`,
+which is valid and which you should use** (see the sizing section below). An
+earlier version of this skill forbade both as if they were the same parameter;
+they are not, and forbidding the second one is what left the only correct way
+to size a worker pool unavailable.
 
-`initialize_logging=False` disables Parsl's automatic `parsl.log` file logging. The default (`True`) writes DEBUG-level output -- including per-5s scaling-strategy chatter -- that isn't useful here and just clutters the run directory.
+**Set `initialize_logging=False`.** The default is `True`, which writes a
+DEBUG-level `parsl.log` under the run directory -- including the scaling
+strategy every 5 seconds, thousands of lines of `more slots than tasks` in a
+long run. That belongs to development, not to a run whose output is a
+scientific artifact, so keep it out of the generated file:
+
+```python
+config = Config(
+    executors=[...],
+    strategy="none",
+    initialize_logging=False,
+)
+```
+
+**When a DAG hangs or fails in a way the result does not explain, turn it back
+on for one run.** `parsl.log` is the only record of task submission and
+dependency resolution: whether an app was ever submitted, which executor it
+went to, what it was waiting on, and the full traceback of a failed app body.
+Without it a hang has no diagnosable trace from the outside. Remove the line,
+reproduce, read the log, put the line back.
+
+A middle setting exists if the file is wanted permanently but the chatter is
+not -- leave the default and raise the level once after load, which keeps the
+submission trail, the state transitions and every failure while dropping the
+polling noise:
+
+```python
+import logging
+parsl.load(config)
+logging.getLogger("parsl").setLevel(logging.INFO)
+```
 
 ### Sizing the worker for an MPI `@bash_app`
 
-`cores_per_worker=1` is correct only when every app is single-core. A `@bash_app`
-that launches `mpiexec -np N` runs **inside one worker slot**, so a 1-core slot
-tries to host N ranks: on an HPC cluster that means core oversubscription,
-affinity-mask conflicts, and rank-placement failures.
-
-Set `cores_per_worker` to the rank count the MPI app launches:
+A `@bash_app` that launches `mpiexec -np N` runs **inside one worker slot**, and
+that slot's `mpiexec` draws its ranks from `$PBS_NODEFILE`. So what you need is
+**exactly one worker**, not a worker that somehow holds N cores.
 
 ```python
-NRANKS = 8
-
 HighThroughputExecutor(
     label="htex",
-    cores_per_worker=NRANKS,      # the mpiexec -np 8 app gets a slot 8 cores wide
+    max_workers_per_node=1,       # exactly one worker: the thing that runs mpiexec
     provider=LocalProvider(min_blocks=1, max_blocks=1, init_blocks=1),
 )
 ```
 
-Use the same `NRANKS` constant for `cores_per_worker` and for the `-np` value in
-the app, so the two cannot drift apart. If ranks are multithreaded, size the slot
-to `nranks * nthreads`. Note this also caps concurrency: a node with 8 usable
-cores and `cores_per_worker=8` runs one such app at a time, which is what you want
-for a single large MPI job.
+Leave `cores_per_worker` at its default of `1.0`.
+
+**`cores_per_worker` is a divisor, not a reservation.** Parsl computes the
+worker count as:
+
+```
+worker_count = min(max_workers_per_node, mem_slots, floor(cores_on_node / cores_per_worker))
+```
+
+so raising it *reduces* how many workers are spawned and reserves nothing. On a
+128-core node, `cores_per_worker=8` yields **16 workers**, not one 8-core slot.
+Worse, if it ever exceeds the cores the process can see, the floor division
+gives **zero workers**: the pool starts, registers, dispatches nothing, and the
+DAG hangs with no error anywhere.
+
+Setting it to the rank count -- which an earlier version of this skill told you
+to do -- is therefore wrong in both directions and was the cause of a real
+hang. `max_workers_per_node=1` is the parameter that means "one slot".
+
+If you want the worker's threads pinned to a core range, that is
+`cpu_affinity="block"`, and it is unrelated to either of the above.
 
 ## Config — HPC (inside existing PBS job)
 
@@ -282,7 +381,7 @@ config = Config(
     executors=[
         HighThroughputExecutor(
             label="htex_lcrc",
-            cores_per_worker=1,     # raise to the rank count if an app runs mpiexec
+            max_workers_per_node=1, # one worker; mpiexec inside it uses $PBS_NODEFILE
             provider=LocalProvider(
                 min_blocks=n_workers,
                 max_blocks=n_workers,
@@ -296,9 +395,10 @@ config = Config(
 parsl.load(config)
 ```
 
-`cores_per_worker=1` here assumes single-core apps. If any `@bash_app` launches
-`mpiexec -np N`, size the slot for it — see "Sizing the worker for an MPI
-`@bash_app`" above — otherwise the N ranks land in one 1-core slot.
+`max_workers_per_node=1` gives exactly one worker, which is what a `@bash_app`
+running `mpiexec -np N` needs: the ranks come from `$PBS_NODEFILE`, not from the
+worker slot. Do not reach for `cores_per_worker` here — see "Sizing the worker
+for an MPI `@bash_app`" above for why it is the wrong knob.
 
 ---
 
@@ -316,6 +416,63 @@ def my_step(arg1, arg2):
 - No closures over mutable outer state
 - `.result()` only in `main()`, never inside another app
 - Return values must be picklable (strings, ints, simple dicts)
+
+---
+
+## Nothing outside the function body exists on the worker
+
+This applies to **both** decorators, and it is the single most common way a
+generated file fails.
+
+An app body runs in a worker process that has **never imported your file**. It
+gets the function and its arguments and nothing else. So a name the body reads
+but does not receive is not defined there:
+
+- **Imports** -- `import numpy as np` at the top of the file is invisible.
+  Import inside the body. (Stated above for `@python_app`; it is equally true
+  for `@bash_app`.)
+- **Module-level constants** -- a `NNODES = 2` at the top of the file is
+  invisible. **Pass it as a parameter.**
+- **Helper functions** -- a plain `def` at module level that the body calls is
+  invisible. Inline it, or make it an app of its own.
+
+```python
+NNODES = 2
+NRANKS = 4
+
+# WRONG -- nranks arrives as an argument, NNODES does not
+@bash_app
+def run_sim(exe, nranks, ntotranks):
+    return f"echo 'NNODES={NNODES}' && mpirun -np {ntotranks} ..."
+#                         ^^^^^^ NameError: name 'NNODES' is not defined
+
+# RIGHT -- every value the body reads is a parameter
+@bash_app
+def run_sim(exe, nnodes, nranks, ntotranks):
+    return f"echo 'NNODES={nnodes}' && mpirun -np {ntotranks} ..."
+
+run_sim(exe=EXE, nnodes=NNODES, nranks=NRANKS, ntotranks=NNODES * NRANKS)
+```
+
+**A default argument is fine**, because defaults are evaluated in the driver
+when the `def` is executed and travel with the call:
+
+```python
+@bash_app
+def run_sim(exe, nranks=NRANKS):      # OK -- NRANKS resolved at def time
+    ...
+```
+
+That is why a file can reference a constant in a default and still fail on the
+same constant used inside the body — the two look alike and behave completely
+differently.
+
+**What the failure looks like:** the task fails within seconds with
+`NameError: name 'X' is not defined`, the traceback points at the line in your
+file, and every downstream task goes to `dep_fail`. Nothing the app was meant
+to launch ever runs. The `NameError` and its traceback are in
+`task_logs/NNNN/task_NNNN_<app>.stderr`, and -- if `initialize_logging` was
+left on for the run -- in `runinfo/NNN/parsl.log` as well.
 
 ---
 
@@ -388,7 +545,7 @@ FOF/SOD.
 #### Why the data moves the way it does — read before copying
 
 `GenericIOPrint` is the only available reader: `pygio` is not built, and
-`write_workflow` rejects `import subprocess`, so every read of GenericIO data has
+`import subprocess` keeps the work out of Parsl entirely, so every read of GenericIO data has
 to be a CLI call inside a `@bash_app`. That tool has exactly three flags
 (`--no-rank-info`, `--no-data`, `--show-map`) — **no column selection and no
 binary output** — so a text dump is forced. What is *not* forced is dumping
@@ -437,7 +594,7 @@ NBINS = 256
 
 
 @bash_app
-def run_hacc(exe, envfile, paramfile, giop, rundir, step,
+def run_hacc(exe, envfile, paramfile, giop, workdir, srcdir, step,
              nnodes=1, nranks=NRANKS, ndepth=4, nthreads=NTHREADS,
              inputs=(), outputs=(),
              stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
@@ -456,11 +613,13 @@ def run_hacc(exe, envfile, paramfile, giop, rundir, step,
     outputs[0] = halo catalog text dump (~680 KB, dumped whole -- it is small)
     """
     ntotranks = nnodes * nranks
-    halo = f"{rundir}/analysis/haloproperties/step_{step}/m000p-{step}.haloproperties"
+    # srcdir = where the program keeps its own trees; workdir = where we run.
+    halo = f"{workdir}/analysis/haloproperties/step_{step}/m000p-{step}.haloproperties"
     halo_txt = outputs[0].filepath
     return (
         f"set -e && "
-        f"cd {rundir} && "
+        # The work directory, not the sample/reference tree -- see above.
+        f"cd {workdir} && "
         f"source {envfile} && "
         f"echo 'NNODES={nnodes} NTOTRANKS={ntotranks} "
         f"NRANKS={nranks} NDEPTH={ndepth} NTHREADS={nthreads}' && "
@@ -468,9 +627,8 @@ def run_hacc(exe, envfile, paramfile, giop, rundir, step,
         f"--map-by ppr:{nranks}:node:PE={nthreads} "
         f"--bind-to core "
         f"-x OMP_NUM_THREADS={nthreads} "
-        f"{exe} {paramfile} -n && "
-        f"{giop} --no-rank-info {halo} > {halo_txt} && "
-        f"test -s {halo_txt}"
+        f"{exe} {paramfile} && "
+        f"{giop} --no-rank-info {halo} > {halo_txt}"
     )
 
 
@@ -552,7 +710,7 @@ def select_halo(outdir, paramfile, inputs=()):
 
 
 @bash_app
-def extract_slice(giop, rundir, step, info, thickness=THICKNESS,
+def extract_slice(giop, workdir, step, info, thickness=THICKNESS,
                   inputs=(), outputs=(),
                   stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
     """Pipe the snapshot through awk: keep x,y for particles in the z-slice only.
@@ -568,19 +726,20 @@ def extract_slice(giop, rundir, step, info, thickness=THICKNESS,
 
     outputs[0] = two-column x,y text for the particles inside the slice
     """
-    snap = f"{rundir}/output/full_snapshots/step_{step}/m000p.full.mpicosmo.{step}"
+    snap = f"{workdir}/output/full_snapshots/step_{step}/m000p.full.mpicosmo.{step}"
     out = outputs[0].filepath
     hz = info["hz"]
     rl = info["RL"]
     half = thickness / 2.0
     return (
-        f"set -e && "
+        # pipefail, because `set -e` alone ignores a failure on the LEFT of a
+        # pipe: if the reader dies, awk still exits 0 and the step looks fine.
+        f"set -eo pipefail && "
         f"{giop} --no-rank-info {snap} | "
         f"awk -v hz={hz} -v half={half} -v rl={rl} "
         f"'!/^#/ && NF>=7 {{ dz=$3-hz; if(dz<0) dz=-dz; "
         f"if(rl-dz<dz) dz=rl-dz; "          # periodic distance in z
-        f"if(dz<=half) print $1\"\\t\"$2 }}' > {out} && "
-        f"test -s {out}"
+        f"if(dz<=half) print $1\"\\t\"$2 }}' > {out}"
     )
 
 
@@ -650,7 +809,8 @@ def render(outdir, info, thickness=THICKNESS, nbins=NBINS, inputs=()):
 
 def main():
     work = "/app/work/run0"
-    rundir = "/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go"
+    # Inputs are read from wherever they live; the run happens in work/run0.
+    srcdir = "/path/to/the/programs/own/sample/tree"   # read-only, inputs only
     hacc = "/lcrc/project/PEDAL/jalemu/HACC/HACC_go"
     giop = f"{hacc}/improv.cpu/frontend/bin/GenericIOPrint"
     step = 624
@@ -661,7 +821,7 @@ def main():
                 label="hacc_htex",
                 # the mpiexec -np 8 app runs inside ONE worker slot -- size the
                 # slot to the rank count or the ranks fight over a single core
-                cores_per_worker=NRANKS,
+                max_workers_per_node=1,
                 provider=LocalProvider(min_blocks=1, max_blocks=1, init_blocks=1),
             )
         ],
@@ -678,14 +838,14 @@ def main():
             exe=f"{hacc}/improv.cpu/mpi/bin/hacc_tpm",
             envfile=f"{hacc}/env/bashrc.improv.cpu",
             paramfile="./params/indat.params",
-            giop=giop, rundir=rundir, step=step, nranks=NRANKS,
+            giop=giop, workdir=work, srcdir=srcdir, step=step, nranks=NRANKS,
             outputs=[File(f"{work}/haloproperties_step{step}.txt")],
         )
 
-        info = select_halo(work, f"{rundir}/params/indat.params",
+        info = select_halo(work, f"{srcdir}/params/indat.params",
                            inputs=sim.outputs)
 
-        sl = extract_slice(giop, rundir, step, info,       # AppFuture -> resolved dict
+        sl = extract_slice(giop, work, step, info,         # AppFuture -> resolved dict
                            outputs=[File(f"{work}/slice_xy_step{step}.txt")])
 
         png = render(work, info, inputs=sl.outputs)
@@ -718,8 +878,8 @@ come from HACC's own `indat.params`, not from a paper.
 
 Structural details worth copying: every inter-app dependency is a `File`/
 `DataFuture` or an `AppFuture` passed as an argument, there is exactly one
-`.result()` and it is on the final PNG, `cores_per_worker` equals the MPI rank
-count, and the large intermediate is never materialized — the only full-size data
+`.result()` and it is on the final PNG, the executor declares
+`max_workers_per_node=1`, and the large intermediate is never materialized — the only full-size data
 that moves is `GenericIOPrint`'s stdout, consumed by `awk` in the same pipe.
 
 > If a binary path is available, prefer it over text entirely. `GenericIO2Cosmo
@@ -733,10 +893,12 @@ that moves is `GenericIOPrint`'s stdout, consumed by `awk` in the same pipe.
 
 | Pitfall | Rule |
 |---|---|
-| Looking for a tool that runs a code or command string | There isn't one. Use `write_workflow` + `run_workflow` |
+| Looking for a tool that runs a code or command string | There isn't one. Use `write_file` + `run_workflow` |
+| Asserting on the simulation's own output (`test -s snapshot`) | Don't. Output from a previous run satisfies it, so a run that wrote nothing passes. Verify afterwards with `list_files`/`read_file`, which can see timestamps and sizes |
+| Chaining a pipe under plain `set -e` | `set -e` ignores failure on the LEFT of a pipe, so a dead reader still exits 0. Use `set -eo pipefail` |
 | Running a CLI command any way other than `@bash_app` | Every command line must be a string returned by a `@bash_app` |
-| `import subprocess` / `os.system` in the generated file | Rejected by `write_workflow` — express it as a `@bash_app` |
-| `mpirun`/`srun` in the driver body instead of inside a `@bash_app` | Rejected by `write_workflow` — move it into the app body |
+| `import subprocess` / `os.system` in the generated file | Takes the work out of Parsl — express it as a `@bash_app` |
+| `mpirun`/`srun` in the driver body instead of inside a `@bash_app` | Parsl never sees the launch — move it into the app body |
 | Writing a `.sh` or `.pbs` file to run the work | Never. The command belongs in a `@bash_app` string |
 | Splitting a workflow across multiple generated files | One file per workflow; multiple apps inside it |
 | Imports at module level inside @python_app | All imports must be inside the function body |
@@ -744,7 +906,12 @@ that moves is `GenericIOPrint`'s stdout, consumed by `awk` in the same pipe.
 | `.result()` between submissions to force ordering | Serializes the driver and hides the DAG. Submit every app first; call `.result()` once, on the final deliverable |
 | Passing file paths between apps as plain strings | Invisible to the DFK. Declare `outputs=[File(p)]` on the producer and pass `inputs=producer.outputs` to the consumer |
 | Hand-written `os.path.exists` checks on another app's output | A symptom of string wiring — with `File`/`DataFuture` deps Parsl guarantees the file before the app starts |
-| `cores_per_worker=1` with an `mpiexec -np N` bash app | N ranks crammed into a 1-core slot: oversubscription and affinity failures. Set `cores_per_worker=N` (or `N*threads`) |
+| A module-level constant used INSIDE an app body | `NameError` on the worker -- it never imported your file. Pass it as a parameter. A constant in a DEFAULT argument is fine; one read in the body is not |
+| A module-level helper function called from an app body | Same `NameError`. Inline it or make it its own app |
+| `cores_per_worker=N` to "size a slot for N ranks" | It is a DIVISOR for the worker count, not a reservation. On 128 cores it gives 16 workers; above the visible core count it gives ZERO and the DAG hangs silently. Use `max_workers_per_node=1` |
+| Leaving `initialize_logging` at its default in a real run | Writes a DEBUG `parsl.log` with 5-second scaling chatter into the run directory. Set `initialize_logging=False`; turn it back on only to diagnose a hang |
+| `--map-by ppr:N:node` with N != the allocation's `mpiprocs` | "not enough slots available". The ranks-per-node in the layout must equal what the allocation reserved per node -- 1x8 and 2x4 are both 8 ranks and are not interchangeable |
+| `rm -rf` on a directory the app also reads from or writes into | A retry wipes the previous attempt's output before you can read it, and one wrong path deletes the inputs. Create with `mkdir -p` and remove only the specific subdirectory being replaced |
 | Extra kwargs in HighThroughputExecutor | Causes TypeError — copy config exactly |
 | `strategy` not set to `"none"` | Can cause auto-scaling issues in local mode |
 | `parsl.load()` called twice without `parsl.clear()` | Raises NoDataFlowKernelError |

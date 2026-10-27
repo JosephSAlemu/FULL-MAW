@@ -40,12 +40,24 @@ is a node reserved to idle.
 
 Why there is no MPIExecutor
 ---------------------------
-The Explorer never submits tasks to a Parsl executor. It talks to
-servers/parsl_server.py over MCP stdio; write_workflow/run_workflow make
-that server emit a standalone file which builds its own Config and calls
-parsl.load() itself. The MPI ranks come from the mpirun string inside a
-@bash_app in that generated file. An MPIExecutor here would reserve an
-allocation nothing ever submits to.
+The Explorer never submits tasks to a Parsl executor. It talks to a server
+under servers/ over MCP stdio, and that server's whole job is to write the
+files the Explorer generates and then launch the workflow file once. Under
+--engine parsl the workflow file builds its own Config and calls parsl.load()
+itself, and its MPI ranks come from the mpirun string inside a @bash_app in
+that file. An MPIExecutor here would reserve an allocation nothing ever
+submits to.
+
+What the multi-node block asks PBS for
+--------------------------------------
+`select=<nodes+1>:ncpus=<ranks>:mpiprocs=<ranks>`. Both come from the one
+--ranks value: mpiprocs puts one line per rank slot in $PBS_NODEFILE, and
+ncpus reserves a core for each of those slots. Neither can be left at its
+default of 1 -- that gives 1 nodefile line per node, or 1 core per node
+however many slots the nodefile advertises. They are passed through
+different PBSProProvider parameters (cpus_per_node and select_options)
+because the provider's template already emits ncpus; a second one in the
+same chunk makes qsub reject the job outright.
 
 Why the multi-node block uses SingleNodeLauncher
 ------------------------------------------------
@@ -70,7 +82,7 @@ Usage:
     # from a login node; submits the Explorer's job itself
     source setup_hpc.sh
     python academy_agents.py --paper 1 --combination b --env multi-node \\
-        --nodes 1 --ncpus 32 --goal "..."
+        --nodes 2 --ranks 4 --goal "..."
 """
 
 import argparse
@@ -79,6 +91,7 @@ import contextlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -100,7 +113,7 @@ from rich.panel import Panel
 from common.consts import (
     LITERATURE_PATH, RUN_PATH, IMAGE_PATH,
     DEFAULT_WALLTIME, HPC_MODULES, PROJECT_DIR, SRC_DIR, SETUP_SCRIPT_PATH,
-    WORK_DIR
+    WORK_DIR, SKILLS_PATH,
 )
 from common.exceptions import exception_message
 from mcp_explorer import post_run_review
@@ -115,10 +128,18 @@ load_dotenv()
 console = Console()
 
 
-# Spare node in the multi-node Explorer allocation. It sits last in
-# $PBS_NODEFILE, so an mpiexec that does not ask for every slot fills
-# the intended nodes first and leaves this one free.
-SPARE_NODES = 1
+# No spare node. The block is exactly --nodes wide, so the allocation and the
+# MPI application are the same shape: `--nodes 2 --ranks 4` is two nodes with
+# four rank slots each, and $PBS_NODEFILE holds exactly the eight lines the
+# workflow's mpiexec may use.
+#
+# There used to be one extra node on top, which made the allocation one node
+# wider than the application. That meant $PBS_NODEFILE -- and therefore
+# get_resources -- reported a shape the agent was told, in prose, to disbelieve:
+# nnodes=3 for a 2x4 run. Sizing `--map-by ppr:N:node` from a number the prompt
+# says to ignore is a trap, and the Explorer's own worker pool needs well under
+# one core while it waits on LLM turns, so the node it was being given mostly
+# sat idle.
 
 
 # __ Helpers ___________________________________________________________________
@@ -130,15 +151,118 @@ def _slugify(path: str) -> str:
     return slug or "no_paper"
 
 
-def make_run_dir(run_dir: Path) -> Path:
-    """Recreate run_dir empty and return it -- the Parsl scratch for this run.
+def available_domains() -> list[str]:
+    """The domains: folder names under skills/use_cases/, sorted. [] if none.
 
-    Wiping it discards the previous run's submit scripts and block logs, so
-    only the current run's are ever there to look at.
+    A folder is offered whether it holds the current single domain.SKILL.md or
+    the older per-agent files -- which of those it is, is the skill loader's
+    problem, not the user's.
     """
-    shutil.rmtree(run_dir, ignore_errors=True)
-    run_dir.mkdir(parents=True)
-    return run_dir
+    uc_dir = os.path.join(SKILLS_PATH, "use_cases")
+    if not os.path.isdir(uc_dir):
+        return []
+    return sorted(
+        name for name in os.listdir(uc_dir)
+        if os.path.isdir(os.path.join(uc_dir, name)) and not name.startswith(".")
+    )
+
+
+def resolve_domain(requested: str) -> str:
+    """Validate a --domain value, or ask which domain to use.
+
+    The name must match a folder under skills/use_cases/ exactly. It used to be
+    matched as a substring, in both directions, against every folder name, and
+    then -- failing that -- guessed at by sniffing the first 500 characters of
+    each candidate skill for a package name out of the installer's stack
+    decision. Both of those could pick the wrong folder, and when they picked
+    nothing the run simply proceeded with no domain knowledge and said nothing
+    about it. An exact name that is checked before the run starts cannot do
+    either.
+
+    Returns the folder name, or "" for a run with no domain skill.
+    """
+    choices = available_domains()
+
+    if requested:
+        if requested in choices:
+            return requested
+        exception_message(
+            f"No such domain: {requested!r}.\n"
+            f"Expected one of: {', '.join(choices) or '(none found)'}\n"
+            f"Looked in {os.path.join(SKILLS_PATH, 'use_cases')}"
+        )
+
+    if not choices:
+        console.print("[yellow]No domains under skills/use_cases/ -- running "
+                      "without a domain skill.[/yellow]")
+        return ""
+
+    console.print("\n[bold]Available domains:[/bold]")
+    for i, name in enumerate(choices, 1):
+        console.print(f"  {i}. {name}")
+    console.print(f"  {len(choices) + 1}. (none -- run without a domain skill)")
+
+    while True:
+        raw = input("\nSelect a domain by number: ").strip()
+        try:
+            idx = int(raw)
+        except ValueError:
+            console.print("[red]Invalid selection. Please input a number[/red]")
+            continue
+        if 1 <= idx <= len(choices):
+            console.print(f"[dim]Selected: {choices[idx - 1]}[/dim]")
+            return choices[idx - 1]
+        if idx == len(choices) + 1:
+            console.print("[dim]Running without a domain skill.[/dim]")
+            return ""
+        console.print("[red]Invalid selection. Choose a listed domain[/red]")
+
+
+def make_run_dir(work_dir: Path) -> Path:
+    """Prepare work/run0 for this run and return it. Nothing outside it is touched.
+
+    This used to `shutil.rmtree(work_dir)` outright. The intent was narrow --
+    discard the previous run's submit scripts and block logs so only the
+    current run's are there to look at -- but work/ holds far more than that:
+    work/run0 is where the Explorer writes workflow.py and every output the
+    run produces, and run_archiver's own docstring explains at length why it
+    deliberately does NOT clear work/run0. The two contradicted each other,
+    and anything you renamed to keep (work/run0_hacc_good) was deleted too.
+
+    Everything this run produces now lives under work/run0 -- the Explorer's
+    outputs, the generated workflow.py, and Parsl's scratch at
+    work/run0/runinfo. That makes work/run0 the one directory a run writes to,
+    so anything you rename to keep it (work/run0_hacc_good) sits beside it and
+    is never touched. It also matches where the MCP servers already point:
+    DEFAULT_WORK_DIR is REPO_ROOT/work/run0 and the skills say /app/work/run0,
+    whereas Parsl's scratch used to land one level up in work/runinfo.
+
+    Within run0 only the scratch is cleared, since nothing in it is run output
+    and Parsl recreates it. The rest is overwritten file-by-file as the run
+    writes it.
+
+    MAW_ROTATE_RUN0=1 moves a non-empty work/run0 aside to
+    work/run0_prev_<timestamp> so this run starts clean instead of writing
+    over it -- worth considering as a default, because a stale output left in
+    place can make a @bash_app that ends on `test -s <output>` report success
+    without having run.
+
+    MAW_WIPE_WORK=1 restores the old behaviour of clearing all of work/.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    if os.getenv("MAW_WIPE_WORK") == "1":
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    run0 = work_dir / "run0"
+    if os.getenv("MAW_ROTATE_RUN0") == "1" and run0.is_dir() and any(run0.iterdir()):
+        kept = work_dir / f"run0_prev_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run0.rename(kept)
+        console.print(f"[dim]Previous outputs moved to {kept}[/dim]")
+
+    run0.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(run0 / "runinfo", ignore_errors=True)
+    return run0
 
 
 def venv_dir() -> Path:
@@ -176,11 +300,7 @@ def venv_dir() -> Path:
     return prefix
 
 
-# Environment setup sourced before every run on LCRC: Intel MPI library paths
-# and VENV_PYTHON. The multi-node Explorer sources it too, on its own node.
-
-
-def make_worker_init(run_dir: Path) -> str:
+def make_worker_init(run_dir: Path, engine: str = "parsl") -> str:
     """Shell prelude for the Explorer's worker pool, run before the launcher.
 
     It sources setup_hpc.sh, the same script you source before running this,
@@ -206,15 +326,33 @@ def make_worker_init(run_dir: Path) -> str:
             f"{SETUP_SCRIPT_PATH} not found. The multi-node Explorer sources it on "
             f"its compute node for the Intel MPI library paths and VENV_PYTHON."
         )
-    return "; ".join(
-        [
-            f"module load {HPC_MODULES}",
-            f"source {venv_dir()}/bin/activate",
-            f"source {SETUP_SCRIPT_PATH}",
-            f"cd {run_dir}",
-            f"export PYTHONPATH={PROJECT_DIR}:{SRC_DIR}:$PYTHONPATH",
-        ]
-    )
+    prelude = [
+        f"module load {HPC_MODULES}",
+        f"source {venv_dir()}/bin/activate",
+        f"source {SETUP_SCRIPT_PATH}",
+        f"cd {run_dir}",
+        f"export PYTHONPATH={PROJECT_DIR}:{SRC_DIR}:$PYTHONPATH",
+        # Where the MCP server writes and runs. Exported here rather than left
+        # to setup_hpc.sh because run_dir is a per-run decision made in THIS
+        # process (work/run0, possibly rotated aside first) -- the setup script
+        # cannot know it, and the Explorer's node never saw the shell that did.
+        # Everything else the servers need (JAVA_HOME, MAW_MPI_LAUNCHER, the
+        # ADIOS2 and MPI library paths, the headless rendering variables) is
+        # site knowledge and belongs in that script. PyCOMPSs needs nothing
+        # beyond the activated venv it was pip-installed into, which the
+        # `source .../activate` two lines up provides.
+        f"export MAW_REPO_ROOT={PROJECT_DIR}",
+        f"export MAW_WORK_DIR={run_dir}",
+        f"export MAW_DATA_DIR={PROJECT_DIR}/data",
+    ]
+
+    # No engine-specific tail, and `engine` is accepted only so the call sites
+    # need not care. There used to be one branch per engine here, each exporting
+    # a library path from a constant in common.consts; those constants are gone,
+    # and setup_hpc.sh -- sourced three lines up, on this node -- is now the
+    # single place the environment for any engine is built. One script that
+    # knows the machine beats three branches that each guessed at it.
+    return "; ".join(prelude)
 
 
 def user_input():
@@ -237,23 +375,38 @@ def user_input():
     parser.add_argument("--trial", type=int, default=1,
                         help="Trial number for repeated (paper, condition) runs (default: 1)")
     parser.add_argument("--domain", type=str, default="",
-                        help="Paper domain label, e.g. molecular_nucleation (optional)")
+                        help="The domain: a folder name under skills/use_cases/, by "
+                             "exact name (e.g. new_molecular_nucleation). It both "
+                             "selects the domain skill and labels the run trace. Omit "
+                             "to be asked; --list-domains shows what is there")
+    parser.add_argument("--list-domains", action="store_true",
+                        help="Print the available domains and exit")
     parser.add_argument("--combination", type=str, required=True,
                         choices=["a", "b", "c", "d"],
                         help="Planner input combination: a=PDF+Image+DataFile+Desc, "
                              "b=PDF+DataFile+Desc, c=Image+DataFile+Desc, d=DataFile+Desc")
     parser.add_argument("--nodes", type=int, default=0,
                         help="multi-node only: nodes the Explorer's MPI application "
-                             "runs across (one spare node is added on top)")
-    parser.add_argument("--ncpus", type=int, default=0,
-                        help="multi-node only: CPUs reserved per node in the Explorer's "
-                             "allocation. Also becomes mpiprocs, so this is the cap on "
-                             "ranks the agent can place on any one node")
+                             "runs across. The allocation is exactly this wide")
+    parser.add_argument("--ranks", type=int, default=0,
+                        help="multi-node only: MPI ranks per node (mpiprocs). This is "
+                             "the cap on ranks the agent can place on any one node, so "
+                             "--nodes x --ranks is the rank ceiling for the run. No core "
+                             "count is requested -- PBS applies its own per-chunk default")
     args = parser.parse_args()
 
+    if args.list_domains:
+        names = available_domains()
+        console.print("\n[bold]Available domains:[/bold]")
+        for name in names:
+            console.print(f"  {name}")
+        if not names:
+            console.print(f"  (none found under {os.path.join(SKILLS_PATH, 'use_cases')})")
+        raise SystemExit(0)
+
     # Fail here rather than after the prompts, or as a qsub for select=0.
-    if args.env == "multi-node" and (args.nodes < 1 or args.ncpus < 1):
-        parser.error("--env multi-node needs --nodes and --ncpus, both at least 1")
+    if args.env == "multi-node" and (args.nodes < 1 or args.ranks < 1):
+        parser.error("--env multi-node needs --nodes and --ranks, both at least 1")
     if args.env == "multi-node" and not os.getenv("PBS_ACCOUNT"):
         parser.error("--env multi-node needs PBS_ACCOUNT set (in .env or the environment)")
     return args
@@ -263,6 +416,10 @@ def collect_inputs(args) -> UserInput:
     """Resolve paper / image / data-file / goal selections (interactive fallbacks)."""
 
     inputs = UserInput()
+
+    # Which domain skill this run loads. Resolved first: an unknown name is a
+    # typo worth reporting before the user has picked a paper and typed a goal.
+    inputs.domain = resolve_domain(args.domain)
 
     # Paper selection
     if args.combination == "a" or args.combination == "b":
@@ -373,19 +530,28 @@ def collect_inputs(args) -> UserInput:
     inputs.goal = goal
 
     inputs.nodes = args.nodes
-    inputs.ncpus = args.ncpus
+    inputs.ranks = args.ranks
+    # Needed by make_worker_init: only pycompss gets an engine prelude on the
+    # Explorer's node.
+    inputs.engine = args.engine
 
     return inputs
 
 
 # __ Parsl configuration (multi-node only) ______________________________________
 
-def make_config(nodes: int, ncpus: int, run_dir: Path) -> Config:
+def make_config(nodes: int, ranks: int, run_dir: Path, engine: str = "parsl") -> Config:
     """Build the config: one block, for the Explorer.
 
-    All workflow artifacts still go to /app/work/run0, which the MCP
-    server resolves from HOST_REPO_PATH -- a __file__-derived absolute
-    path, so no worker's cwd can affect it.
+    Renders `select=<nodes+1>:ncpus=<ranks>:mpiprocs=<ranks>`, i.e. (nodes+1) x
+    ranks lines in $PBS_NODEFILE, with one core reserved per rank slot. ncpus
+    goes in via cpus_per_node and mpiprocs via select_options -- see the note
+    on the provider below for why they cannot both go in the same place.
+
+    `run_dir` is work/run0, so Parsl's scratch goes to work/run0/runinfo and
+    everything this run produces is under one directory. That is also where the
+    MCP server writes -- MAW_WORK_DIR is exported to the same path by
+    make_worker_init -- so no worker's cwd can affect it.
     """
     return Config(
         # Parsl's own scratch (block logs, submit scripts, interchange
@@ -398,32 +564,59 @@ def make_config(nodes: int, ncpus: int, run_dir: Path) -> Config:
         executors=[
             # ---------------------------------------------------------------
             # Explorer: one worker on the head node of an allocation
-            # (nodes + 1) wide, every node with the same ncpus.
+            # (nodes + 1) wide, every node offering `ranks` rank slots.
             #
-            # mpiprocs is the point of this block. cpus_per_node alone
-            # renders select=N:ncpus=M, and PBS Pro defaults mpiprocs to
-            # 1 PER CHUNK -- so $PBS_NODEFILE would hold one line per
-            # node and the agent's `mpiexec -n 8` would die with "not
-            # enough slots available".
+            # One core per rank slot, both sides derived from the single
+            # --ranks value: cpus_per_node sets ncpus, select_options sets
+            # mpiprocs.
             #
-            # It is pinned to ncpus rather than exposed as a flag because
-            # the rank count is the agent's decision, made at runtime
-            # inside the generated workflow file, long after this job was
-            # submitted. One slot per reserved core is the most
-            # permissive nodefile that request can produce: 8 ranks land
-            # together on the first node, 128 spread across four, and
-            # nothing is reserved by mpiprocs itself.
+            # They go in through DIFFERENT parameters because PBSProProvider's
+            # template already emits ncpus itself:
+            #
+            #     #PBS -l select=${nodes_per_block}:ncpus=${ncpus}${select_options}
+            #
+            # so ncpus comes from cpus_per_node and select_options is appended
+            # after it. Putting "ncpus=" in select_options as well produces a
+            # second one in the same chunk and qsub rejects the whole job with
+            # "duplicated resource within a section of a select specification".
+            #
+            # Neither value can be left out. cpus_per_node DEFAULTS TO 1, which
+            # is where this came from on Improv:
+            #
+            #     Resource_List.select = 3:ncpus=1:mpiprocs=4
+            #     Resource_List.ncpus  = 3
+            #
+            # 12 rank slots in $PBS_NODEFILE and 3 cores to run them on. A
+            # workflow's `mpiexec -np 8 --bind-to core` then asks for 4 cores
+            # on nodes that hold 1 -- it either fails outright or
+            # oversubscribes 4:1 (observed as cpupercent 353 against a walltime
+            # of 13 minutes and cput of 25).
+            #
+            # Deriving both from --ranks keeps the one flag the caller can
+            # actually answer ("how many ranks per node"). An earlier version
+            # exposed --ncpus separately, and it served as the core reservation
+            # AND the rank cap at once, so sizing it for either got the other
+            # wrong -- 32 cores reserved to run 8 ranks.
+            #
+            # Threads per rank are deliberately not expressible: that would
+            # need cpus_per_node = ranks x threads plus ompthreads, and nothing
+            # in the workflow asks for them yet.
+            #
+            # max_workers_per_node=1 because exactly one thing runs in this
+            # block: the Explorer. The ranks are not Parsl workers -- they are
+            # launched by mpirun from inside the generated workflow, in the
+            # allocation this block holds.
             # ---------------------------------------------------------------
             HighThroughputExecutor(
                 label="Explorer",
                 max_workers_per_node=1,
                 provider=PBSProProvider(
                     account=os.getenv("PBS_ACCOUNT"),
-                    worker_init=make_worker_init(run_dir),
+                    worker_init=make_worker_init(run_dir, engine),
                     launcher=SingleNodeLauncher(),
-                    nodes_per_block=nodes + SPARE_NODES,
-                    cpus_per_node=ncpus,
-                    select_options=f"mpiprocs={ncpus}",
+                    nodes_per_block=nodes,
+                    cpus_per_node=ranks,
+                    select_options=f"mpiprocs={ranks}",
                     walltime=DEFAULT_WALLTIME,
                     # Fixed topology: no scaling in or out.
                     init_blocks=1,
@@ -463,7 +656,13 @@ def make_state(args, inputs) -> AgentState:
         # multi-node MPI. The run metadata still records the real --env.
         env="hpc" if multi_node else args.env,
         condition=args.condition,
-        domain=args.domain,
+        # The folder name IS the domain -- one flag, one field. It was briefly
+        # two (--domain as a free-text label, --use-case as the folder), which
+        # meant the trace could record a domain that matched no folder and the
+        # skill lookup could disagree with the label. run_archiver already read
+        # metadata.domain as the use case (`usecase = metadata.domain or ...`),
+        # so this is the name that was always meant to carry it.
+        domain=inputs.domain,
         explorer_summary="",
         run_succeeded=True,
         reported_issue="",
@@ -473,8 +672,8 @@ def make_state(args, inputs) -> AgentState:
         # one. Under hpc the Explorer reads the allocation you hold from PBS
         # itself via get_resources, so these stay 0 and are not shown to it.
         mpi_nodes=inputs.nodes if multi_node else 0,
-        mpi_cpus_per_node=inputs.ncpus if multi_node else 0,
-        mpi_slots=inputs.nodes * inputs.ncpus if multi_node else 0,
+        mpi_ranks_per_node=inputs.ranks if multi_node else 0,
+        mpi_slots=inputs.nodes * inputs.ranks if multi_node else 0,
     )
 
 
@@ -596,19 +795,21 @@ async def run_multi_node(inputs, initial_state, run_log_path: str) -> dict:
     explorer_log = base + "_explorer.log"
     explorer_trace = base + "_explorer_trace.jsonl"
 
+    # make_run_dir returns work/run0 -- the whole run lives there now.
     run_dir = make_run_dir(Path(WORK_DIR))
     console.print(f"[dim]Project dir:    {PROJECT_DIR}[/dim]")
     console.print(f"[dim]Venv:           {venv_dir()}[/dim]")
-    console.print(f"[dim]Parsl scratch:  {run_dir}[/dim]")
+    console.print(f"[dim]Run dir:        {run_dir}[/dim]")
+    console.print(f"[dim]Parsl scratch:  {run_dir / 'runinfo'}[/dim]")
     console.print(f"[dim]Explorer log:   {explorer_log}[/dim]")
     console.print(f"[dim]Explorer trace: {explorer_trace}[/dim]")
     console.print(
-        f"[dim]Explorer allocation: {inputs.nodes + SPARE_NODES} nodes "
-        f"x {inputs.ncpus} cpus (mpiprocs={inputs.ncpus}) -> up to "
-        f"{inputs.nodes * inputs.ncpus} ranks across {inputs.nodes} nodes[/dim]"
+        f"[dim]Explorer allocation: {inputs.nodes} nodes "
+        f"x mpiprocs={inputs.ranks} -> up to "
+        f"{inputs.nodes * inputs.ranks} ranks across {inputs.nodes} nodes[/dim]"
     )
 
-    dfk = parsl.load(make_config(inputs.nodes, inputs.ncpus, run_dir))
+    dfk = parsl.load(make_config(inputs.nodes, inputs.ranks, run_dir, inputs.engine))
     follower = asyncio.create_task(follow(explorer_log, "[explorer]"))
     # HttpExchangeFactory, not LocalExchangeFactory: the local exchange only
     # passes messages within one process, and the Explorer is on another node.
@@ -733,7 +934,7 @@ def main():
         trial=args.trial,
         paper_id=_slugify(inputs.pdf) if inputs.pdf else "no_paper",
         paper_path=inputs.pdf,
-        domain=args.domain,
+        domain=inputs.domain,
         framework=args.engine,
         env=args.env,
         goal=inputs.goal,

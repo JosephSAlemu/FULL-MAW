@@ -62,7 +62,7 @@ Follow this flow unless you have a specific reason to deviate.
   demonstrably exercise the real workflow engine. Route to **explorer** with
   feedback naming the specific task.
 
-  On every engine the explorer writes ONE workflow file via `write_workflow`
+  On every engine the explorer writes ONE workflow file via `write_file`
   and runs it via `run_workflow`; that file is *supposed* to contain the
   engine's own constructs. **The fix differs by engine -- don't give the wrong
   instruction:**

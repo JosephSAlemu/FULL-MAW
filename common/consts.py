@@ -40,6 +40,26 @@ IMAGE_PATH = f"{PROJECT_DIR}/images"
 BUILDS_PATH = f"{PROJECT_DIR}/builds"
 SETUP_SCRIPT_PATH = f"{PROJECT_DIR}/setup_hpc.sh"
 
+# __ Engine environment: deliberately absent ____________________________________
+# Nothing about PyCOMPSs, ADIOS2, MPI, Java, libxml2 or headless rendering is
+# written down here any more.
+#
+# All of it used to be: COMPSS_HOME, JAVA_HOME, LIBXML2_LIB, ADIOS2_HOME,
+# GCC14_LIB, OPENMPI_BIN, MPI_LIB_PATHS, GUI_OFFSCREEN_ENV and
+# SINGLE_RANK_MPI_SHIMS, each with a hardcoded Improv/Swing path as its default.
+# A default path is a claim about a machine, and every one of those claims was
+# true on exactly one cluster -- while being wrong silently, because a
+# nonexistent directory on LD_LIBRARY_PATH is not an error, it is just a lookup
+# that finds nothing.
+#
+# The servers in servers/ now read what they need from the environment and
+# resolve nothing: see the header of servers/server.py for the list. Export them
+# from the setup script sourced before launch, which is the one place that knows
+# which machine this is. Anything that script does not export is a path the
+# servers will not have, and that is the intended failure mode -- loud, and at
+# the right layer.
+
+
 # No VENV_DIR here on purpose: the virtualenv is not a constant. The
 # workers activate whichever one the launching process is running in,
 # which academy_agents.venv_dir() reads from sys.prefix.
@@ -51,22 +71,29 @@ ENV_KNOWLEDGE = {
     "local":      "knowledge/local",
     "hpc":        "knowledge/lcrc",
     # multi-node is LCRC under PBS like hpc, but the allocation is not the one
-    # you hold -- this code submits it, in two separate blocks, and the
-    # Explorer's is one node wider than its MPI application may use. Agents
-    # sized from get_resources alone get that wrong, so multi-node gets its own
-    # knowledge file rather than reusing knowledge/lcrc.
+    # you hold -- this code submits it, and the Explorer's is one node wider
+    # than its MPI application may use. Agents sizing from get_resources alone
+    # get that wrong. NOTE: knowledge/multi_node_lcrc is not written yet; this
+    # key is currently never looked up because make_state passes env="hpc" for
+    # multi-node, so it is inert until both land together.
     "multi-node": "knowledge/multi_node_lcrc",
 }
 
 # __ Use-case skill redirects ___________________________________________________
-# Side-by-side comparison hook: instead of the per-agent files under
-# use_cases/cosmology/ (planner/orchestrator/explorer/installer), every agent
-# loads the single consolidated use_cases/new_comsology/domain file for cosmology.
-# Any skill request matching use_cases/<key>/<agent> is rewritten to the value.
-USE_CASE_SKILL_REDIRECTS = {
-    "cosmology":            "use_cases/new_comsology/domain",
-    "molecular_nucleation": "use_cases/new_molecular_nucleation/domain",
-}
+# Empty, and kept only so that `from common.consts import USE_CASE_SKILL_REDIRECTS`
+# keeps working. Nothing is redirected any more.
+#
+# It used to map use_cases/<key>/<agent> to a consolidated file, so that asking
+# for cosmology's per-agent skills quietly got you new_comsology/domain instead.
+# That existed because the folder was chosen by matching a --domain label rather
+# than being named outright. It is now named outright: `--use-case new_comsology`
+# loads that folder, and `--use-case cosmology` loads the other one, with no
+# table in between deciding which you actually meant.
+#
+# Add an entry only to make one folder's skill requests resolve to a different
+# file on purpose -- and prefer passing the folder you want.
+USE_CASE_SKILL_REDIRECTS: dict[str, str] = {}
+
 
 # __ Condition-A substitute for env knowledge ___________________________________
 # B/C load the real knowledge/local|lcrc skill file, unchanged. A doesn't get that
@@ -81,12 +108,11 @@ ENV_NOTES = {
         "resolved to the repo root at runtime; never hardcode cluster-specific absolute paths."
     ),
     "multi-node": (
-        "Environment: an HPC cluster under PBS. This run holds two allocations submitted by "
-        "the agent code itself -- one node for the orchestrator/planner/installer, and a "
-        "separate, wider one for the explorer. The explorer's allocation carries one spare "
-        "node beyond what its MPI application may use, so size mpiexec from the MPI capacity "
-        "stated in the task context, not from get_resources. /app/ paths are resolved to the "
-        "repo root at runtime; never hardcode cluster-specific absolute paths."
+        "Environment: an HPC cluster under PBS. The Explorer's allocation was submitted by "
+        "the agent code itself, and the allocation is exactly as wide as what its MPI application "
+        "may use, so size mpiexec from the MPI capacity stated in the task context, not from "
+        "get_resources. /app/ paths are resolved to the repo root at runtime; never hardcode "
+        "cluster-specific absolute paths."
     ),
 }
 
@@ -97,16 +123,11 @@ ENV_NOTES = {
 # `module load`. Site-specific: these names are Improv's.
 HPC_MODULES = "gcc/13.2.0 openmpi/4.1.7"
 
-# CPUs per node for the Orchestrator, Planner and Installer block, used only
-# under --env multi-node with --agent-placement distributed, and the default
-# for --agent-ncpus. One core is enough for LLM-latency-bound work, but the
-# Installer shells out to pip, which builds wheels single-threaded -- raise
-# this if installs are slow or time out.
-#
-# Improv compute nodes report 128 cores and ~251 GB, and the site
-# allocates whole nodes, so this does not change what the block costs. It
-# only bounds what the agents may use.
-DEFAULT_NCPUS = 4
+# Removed: DEFAULT_NCPUS. It reserved cores for a Planner/Installer placement
+# mode that no longer exists -- both run in the launching process, on the login
+# node. Nothing requests a core count anywhere now; the Explorer's allocation
+# asks for nodes and mpiprocs only.
+
 
 # PBS walltime for every block. One value, used by both.
 #
@@ -117,9 +138,9 @@ DEFAULT_NCPUS = 4
 # latency and a revision loop or two -- but not for a scaled-up HACC.
 DEFAULT_WALLTIME = "01:00:00"
 
-# Cores per compute node on this machine. Reference only -- nothing
-# imports it. Useful when sizing --ncpus: the generated workflow runs
-# `mpiexec --map-by ppr:<ranks>:node:PE=<threads>`, so
-# ranks_per_node * threads_per_rank must fit inside the ncpus reserved.
-# The 8-rank reference run needs 8 x 4 = 32.
+# Cores per compute node on this machine. Reference only -- nothing imports it,
+# and nothing should size an allocation from it. The Explorer's block requests
+# `select=<nodes>:mpiprocs=<ranks>` with no ncpus, so PBS applies its own
+# per-chunk default and rank placement is decided by mpiprocs alone. This number
+# is here to answer "how much is on a node", not to be passed to anything.
 CORES_PER_NODE = 128

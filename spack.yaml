@@ -1,0 +1,63 @@
+spack:
+  specs:
+  - boost
+  - openmpi@4.1.6
+  - openjdk@21
+  - python@3.12
+  - graphviz
+  - libtool
+  - automake
+  - autoconf
+  - bison
+  - flex
+  - pkgconf
+  - libxml2
+  - papi
+  - adios2 +mpi +python +sst ~hdf5
+
+  # Flexible concretization to prevent strict puzzle locks
+  concretizer:
+    unify: when_possible
+
+  packages:
+    gcc:
+      externals:
+      - spec: gcc@13.2.0 languages='c,c++,fortran'
+        prefix: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-x86_64/gcc-8.5.0/gcc-13.2.0-iyqxotb
+        extra_attributes:
+          compilers:
+            c: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-x86_64/gcc-8.5.0/gcc-13.2.0-iyqxotb/bin/gcc
+            cxx: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-x86_64/gcc-8.5.0/gcc-13.2.0-iyqxotb/bin/g++
+            fortran: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-x86_64/gcc-8.5.0/gcc-13.2.0-iyqxotb/bin/gfortran
+      - spec: gcc@8.5.0 languages='c,c++,fortran'
+        prefix: /usr
+        extra_attributes:
+          compilers:
+            c: /usr/bin/gcc
+            cxx: /usr/bin/g++
+            fortran: /usr/bin/gfortran
+
+    all:
+      require:
+      - "%gcc@13.2.0"
+      providers:
+        mpi: [openmpi]
+
+    openjdk:
+      buildable: true
+      externals:
+      - spec: openjdk@21.0.0_35
+        prefix: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-zen3/gcc-12.3.0/openjdk-21.0.0_35-23zksi2
+
+    openmpi:
+      # buildable: false so a typo in the prefix below fails loudly at
+      # concretization instead of silently triggering a from-source OpenMPI
+      # build that would then not match hacc_tpm's ABI.
+      buildable: false
+      externals:
+      # The prefix the HACC envfile exports as MPI_HOME. Verified present on a
+      # compute node:
+      #   ls .../openmpi-4.1.6-knzkvb2/bin/mpirun   -> exists
+      #   mpiexec --version                          -> mpiexec (OpenRTE) 4.1.6
+      - spec: openmpi@4.1.6%gcc@13.2.0
+        prefix: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-zen3/gcc-13.2.0/openmpi-4.1.6-knzkvb2

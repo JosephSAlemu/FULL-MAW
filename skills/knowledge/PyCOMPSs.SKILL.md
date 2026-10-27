@@ -1,3 +1,37 @@
+---
+name: knowledge/PyCOMPSs
+description: >
+  PyCOMPSs API reference: the synchronization calls (compss_wait_on, compss_open,
+  compss_barrier, compss_wait_on_file/directory), the @local decorator, file and
+  object deletion, and task groups. Load alongside systems/pycompss, which
+  carries the MAW execution contract (write_xml/write_file/run_workflow, the
+  @task/@binary/@mpi rules, and the runtime lifecycle) that this manual serves.
+---
+
+# PyCOMPSs — API Reference
+
+The companion to `systems/pycompss`. That skill states the rules every generated
+driver must obey; this one is the API manual you consult while writing it.
+
+Nothing here overrides the contract. If a snippet below appears to permit
+something `systems/pycompss` forbids -- a `subprocess` call, an `mpirun` you
+typed yourself, a shell wrapper -- the contract wins. Note that `write_file`
+no longer refuses these for you: it rejects only a syntax error, so a file that
+breaks the contract will be written and will run, with the work happening
+outside COMPSs. The contract still binds.
+
+Two things to carry over from the contract while reading:
+
+- **`compss_wait_on` only where the driver needs a real value.** The examples
+  below show it liberally because they are illustrating the call. Waiting after
+  every submission serializes the graph COMPSs just built.
+- **Ordering comes from parameters, not from these calls.** `compss_barrier()`
+  forces a wait; it does not create a dependency. If a consumer needs a
+  producer's file, declare it `FILE_OUT` on the producer and `FILE_IN` on the
+  consumer -- see "The producer MUST declare its outputs" in `systems/pycompss`.
+
+---
+
 # API
 
 PyCOMPSs provides an API for data synchronization and other functionalities, such as task group definition and automatic function parameter synchronization (local decorator).

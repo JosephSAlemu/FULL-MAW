@@ -67,11 +67,13 @@ class ToolCallEvent(BaseEvent):
     succeeded: bool
     duration_s: float = 0
     iteration: Optional[int] = None
-    # only populated for write_workflow/run_workflow. engine_backend
-    # is the raw "engine" string the MCP server reports back (e.g "parsl-fallback").
-    # engine_verified: for parsl/pycompss, did the runtime actually dispatch it (not
-    # fallback). for adios, did the code call a real adios2 API, not just import it.
-    # None when it doesn't apply
+    # Only populated for write_file/run_workflow. engine_backend is the "engine"
+    # string the MCP server reports back; every server states it in that one
+    # field, so it no longer varies by engine the way "parsl-fallback" and
+    # "adios2-unused" used to. engine_verified is narrower: False when the file
+    # just written does not look like it uses the engine at all (no Parsl app,
+    # no @task, no ADIOS2 stream), which is how a run can be structurally wrong
+    # while every tool call succeeds. None when neither applies.
     engine_backend: Optional[str] = None
     engine_verified: Optional[bool] = None
 
@@ -168,6 +170,9 @@ class RunMetadata(BaseModel):
     trial: int = 1
     paper_id: str = ""
     paper_path: str = ""
+    # The domain: a folder name under skills/use_cases/, verbatim and validated
+    # against the folders on disk before the run starts -- so it always names a
+    # directory that exists, rather than a free-text label that may match none.
     domain: str = ""
     framework: str = ""
     env: str = ""

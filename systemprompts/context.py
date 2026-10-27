@@ -1,6 +1,3 @@
-
-
-
 PROJECT_LAYOUT = """\
 Repo directory tree -- the repo root is mapped to /app/ at runtime:
 
@@ -8,7 +5,8 @@ Repo directory tree -- the repo root is mapped to /app/ at runtime:
 +-- agent_mcp.py                       <- orchestrator/planner/installer + graph
 +-- mcp_explorer.py                    <- explorer agent (ReAct loop, MCP client)
 +-- servers/                           <- MCP server backends, one per workflow engine
-|   +-- parsl_server.py
+|   +-- server.py                      <- base class: every shared MCP tool
+|   +-- parsl_server.py                <- subclasses of it, engine specifics only
 |   +-- pycompss_server.py
 |   +-- adios_server.py
 +-- requirements.txt

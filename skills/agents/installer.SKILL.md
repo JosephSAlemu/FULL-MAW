@@ -63,5 +63,3 @@ If any missing → run `pip install -r builds/requirements.txt`.
 ---
 
 ## Notes
-
-- Ownership: Jacob owns installer(), INSTALLER_PROMPT, InstallerOutput

@@ -59,6 +59,20 @@ async def _read_skill(rel_path: str, agent_name: str, enabled: bool = True) -> s
         return ""
     rel_path = _redirect_skill(rel_path)
     full = os.path.join(SKILLS_PATH, rel_path + ".SKILL.md")
+
+    # A use case is one file now -- use_cases/<name>/domain.SKILL.md -- rather
+    # than one per agent. Agents still ask for "use_cases/<name>/planner" and
+    # the like, so fall back to that folder's domain file when the per-agent
+    # one is not there. Without this a new-style folder returns "" to every
+    # agent except the explorer, silently.
+    if not os.path.isfile(full):
+        parts = rel_path.split("/")
+        if len(parts) == 3 and parts[0] == "use_cases" and parts[2] != "domain":
+            domain_rel = f"{parts[0]}/{parts[1]}/domain"
+            if os.path.isfile(os.path.join(SKILLS_PATH, domain_rel + ".SKILL.md")):
+                rel_path = domain_rel
+                full = os.path.join(SKILLS_PATH, rel_path + ".SKILL.md")
+
     found = os.path.isfile(full)
     tracer.log_skill_load(agent_name, rel_path, found, suppressed=False)
     if found:

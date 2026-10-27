@@ -43,18 +43,19 @@ Always available, regardless of engine:
 |---|---|---|
 | `get_resources` | Query available compute resources (nodes, ranks, launcher) | **First call in HPC env** — before expressing any MPI command. Check `warning` field in the response. |
 | `load_skill` | Load `"local"` or `"hpc"` environment knowledge | Immediately after `get_resources` — load only the one that matches |
-| `get_task_status` | Check task status | After submitting work, to monitor progress |
-| `get_task_result` | Get full task output | After work completes, to see stdout/stderr |
-| `list_tasks` | List all tasks | To review what has been submitted and their statuses |
+| `write_file` | Write any file the run needs | Configuration first, then the single workflow file |
+| `run_workflow` | Run the workflow file | Once, after every file it reads is written |
+| `get_status` | A run's outcome and full output | After `run_workflow`, especially when its output was truncated |
 | `install_package` | pip install a package | When import fails with ModuleNotFoundError |
 | `check_package` | Verify package exists | Before running code that depends on a package |
 | `list_files` | List directory contents | After execution, to verify output files were created |
 | `read_file` | Read file contents | Inspect results, check CSV data, debug errors |
 
-Execution is the same on every engine: `write_workflow` and `run_workflow`.
-There are no other execution tools — you write ONE workflow file and the server
-runs it. What differs per engine is the constructs that file must use, which
-the engine reference in your context specifies.
+Execution is the same on every engine: `write_file`, then `run_workflow`. There
+are no other execution tools — you write the files and the server runs the
+workflow. What differs per engine is the constructs that file must use, which
+the engine reference in your context specifies. One engine (PyCOMPSs) binds one
+extra tool, `write_xml`, for configuration its runtime cannot start without.
 
 ---
 
@@ -87,11 +88,18 @@ Read **all** of them first, then express them to the engine together.
    engine's constructs (see the engine reference in your context)
 2. Express the ordering between steps the way that engine does it — not by
    running them one at a time yourself
-3. `write_workflow(python_code=..., filename="workflow.py")`
-4. If it is rejected, read the `errors`, fix the file, and call `write_workflow` again
-5. `run_workflow(filename="workflow.py")`
-6. Verify the output (`list_files`, `read_file`)
-7. If it failed, diagnose, fix the file, and repeat from step 3
+3. Write any configuration that workflow will read **first**, one
+   `write_file(path=..., content=...)` call per file. Under PyCOMPSs the XML
+   topology goes through `write_xml` instead, and both files are required
+4. `write_file(path="workflow.py", content=...)`
+5. Read the result. `rejected` means the file was not written — fix the error
+   and call `write_file` again. `warnings` means it was written but does not
+   look like it uses the engine; fix those before running it, because a file
+   that never touches the engine can still exit 0 having done nothing
+6. `run_workflow(filename="workflow.py")`
+7. Verify the output (`list_files`, `read_file`)
+8. If it failed, diagnose from `stderr` and the `logs` in the result, fix the
+   file, and repeat from step 4
 
 A workflow with an 8-rank MPI simulation and a Python visualization of its
 output is **one** file with both steps in it — not two files, not two tool
@@ -100,7 +108,7 @@ calls, and never a shell script.
 ### Phase 3: Validation
 
 After execution completes:
-1. Use `list_tasks` to review all task statuses
+1. Use `get_status` to review every run and its exit code
 2. List all output files (`list_files` on /app/work/run0/)
 3. Read key result files to verify correctness (`read_file` on results.csv, etc.)
 4. Summarize what was accomplished
@@ -115,7 +123,8 @@ After execution completes:
 | `FileNotFoundError` | Check the path; make the copy/mkdir part of the work you hand the engine, then retry |
 | Permission denied | Try with different path or check file permissions |
 | Script logic error (wrong output) | Rewrite the engine task code and retry |
-| Workflow file rejected by `write_workflow` | Read the `errors` list and fix the file — never route around it with another tool |
+| File rejected by `write_file` | A syntax error, or a path outside the work directory. Fix it and write again — never route around it with another tool |
+| `warnings` on a written file | The file does not look like it uses this engine. Fix it before running, or the run will succeed without the engine having done anything |
 | Timeout | Reduce problem size or increase timeout |
 | Unknown error | Read error message carefully, try a different approach |
 

@@ -1,3 +1,49 @@
+---
+name: knowledge/ADIOS
+description: >
+  ADIOS2 Python API reference: the Stream high-level API, the
+  Adios/IO/Variable/Engine/Attribute classes, read modes, and the old-to-new API
+  transition. Load alongside systems/adios, which carries the MAW execution
+  contract (write_file/run_workflow/run_mpmd, staged pipelines, MPMD) that
+  this manual serves.
+---
+
+# ADIOS2 — Python API Reference
+
+The companion to `systems/adios`. That skill states the rules every generated
+workflow must obey; this one is the API manual you consult while writing it.
+
+Nothing here overrides the contract. If a snippet below appears to permit
+something `systems/adios` forbids -- `subprocess` at module top level, a stage
+that never reads its data back -- the contract wins. Note that `write_file`
+no longer refuses these for you: it rejects only a syntax error and reports the
+rest as warnings, so a pipeline that never touches ADIOS2 will be written and
+will run. The contract still binds.
+
+## The calls MPMD depends on
+
+`systems/adios` explains when to use `MPMD_LAYOUT` (separate programs, one rank
+block each) versus `MPI_RANKS` (one program, roles by rank). Both rest on the
+lower-level class API rather than the `Stream` convenience wrapper, because
+only it accepts a communicator and lets you select the SST engine:
+
+| Need | Call | Reference section below |
+|---|---|---|
+| Per-block ADIOS instance | `adios2.Adios(comm)` | ADIOS class |
+| Named IO channel | `ad.declare_io("name")` | IO class |
+| Stream instead of file | `io.set_engine("SST")` | IO class |
+| Open with a communicator | `io.open(name, Mode.Write, comm)` | Engine class |
+| Declare the array once | `io.define_variable(...)` | Variable class |
+| Per-step publish / consume | `e.begin_step()` / `put` / `get` / `e.end_step()` | Engine class |
+| Reader slice selection | `v.set_selection([[start], [count]])` | Variable class |
+| Global shape, at read time | `v.shape()` -- lowercase | Variable class |
+
+`Stream(path, "w"/"r")` is the right choice for a **sequential** BP pipeline and
+is what the validator looks for there; it does not take a comm, so it is not the
+MPMD path.
+
+---
+
 # Python APIs
 
 ## Python Example Code

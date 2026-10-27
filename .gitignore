@@ -11,3 +11,4 @@ wheelhouse/
 OLD RUNS/
 SAMPLE RUNS/**/work/.parsl/
 profiler/
+/.spack-env

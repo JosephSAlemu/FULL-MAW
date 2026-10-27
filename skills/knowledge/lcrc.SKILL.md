@@ -103,19 +103,43 @@ For Parsl config, load the `systems/parsl` skill — the HPC PBS config (scaled 
 
 ---
 
-## Storage Paths
+## Paths
 
-| Path | Use for |
+| Alias | Resolves to |
 |---|---|
-| `/lcrc/project/<project>/` | Project repo, venv, results — persistent, backed up |
-| `/lcrc/globalscratch/<username>/` | Large intermediate output — shared, may be cleared during maintenance |
-| `/scratch` | 15 GB node-local scratch — cleared after job ends, never store venv here |
+| `/app/` | repo root on disk (`MAW_REPO_ROOT`) |
+| `/app/data/` | input data files (`MAW_DATA_DIR`) |
+| `/app/work/run0/` | working directory for all run output (`MAW_WORK_DIR`) |
 
-Store the project repo and venv under `/lcrc/project/`.
+The MCP server rewrites these prefixes when it writes or reads a file, so write
+`/app/`-rooted paths and never a machine-specific absolute path. Anything
+written outside the working directory is refused.
 
-**In task code and planner task lists, always use `/app/` paths** — the MCP server
-resolves them to the actual repo location automatically. Never write `/lcrc/project/`
-or any absolute cluster path in task instructions or Python code.
+---
+
+### The working directory
+
+**Every command runs from `/app/work/run0/`, and every file it writes goes
+there.** That directory is the one the run owns: the MCP server confines writes
+to it, and it is what gets archived as the run's output.
+
+This matters most for a program that writes its output **relative to the
+directory it was started in**. Such a program must be launched from
+`/app/work/run0/` — a reference or sample directory elsewhere on the filesystem
+is usually read-only, and the run stops with a permission error the moment the
+program tries to create its first output folder. Read inputs from wherever they
+live; write from `/app/work/run0/`.
+
+A `cd` in a command string should therefore be to `/app/work/run0/`, or to a
+subdirectory of it, and essentially never to a shared or reference tree. If a
+program needs a configuration or parameter file that lives elsewhere, pass it
+by absolute path rather than moving the working directory to reach it.
+
+On a shared filesystem this is not a style preference. A project directory you
+can read is often one you cannot write: `/lcrc/project/<project>/` holds shared
+reference and sample trees owned by other people, and a program launched from
+one of those will fail on its first write no matter how correct the rest of the
+command is.
 
 ---
 
@@ -156,6 +180,5 @@ Then activate it in your job script before launching MAW.
 ## Stack Rules
 
 - All Python packages installed via pip into the project venv
-- `mpi4py` is allowed and expected for Python-level MPI programs
 - MPI-capable executables (LAMMPS, etc.) must be built with MPI support enabled
 - Do not recommend conda, `module load anaconda3`, or conda-forge packages

@@ -6,8 +6,11 @@ preparing the local venv, then iteratively calls tools (exposed by the MCP serve
 submitting Python tasks, running shell commands, checking outputs, installing
 missing packages, and recovering from errors.
 
-The explorer doesn't know which workflow engine is behind the MCP server.
-It calls the same tools regardless of backend (Parsl, PyCOMPSs, ADIOS).
+The explorer calls the same tools whichever engine is behind the MCP server:
+it writes the files the run needs (the workflow itself plus any configuration
+that workflow reads), then asks the server to run the workflow. Which engine's
+constructs the workflow file has to be written in is the only thing that
+differs, and that comes from the engine reference in the system prompt.
 """
 
 import os
@@ -101,9 +104,25 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 _SKILLS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
-# common.consts is dependency-free literals, so importing it here can't create the
-# circular import that forced ENV_NOTES to be duplicated below.
-from common.consts import USE_CASE_SKILL_REDIRECTS
+# common.consts is dependency-free literals, so importing it here cannot create a
+# circular import. ENV_NOTES used to be duplicated in this file to dodge one that
+# no longer applies -- src/utility.py already reads it from here, and a second
+# copy drifting from the first is how condition A ends up describing a different
+# machine to different agents.
+from common.consts import USE_CASE_SKILL_REDIRECTS, ENV_NOTES
+
+# Prompts and text constants. Kept in their own module: they are the part that
+# gets edited most often, and this file is the loop that consumes them.
+from systemprompts.explorer import (
+    KNOWLEDGE_SKILLS,
+    ENGINE_EXEC_PROMPTS,
+    EXEC_PROMPT_HEAD,
+    ENGINE_SKILLS,
+    ENGINE_RELEVANT_TOOLS,
+    SCRATCH_DIRS,
+    EXPLORER_SYSTEM_PROMPT,
+    SKILL_REVIEW_SYSTEM_PROMPT,
+)
 
 
 def _redirect_skill(rel_path: str) -> str:
@@ -141,22 +160,6 @@ def _read_skill(rel_path: str, agent_name: str = "explorer", enabled: bool = Tru
     return ""
 
 
-def _peek_skill(rel_path: str, nchars: int = 500) -> str:
-    """Read only the first `nchars` of a skill file, for match probing.
-
-    Deliberately not _read_skill: this is a candidacy test over every entry in
-    a directory, and _read_skill both reads the whole file and logs a
-    skill_load trace event -- which would record skills as loaded that were
-    only ever sniffed and discarded.
-    """
-    full = os.path.join(_SKILLS_ROOT, _redirect_skill(rel_path) + ".SKILL.md")
-    try:
-        with open(full) as f:
-            return f.read(nchars)
-    except OSError:
-        return ""
-
-
 # set once per explorer run, lets the module-level load_skill tool see the
 # current condition even though it has no access to AgentState when the LLM calls it
 _current_condition: str = "B"
@@ -177,283 +180,188 @@ def set_condition(condition: str) -> None:
 # optionally append) edits to the right file rather than guessing.
 _loaded_skills: list[str] = []
 
-# Mirrors agent_mcp.ENV_NOTES. Duplicated rather than imported to avoid a circular
-# import (agent_mcp imports `explorer` from this module).
-ENV_NOTES = {
-    "local": (
-        "Environment: a single local machine, no job scheduler. No PBS/LSF, no multi-node "
-        "MPI. /app/ paths are resolved to the repo root at runtime."
-    ),
-    "hpc": (
-        "Environment: an HPC cluster, presumably inside a job allocation. /app/ paths are "
-        "resolved to the repo root at runtime; never hardcode cluster-specific absolute paths."
-    ),
-}
+@tool
+def write_file(path: str, content: str) -> str:
+    """Write a file the run needs: the workflow itself, or anything it reads.
+
+    Use this for EVERY file you generate. The workflow .py goes through here,
+    and so does every configuration file that workflow opens -- XML, JSON,
+    YAML, .params, input decks. Write the configuration first, then the
+    workflow that reads it, then call run_workflow.
+
+    A bare filename lands in the work directory. A relative path is relative to
+    it, so "config/params.json" works and the directory is created for you.
+    Writing outside the work directory is refused.
+
+    Python files are parsed before being written, so a syntax error is reported
+    instead of leaving a broken file on disk. Anything the engine would rather
+    you did differently comes back as `warnings` -- read them, they are about
+    whether the file actually uses the engine.
+
+    Args:
+        path: file to write, e.g. "workflow.py" or "config/project.xml"
+        content: full contents of the file
+    """
+    return _call_mcp_tool("write_file", {"path": path, "content": content})
 
 
 @tool
-def write_workflow(python_code: str, filename: str = "workflow.py") -> str:
-    """Write the single standalone Parsl workflow file that performs ALL the work.
+def run_workflow(filename: str = "workflow.py", args: Optional[list] = None,
+                 ranks: int = 0, timeout: int = 7200) -> str:
+    """Run the workflow file. This is the only tool that executes anything.
 
-    Parsl runs only what this file expresses. Write ONE file in which every unit
-    of work is a decorated function:
-      - `@bash_app`   -- ANY command-line/MPI invocation. The function body returns
-                         the command string; Parsl executes it. You never run it.
-      - `@python_app` -- pure Python work (analysis, plotting, writing files).
-
-    The file must build its own Parsl Config, call `parsl.load(config)`, invoke the
-    apps, resolve futures with `.result()`, and `parsl.clear()` at the end.
-
-    The server rejects the file if it has no apps, never calls parsl.load, imports
-    or calls subprocess/os.system/os.popen, or puts mpirun/srun outside a @bash_app.
+    Call it after write_file has put the workflow AND every file it reads in
+    place. The server builds this engine's launch command and runs it once.
 
     Args:
-        python_code: Full contents of the Parsl driver file
-        filename: Bare .py filename written under /app/work/run0 (default: workflow.py)
+        filename: workflow file under the work directory (default: workflow.py)
+        args: arguments passed to the workflow file itself
+        ranks: ranks to launch, for engines that launch ranks. 0 lets the
+               engine decide -- check get_resources before asking for more than
+               one, and never ask for ranks when in_pbs is false.
+        timeout: seconds before the run is killed (default: 7200)
     """
-    return _call_mcp_tool("write_workflow", {
-        "python_code": python_code, "filename": filename,
+    return _call_mcp_tool("run_workflow", {
+        "filename": filename,
+        "args": list(args or []),
+        "ranks": ranks,
+        "timeout": timeout,
     })
 
 
 @tool
-def run_workflow(filename: str = "workflow.py", timeout: int = 7200) -> str:
-    """Execute the Parsl workflow file previously created with write_workflow.
+def write_xml(kind: str, content: str) -> str:
+    """Write COMPSs's project.xml or resources.xml. PyCOMPSs runs only.
 
-    The server launches the file; the Parsl runtime inside it schedules every
-    @bash_app and @python_app step. Call this after write_workflow succeeds.
+    Both are required before run_workflow: they describe the machine COMPSs
+    will run on, and its runtime will not come up without them. Call
+    get_resources first so the hosts and slots you declare match the allocation
+    that actually exists.
 
     Args:
-        filename: Workflow filename under /app/work/run0 (default: workflow.py)
-        timeout: Max seconds to wait (default: 7200)
+        kind: "project" or "resources"
+        content: the full XML document
     """
-    return _call_mcp_tool("run_workflow", {"filename": filename, "timeout": timeout})
+    return _call_mcp_tool("write_xml", {"kind": kind, "content": content})
 
 
 @tool
-def get_task_status(task_id: str) -> str:
-    """Get the current status of a submitted task.
+def run_mpmd(blocks: list, filename: str = "workflow.py", timeout: int = 7200) -> str:
+    """Run the pipeline as ONE mpirun with a rank block per program. ADIOS runs only.
+
+    Use this instead of run_workflow when a compiled MPI binary and the Python
+    stages must be alive AT THE SAME TIME, so ADIOS2's SST engine can stream
+    between them live. run_workflow with `ranks` launches N copies of one
+    program; this launches several different programs as rank blocks of one
+    job, which is the only way an external binary can be one of the roles.
+
+    Each block is an object with `ranks` plus either `exe` (a program, with
+    optional `args`) or `stage` (the name of a stage function in the workflow
+    file, which is re-entered as `python workflow.py --stage <name>`). At least
+    two blocks, or nothing streams to anything.
+
+    The file is re-entered once per stage block, so it must read --stage and
+    dispatch to the named function, and must select the SST engine.
 
     Args:
-        task_id: The task ID returned by run_workflow
+        blocks: rank blocks in launch order, e.g.
+                [{"ranks": 8, "exe": "/path/sim", "args": ["in.params"]},
+                 {"ranks": 4, "stage": "analyze"}]
+        filename: workflow file the `stage` blocks re-enter (default: workflow.py)
+        timeout: seconds before the run is killed (default: 7200)
     """
-    return _call_mcp_tool("get_task_status", {"task_id": task_id})
+    return _call_mcp_tool("run_mpmd", {
+        "blocks": blocks, "filename": filename, "timeout": timeout,
+    })
 
 
 @tool
-def get_task_result(task_id: str) -> str:
-    """Get the full output (stdout/stderr) of a completed task.
+def get_status(run_id: str = "") -> str:
+    """Status of the workflow runs started by run_workflow.
+
+    With no argument, every run and its outcome. With a run_id, that run in
+    full, including the untruncated stdout and stderr -- which is where to look
+    when run_workflow's own output was cut short.
 
     Args:
-        task_id: The task ID returned by run_workflow
+        run_id: the run_id returned by run_workflow (default: all runs)
     """
-    return _call_mcp_tool("get_task_result", {"task_id": task_id})
-
-
-@tool
-def list_tasks() -> str:
-    """List all submitted tasks and their current status."""
-    return _call_mcp_tool("list_tasks", {})
+    return _call_mcp_tool("get_status", {"run_id": run_id})
 
 
 @tool
 def install_package(package: str) -> str:
-    """Install a pip package into the local venv.
+    """Install a pip package into the interpreter that runs workflows.
 
-    Use when a required package is missing (ModuleNotFoundError).
+    Pure-Python dependencies only. The engine itself, and anything with
+    compiled MPI bindings, comes from the environment this run was launched in
+    -- pip cannot fix those, so do not try more than once.
 
     Args:
-        package: Package name to install (e.g. "numpy", "ovito==3.10.0")
+        package: pip requirement, e.g. "numpy" or "matplotlib==3.9.0"
     """
     return _call_mcp_tool("install_package", {"package": package})
 
 
 @tool
 def check_package(package: str) -> str:
-    """Check if a Python package is installed in the local venv.
+    """Check whether a Python package can be imported.
+
+    Probed with the same interpreter that runs workflows, so the answer is
+    about the environment the workflow will actually see.
 
     Args:
-        package: Package name to check (e.g. "numpy", "lammps", "ovito")
+        package: import name, e.g. "numpy", "mpi4py", "adios2"
     """
     return _call_mcp_tool("check_package", {"package": package})
 
 
 @tool
-def list_files(directory: str = "/app/work/run0") -> str:
-    """List all files in a directory in the local environment.
+def list_files(directory: str = "", max_entries: int = 400) -> str:
+    """List the files under a directory. Default: the work directory.
 
-    Use this to verify that expected output files were created after a task.
+    Use it to confirm the outputs you expected actually exist.
 
     Args:
-        directory: Path to list (default: /app/work/run0)
+        directory: directory to list (default: the work directory)
+        max_entries: stop after this many files (default: 400)
     """
-    return _call_mcp_tool("list_files", {"directory": directory})
+    return _call_mcp_tool("list_files", {
+        "directory": directory, "max_entries": max_entries,
+    })
 
 
 @tool
-def read_file(path: str, max_lines: int = 100) -> str:
-    """Read the contents of a file in the local environment.
-
-    Use this to inspect output files, check results, or debug errors.
+def read_file(path: str, max_lines: int = 200, start_line: int = 1) -> str:
+    """Read a file back -- an output, a generated file, or a log.
 
     Args:
-        path: Absolute path of the file
-        max_lines: Maximum number of lines to return (default: 100)
+        path: path of the file
+        max_lines: how many lines to return (default: 200)
+        start_line: 1-based line to start at (default: 1)
     """
-    return _call_mcp_tool("read_file", {"path": path, "max_lines": max_lines})
+    return _call_mcp_tool("read_file", {
+        "path": path, "max_lines": max_lines, "start_line": start_line,
+    })
 
 
 @tool
 def get_resources() -> str:
-    """Detect available compute resources (nodes, ranks, launcher) for this run.
+    """Detect the compute resources available to this run.
 
-    Always call this FIRST, before writing any MPI command and before deciding
-    whether you're on a single local machine or inside a multi-node HPC allocation.
+    Always call this FIRST, before writing anything that asks for ranks and
+    before deciding whether you are on one machine or inside an allocation.
 
-    Returns JSON with in_pbs, nnodes, ntasks, cpus_per_task, nodelist, launcher.
-    If in_pbs is false, call load_skill("local"). If in_pbs is true, call
-    load_skill("hpc") to learn the launcher conventions and storage paths.
+    Returns JSON with in_pbs, nnodes, ntasks, ranks_per_node, nodelist, launcher,
+    the work and data directories, and facts specific to this engine. If in_pbs
+    is false, call load_skill("local"); if it is true, call load_skill("hpc").
     """
     return _call_mcp_tool("get_resources", {})
 
 
-
-_KNOWLEDGE_SKILLS = {
-    "local": "knowledge/local",
-    "hpc":   "knowledge/lcrc",
-}
-
-# Per-engine execution contract, appended to the system prompt. Every engine is
-# generated-file only and binds the same two execution tools; what differs is the
-# constructs the generated file must use, which is what this text supplies.
-_EXEC_PROMPT_HEAD = """\
-## How You Execute Work (generated file only)
-
-You have exactly two execution tools: `write_workflow` and `run_workflow`.
-These are the only execution tools. No tool takes a code string or a command
-string and runs it for you.
-
-1. `write_workflow(python_code=..., filename="workflow.py")` -- write ONE
-   standalone file containing EVERY step of the workflow.
-2. `run_workflow(filename="workflow.py")` -- the server executes that file.
-
-A simulation plus its visualization is ONE file with multiple steps in it, not
-two files and not two tool calls.
-
-If `write_workflow` rejects your file, read the `errors` list, fix the file, and
-call `write_workflow` again. Do not try to route around it with another tool.
-"""
-
-_ENGINE_EXEC_PROMPTS = {
-    "parsl": _EXEC_PROMPT_HEAD + """
-### What the file must contain (Parsl)
-
-Every unit of work is a decorated function:
-
-- `@bash_app` for ANY command-line work (simulation binaries, MPI runs, file
-  conversion). The function body returns the command **string**; Parsl runs it.
-  An 8-rank MPI run is a @bash_app returning `f"mpirun -n 8 {exe} {params}"`.
-- `@python_app` for pure Python work (analysis, plotting, writing summaries).
-
-The file must build its own Parsl `Config`, call `parsl.load(config)`, invoke the
-apps, wire them together with futures and `File` objects, and call
-`parsl.clear()` at the end.
-
-Rejected: `import subprocess`, `subprocess.run/Popen`, `os.system`, `os.popen`,
-and any `mpirun`/`srun`/`mpiexec` string outside a `@bash_app` body.
-""",
-
-    "pycompss": _EXEC_PROMPT_HEAD + """
-### What the file must contain (PyCOMPSs)
-
-Every unit of work is a decorated function:
-
-- `@task` for pure Python work.
-- `@binary(binary="...")` stacked ABOVE `@task` for a command-line program.
-  The body is `pass`. Arguments come from the function signature plus `@task`
-  parameter types (`FILE_IN`, `FILE_OUT`, `FILE_IN_STDIN`, `FILE_OUT_STDOUT`,
-  `Prefix`), or from an `args` string with `{{name}}` placeholders.
-- `@mpi(binary="...", runner="mpirun", processes=N)` stacked above `@task` for
-  an MPI program on N ranks. Body is `pass`. This is how rank count is
-  expressed -- you never type `mpirun` yourself.
-
-Dependencies come from passing values between tasks and from FILE_IN/FILE_OUT
-parameters; call `compss_wait_on()` only where the driver needs a real value.
-
-The runtime lifecycle depends on how this server launches the file, which
-`write_workflow` reports as `launch_mode`:
-- `runcompss`: the launcher owns the runtime -- do NOT call compss_start/stop.
-- `direct`: the file MUST call `compss_start()` first and `compss_stop()` last.
-
-Rejected: `subprocess` anywhere, `os.system`/`os.popen`, `@binary`/`@mpi`
-without `@task` beneath it, and `mpirun`/`srun` named outside an `@mpi`
-decorator.
-""",
-
-    "adios": _EXEC_PROMPT_HEAD + """
-### What the file must contain (ADIOS2)
-
-ADIOS2 is an I/O library, not a scheduler -- it has no task decorator. The file
-is a **staged pipeline**:
-
-- Each stage is a top-level function; a `main()` calls them in order.
-- Inter-stage numerical data MUST move through ADIOS2: the producing stage
-  writes with `stream.write(...)` on an `adios2.Stream(path, "w")`, and the
-  consuming stage reads it back with `stream.read(...)` from an
-  `adios2.Stream(path, "r")`. Write it and actually read it back -- do not keep
-  using the in-memory copy.
-- Human-facing outputs (PNG, summary text) stay plain files; BP is for the
-  numerical arrays flowing between stages.
-
-Because ADIOS2 cannot launch programs, a CLI step for an external compiled
-binary is a stage function that uses `subprocess` internally. That is allowed
-ONLY inside a stage body. Never subprocess another Python stage -- Python
-stages live in this same file and talk to each other through ADIOS2.
-
-For true in-situ streaming (producer and consumer running CONCURRENTLY rather
-than one after the other), declare a top-level `MPI_RANKS = <int>`. The server
-then launches the whole file under one `mpirun -n <MPI_RANKS>`, and the stages
-dispatch on MPI rank: split `MPI.COMM_WORLD` with `world.Split(color=role,
-key=rank)`, pass the split `comm` to `adios2.Adios(comm)` and
-`io.open(name, mode, comm)`, and use the SST engine. See the engine skill for
-a full example. Without `MPI_RANKS` the pipeline runs sequentially, which is
-fine when stages don't need to overlap.
-
-Rejected: `subprocess`/`os.system`/`os.popen` at module top level, no stage
-functions, no `main()` (serial mode), opening no ADIOS2 stream, never reading
-back what was written, or declaring `MPI_RANKS` without splitting COMM_WORLD
-and passing the split comm to ADIOS2.
-""",
-}
-
-
 def _engine_exec_prompt(engine: str) -> str:
     """Execution-contract text for this engine's generated workflow file."""
-    return _ENGINE_EXEC_PROMPTS.get(engine, _EXEC_PROMPT_HEAD)
-
-# engine-specific skills, force-loaded into the system prompt in _explorer_async
-# instead of leaving it to load_skill (systems/<engine>, knowledge/<ENGINE>)
-_ENGINE_SKILLS = {
-    "parsl":    ("systems/parsl",    "knowledge/PARSL"),
-    "pycompss": ("systems/pycompss", "knowledge/PyCOMPSs"),
-    "adios":    ("systems/adios",    "knowledge/ADIOS"),
-}
-
-_ENGINE_RELEVANT_TOOLS = (
-    "write_workflow", "run_workflow",
-)
-
-
-
-# Directories under work/ that hold the engine's own bookkeeping rather than
-# anything the run produced: Parsl's run_dir (interchange and block logs,
-# submit scripts), the multi-node Parsl scratch, and the per-launch stdout/
-# stderr temp files _run_bash_command creates. In the sample runs these are
-# the majority of the tree -- 90% of the files in the cosmology archive -- and
-# every one of them is walked, stat'd, written into the trace, schema-validated
-# and JSON-dumped on *each* explorer pass, then copied again by run_archiver.
-# They say nothing about whether the workflow produced its outputs.
-_SCRATCH_DIRS = {".parsl", "runinfo", "_task_scripts", "__pycache__", "_compss_config"}
+    return ENGINE_EXEC_PROMPTS.get(engine, EXEC_PROMPT_HEAD)
 
 
 def _walk_artifacts(root: str):
@@ -463,7 +371,7 @@ def _walk_artifacts(root: str):
     contents are never stat'd rather than merely filtered out afterwards.
     """
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SCRATCH_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in SCRATCH_DIRS]
         for fn in filenames:
             full = os.path.join(dirpath, fn)
             try:
@@ -478,7 +386,7 @@ _SKILL_NAME_RE = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
 def _dedupe_skills(contents: list[str]) -> list[str]:
     """Drop blank entries and any skill that is already in the list.
 
-    The two files named for an engine in _ENGINE_SKILLS are concatenated into
+    The two files named for an engine in ENGINE_SKILLS are concatenated into
     the explorer's system prompt verbatim, and that prompt is resent on every
     iteration of the ReAct loop -- so anything in there twice is paid for up to
     max_iterations times.
@@ -517,35 +425,37 @@ def _classify_engine_usage(engine: str, tool_name: str, tool_args: dict,
                             tool_result_text: str) -> tuple[Optional[str], Optional[bool]]:
     """Derive (engine_backend, engine_verified) for a tool call, for tracing.
 
-    engine_backend is the raw "engine" field self-reported by the MCP server (e.g.
-    "parsl-fallback", "adios2-unused"), when the tool's JSON result has one.
+    engine_backend is the engine the server reported handling the call. Every
+    server states it in the same `engine` field, so this needs no per-engine
+    cases: the server is authoritative about which engine ran, and there is no
+    longer any fallback path for it to disagree with.
 
-    All three engines use the same shape: the server is authoritative on whether
-    the engine was genuinely used, not just available. parsl/pycompss_server.py
-    report whether their runtime actually dispatched the workflow (vs. fallback);
-    adios_server.py's _adios_engine_state scans the generated file for a real
-    adios2 API call and reports "adios2-unused" when the package was available
-    but never actually called.
-
-    "-fallback" maps to None for adios (package unavailable isn't the explorer's
-    fault), but to False for parsl/pycompss, whose fallback always means a real
-    runtime-dispatch failure worth flagging. "adios2-n/a" also maps to None.
+    engine_verified answers a narrower question -- did the file look like it
+    used the engine at all. `write_file` returns `warnings` when it does not
+    (no Parsl app, no @task, no ADIOS2 stream), which is the one signal here
+    that a run can be structurally wrong while every tool call succeeds.
     """
-    if tool_name not in _ENGINE_RELEVANT_TOOLS:
+    if tool_name not in ENGINE_RELEVANT_TOOLS:
         return None, None
     try:
-        backend = json.loads(tool_result_text).get("engine")
+        parsed = json.loads(tool_result_text)
     except (json.JSONDecodeError, AttributeError, TypeError):
-        backend = None
+        return None, None
+    if not isinstance(parsed, dict):
+        return None, None
+
+    backend = parsed.get("engine")
     if backend is None:
         return None, None
-    if engine in ("parsl", "pycompss"):
-        return backend, not backend.endswith("-fallback")
-    if engine == "adios":
-        if backend in ("adios2-fallback", "adios2-n/a"):
-            return backend, None
-        return backend, backend != "adios2-unused"
-    return backend, None
+
+    if tool_name == "write_file" and parsed.get("status") == "written":
+        # Only .py files are checked, so no warnings key means either a clean
+        # workflow or a config file -- neither is evidence of a problem.
+        if "warnings" in parsed:
+            return backend, False
+        return backend, None
+
+    return backend, backend == engine
 
 
 @tool
@@ -559,213 +469,44 @@ def load_skill(name: str) -> str:
     Args:
         name: "local" or "hpc"
     """
-    if name not in _KNOWLEDGE_SKILLS:
+    if name not in KNOWLEDGE_SKILLS:
         return f"Unknown skill '{name}'. Use 'local' or 'hpc'."
     # B/C read the real skill file. A never touches it, gets the same lean
     # ENV_NOTES substitute the orchestrator/planner use in that condition
     enabled = _current_condition != "A"
-    content = _read_skill(_KNOWLEDGE_SKILLS[name], enabled=enabled)
+    content = _read_skill(KNOWLEDGE_SKILLS[name], enabled=enabled)
     return content or ENV_NOTES.get(name, ENV_NOTES["local"])
 
 
-# Inspection/environment tools. These never execute workflow work, they only
-# observe it or prepare the venv.
+# Everything every engine exposes. The servers all inherit these from one base
+# class, so this list is the same whichever engine is behind the session.
 _COMMON_TOOLS = [
-    get_task_status, get_task_result, list_tasks,
-    install_package, check_package,
-    list_files, read_file,
     get_resources, load_skill,
+    check_package, install_package,
+    list_files, read_file,
+    get_status,
+    write_file, run_workflow,
 ]
 
-# Execution tools. Every engine is generated-file only: the agent writes ONE
-# workflow file expressed in that engine's own constructs, then runs it. No
-# engine accepts a code or command string to execute, which is what used to let
-# work bypass the engine entirely.
-_EXEC_TOOLS = [write_workflow, run_workflow]
+# Tools that exist for one engine only, bound just for that engine so the model
+# is never offered a tool the server does not implement. PyCOMPSs needs its XML
+# topology written before the runtime can start; the other two need nothing.
+_ENGINE_ONLY_TOOLS = {
+    "pycompss": [write_xml],
+    "adios":    [run_mpmd],
+}
 
-EXPLORER_TOOLS = _COMMON_TOOLS + _EXEC_TOOLS
+EXPLORER_TOOLS = _COMMON_TOOLS
 
 
 def _tools_for_engine(engine: str) -> list:
-    return EXPLORER_TOOLS
+    """Tools to bind for this run: the common set plus this engine's own."""
+    return _COMMON_TOOLS + _ENGINE_ONLY_TOOLS.get(engine, [])
 
 
 # __ Explorer System Prompt ____________________________________________________
 
-EXPLORER_SYSTEM_PROMPT = """\
-You are the Explorer agent in a scientific workflow reproduction system. Your job is to
-execute a computational workflow step by step using tools provided by a workflow engine
-MCP server.
-
-You receive:
-- A list of tasks from the planner (what needs to be done)
-- Literature findings (scientific context from the paper)
-- Information about what software is installed in the venv
-
-Your goal: complete every task successfully by calling tools, observing results, and
-adapting your approach when things fail.
-
-## Available Tools
-
-The exact execution tools you have depend on this run's engine -- use the ones
-actually bound for you, listed in the engine reference section below. These are
-always available:
-
-| Tool | When to use |
-|---|---|
-| get_resources | **Call first.** Detects nodes/ranks/launcher (in_pbs true/false) |
-| load_skill | Load "local" or "hpc" environment knowledge -- pick ONE based on get_resources |
-| get_task_status | Check if a previously submitted task is done |
-| get_task_result | Get full stdout/stderr from a completed task |
-| list_tasks | See all tasks and their statuses |
-| install_package | Install a missing pip package |
-| check_package | Verify a package is installed |
-| list_files | Check what files exist in a directory |
-| read_file | Inspect file contents |
-
-## Workflow
-
-1. Call get_resources first. Then call load_skill("hpc") if in_pbs is true, or
-   load_skill("local") if it is false -- load only the one that matches.
-2. Review the tasks list and plan your execution order
-3. Before running anything, check prerequisites (files exist, packages installed)
-4. Express and run the work using this engine's execution tools (see below)
-5. After execution, verify output (list_files, read_file)
-6. If something fails, diagnose and fix (install package, change code, retry)
-
-## Rules
-
-- Always verify output after execution
-- Max 3 retries per task before giving up -- then MOVE ON to the next task
-- Do NOT spend more than 3 attempts debugging any single issue (e.g. Qt rendering, display errors)
-- If a visualization/rendering task fails due to display/Qt/GUI issues, SKIP it and move to the next task
-- When all executable tasks are done, STOP and provide your final summary -- do not keep retrying failed tasks
-- Report what you accomplished and what failed in your final message
-
-## You Never Execute Anything Yourself
-
-Whatever the engine, you do not run code or commands -- the workflow engine does.
-You never open a subprocess, never invoke a CLI directly, never write or run a
-bash/PBS script, and never call `mpirun`/`srun` yourself. Every command-line
-invocation must be expressed to the engine as a command *string* that the engine
-executes on your behalf.
-
-## Scientific Integrity Rules (CRITICAL)
-
-- Do NOT generate synthetic, fake, or hardcoded data to simulate results from the paper
-- Do NOT fabricate timing data, performance benchmarks, or scaling measurements
-- Do NOT reproduce scaling plots, strong/weak scaling curves, or performance comparisons
-  that require HPC infrastructure (MPI, multi-node, PBS) unavailable in the current environment
-- ALL visualizations MUST use data produced by your own simulation runs in this session,
-  not values copied from the paper or invented to look plausible
-- If a task requires infrastructure you do not have (MPI, multi-node cluster, specific
-  HPC hardware), SKIP it and explain why in your summary
-- If the paper shows benchmark results on 40-1280 processes but you are running on a
-  single machine, do NOT simulate those benchmarks -- skip them
-- You CAN measure and plot actual single-machine timing of your own pipeline stages
-  (e.g. how long particle generation, analysis, and visualization took on this run)
-
-## Data Layout (MANDATORY -- do not deviate)
-
-NOTE: /app/ paths are automatically resolved to the local repo directory at runtime.
-You do not need an actual /app/ folder. Always use /app/ paths in your code --
-the MCP server translates them to the correct local paths.
-
-- Input data: /app/data/ (source files)
-- Working directory: /app/work/run0/ (ALL output goes here)
-- ALL output files, subdirectories, scripts, and results MUST be placed under /app/work/run0/
-- Use consistent subdirectory names:
-  - /app/work/run0/frames/       for simulation trajectory/frame output
-  - /app/work/run0/renders/      for visualization images and GIFs
-  - /app/work/run0/results.csv   for tabular analysis results
-  - /app/work/run0/workflow.py   for generated workflow scripts
-  - /app/work/run0/run_workflow.sh for launcher scripts
-- Do NOT create output directories with arbitrary names (no "output/", "decaf_workflow_output/", 
-  "smoketest/", etc.)
-- Do NOT write files to /tmp/ -- always use /app/work/run0/
-"""
-
-
 # __ Post-Run Skill Review _____________________________________________________
-
-SKILL_REVIEW_SYSTEM_PROMPT = """\
-You are the Explorer agent, reviewing the run you just finished. The user has told you
-the workflow did NOT execute properly. Your job is to work out the root cause from what
-you actually observed, and write what should be added to the domain skill file so the
-same problem does not happen on the next run.
-
-You are NOT fixing anything now and NOT re-running anything. You are writing durable
-guidance for future runs.
-
----
-
-## What a skill file is
-
-A skill file is domain knowledge written for a scientist. It is not source code, and it
-is not a description of how this system is built internally. It tells a future run what
-tool to use, where the files are, what comes out, what goes wrong, and what the rules of
-the domain are.
-
-The domain skill file has these sections. Each has a strict purpose -- put your addition
-in the section it belongs to and nowhere else:
-
-| Section | What belongs in it | What does NOT belong in it |
-|---|---|---|
-| `Tools` | The name of the tool that gets run, where it lives on disk, whether it is already installed. | Pitfalls, output names, domain rules. |
-| `Input Parameters` | Which files hold the settings, where they live, which values are fixed and must not be invented, which input paths to use. | Descriptions of what the run produces, or of what went wrong. |
-| `Outputs` | Names, paths, formats, and plain-language descriptions of the files the run produces. | Anything about workflow type, orchestration, which stage failed, or what the tool is. |
-| `Pitfalls` | Things that tend to go wrong, in plain English, paired with what to do instead. | Source code, stack traces, function names, internal module names. |
-| `Guidelines` | Rules of the domain: what must never be rebuilt or reimplemented, what is closed-source or pre-built, what must not be edited, what must not be re-run, required conventions. | Step-by-step procedure, or anything belonging to another section. |
-
----
-
-## Hard constraints on what you may write
-
-1. **No code.** No source code, snippets, or pseudocode. No function names, class names,
-   module or package import names, API signatures, command lines, flags, environment
-   variable names, or configuration keys.
-2. **No internal system details.** Nothing about agents, routing, orchestration, tool
-   calls, MCP, servers, state fields, or retries. The skill file describes the
-   scientific workflow, not the machinery running it.
-3. **Allowed technical content is exactly three things:**
-   - **Paths** -- where tools live, where inputs live, where outputs are written.
-   - **Inputs** -- which input files exist, what kind of file each is, what each holds.
-   - **Outputs** -- which output files are produced, what format each is, what each contains.
-4. **Errors are described in English, not pasted.** Say what the failure looks like to a
-   person ("the output folder is empty after the run", "the counts come out roughly ten
-   times too low"), never the literal error text, exit code, exception type, or traceback.
-5. **Prefer an existing section.** Only propose a new section when the guidance genuinely
-   fits none of the five. A new section is subject to every constraint above: it may not
-   be about code, software engineering, or computer science beyond paths, inputs, and
-   outputs.
-
----
-
-## How to choose what to recommend
-
-- Anchor on the root cause, not the symptom. If the visible failure was a missing output
-  file but the real cause was a stage that ran in the wrong place, write about the cause.
-- Write guidance that generalizes to a different paper in the same domain.
-- Do not restate guidance the skill file already contains. If it already warns about this
-  and the run ignored it, say so in your rationale and sharpen the existing wording.
-- Keep each addition short and concrete: one or two sentences for a guideline, one table
-  row for a pitfall, one bullet for an output.
-- Match the formatting the target section already uses. If the section is a pitfalls
-  table, your addition must be a table row. If it is a bullet list, a bullet.
-- You ran this workflow yourself. Prefer what you actually observed over speculation.
-
----
-
-Return ONLY a valid JSON object with exactly these keys:
-- root_cause:      str -- plain-language analysis of what actually went wrong
-- recommendations: list of objects, each with exactly these keys:
-    - skill_file:     str -- skill path to edit, e.g. "use_cases/<name>/domain"
-    - section:        str -- the exact section heading the addition goes under, without the leading '#'
-    - is_new_section: bool -- true only if this section does not already exist in that file
-    - addition:       str -- the exact markdown text to add, formatted to match the section
-    - rationale:      str -- why this addition prevents a repeat of the issue
-"""
-
 
 def _ask(prompt: str) -> str:
     """Prompt the human on stdin. Blocking -- callers run it off the event loop."""
@@ -786,6 +527,57 @@ async def _ask_yes_no(prompt: str) -> bool:
         if answer in ("n", "no"):
             return False
         console.print("[yellow]Please answer 'yes' or 'no'.[/yellow]")
+
+
+def _work_dir() -> str:
+    """The directory this run actually writes to.
+
+    MAW_WORK_DIR is what mcp_explorer exports to the server, what the server
+    confines every write to, and what make_worker_init exports on the
+    Explorer's compute node -- so it is the only authority on where the outputs
+    are. This used to be `<repo>/work`, derived from __file__, which was the
+    parent of the real work directory and ignored the variable entirely: point
+    MAW_WORK_DIR anywhere else, or rotate run0 aside with MAW_ROTATE_RUN0, and
+    the artifact manifest and the run digest both walked a directory the run
+    had never touched -- reporting no files produced for a run that produced
+    plenty.
+    """
+    repo_root = os.environ.get(
+        "MAW_REPO_ROOT", os.path.dirname(os.path.abspath(__file__))
+    )
+    return os.environ.get(
+        "MAW_WORK_DIR", os.path.join(repo_root, "work", "run0")
+    )
+
+
+def _runs_dir() -> str:
+    """Where run logs and the recommendations file live."""
+    repo_root = os.environ.get(
+        "MAW_REPO_ROOT", os.path.dirname(os.path.abspath(__file__))
+    )
+    return os.path.join(repo_root, "runs")
+
+
+def _domain_skill(domain: str, agent: str = "explorer") -> str:
+    """Skill path for a domain: the single domain file, else the legacy per-agent one.
+
+    `domain` is a folder name under skills/use_cases/, validated against the
+    folders on disk by academy_agents before the run starts.
+
+    A domain is one file now -- use_cases/<name>/domain.SKILL.md, carrying the
+    Tools / Input Parameters / Outputs / Pitfalls / Guidelines sections that the
+    post-run review writes against. The older directories still hold a file per
+    agent (explorer/planner/installer/orchestrator), so those are the fallback.
+
+    Checking for the file rather than consulting a redirect table is what makes
+    a new domain work by being dropped in: USE_CASE_SKILL_REDIRECTS had to name
+    every consolidated domain explicitly, so a new one silently loaded nothing
+    until someone remembered to add it.
+    """
+    domain_path = os.path.join(_SKILLS_ROOT, "use_cases", domain, "domain.SKILL.md")
+    if os.path.isfile(domain_path):
+        return f"use_cases/{domain}/domain"
+    return f"use_cases/{domain}/{agent}"
 
 
 def _domain_skill_candidates() -> list[str]:
@@ -810,7 +602,9 @@ def _build_run_digest(state: dict, exploration_log: list, final_summary: str,
     lines = [
         f"Goal: {state.get('goal', '')}",
         f"Engine: {state.get('engine', '')} | Env: {state.get('env', '')} | "
-        f"Domain: {state.get('domain', '') or '(unset)'}",
+        # The folder under skills/use_cases that this run loaded, which is also
+        # what the review is asked to target: "use_cases/<domain>/domain".
+        f"Domain: {state.get('domain', '') or '(none)'}",
         f"Input data files: {', '.join(state.get('selected_data_files', [])) or '(none)'}",
         "",
     ]
@@ -843,11 +637,13 @@ def _build_run_digest(state: dict, exploration_log: list, final_summary: str,
 
     # Record what actually landed on disk -- "the file is missing" is usually the
     # single most diagnostic fact available, and the log alone does not show it.
-    work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work")
+    work_dir = _work_dir()
     if os.path.isdir(work_dir):
         produced = [f"  {full} ({size} bytes)" for full, size in _walk_artifacts(work_dir)]
-        lines += ["", f"Files present under work/ after the run ({len(produced)}):"]
+        lines += ["", f"Files present under {work_dir} after the run ({len(produced)}):"]
         lines += produced[:200]
+    else:
+        lines += ["", f"The work directory does not exist: {work_dir}"]
 
     digest = "\n".join(lines)
     if len(digest) > max_chars:
@@ -864,7 +660,18 @@ def _append_to_skill(rel_path: str, section: str, addition: str, is_new_section:
     than at the bottom of the file. Creates the section at the end when it is new.
     Returns a status string describing what happened.
     """
-    full = os.path.join(_SKILLS_ROOT, _redirect_skill(rel_path) + ".SKILL.md")
+    # `rel_path` is model output, and this is the only function in the project
+    # that writes into skills/. Confine it the same way the servers confine
+    # write_file: a "../.." in that field would otherwise land outside the
+    # skills tree. The user does see the path before approving, so this is a
+    # backstop rather than the only check -- but it is a cheap one.
+    full = os.path.normpath(
+        os.path.join(_SKILLS_ROOT, _redirect_skill(rel_path) + ".SKILL.md")
+    )
+    root = os.path.normpath(_SKILLS_ROOT)
+    if not full.startswith(root + os.sep):
+        return f"SKIPPED (path escapes the skills directory: {rel_path!r})"
+
     if not os.path.isfile(full):
         return f"SKIPPED (no such skill file: {full})"
 
@@ -1087,7 +894,7 @@ def _write_recommendations_file(state: dict, root_cause: str, recs: list,
     """Save the review next to the run log so it survives the terminal session."""
     run_log = state.get("run_log") or ""
     if not run_log:
-        runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+        runs_dir = _runs_dir()
         run_id = getattr(tracer.run_metadata, "run_id", "") if tracer.run_metadata else ""
         if not run_id:
             return
@@ -1180,14 +987,30 @@ async def _explorer_async(state: dict, engine: str) -> dict:
     if not server_path or not os.path.isfile(server_path):
         raise FileNotFoundError(f"Server not found for engine '{engine}': {server_path}")
 
+    # The server reads where everything lives from the environment and resolves
+    # nothing itself, so whatever is exported here is what it will use. The
+    # setup script run before launch is expected to have set these; the
+    # fallbacks only cover MAW_REPO_ROOT, which is derivable from this file's
+    # own location and is what the other two default from.
+    #
+    # The old HOST_REPO_PATH that used to be set here was read by nothing --
+    # the servers looked for REPO_ROOT -- so the repo root never actually
+    # crossed this boundary and each server silently fell back to its own
+    # __file__. That worked only because the servers live inside the repo.
+    repo_root = os.environ.get(
+        "MAW_REPO_ROOT", os.path.dirname(os.path.abspath(__file__))
+    )
     server_params = StdioServerParameters(
         command=sys.executable,
         args=[server_path],
         env={
             **os.environ,
-            "HOST_REPO_PATH": os.environ.get(
-                "HOST_REPO_PATH",
-                os.path.dirname(os.path.abspath(__file__)),
+            "MAW_REPO_ROOT": repo_root,
+            "MAW_WORK_DIR": os.environ.get(
+                "MAW_WORK_DIR", os.path.join(repo_root, "work", "run0")
+            ),
+            "MAW_DATA_DIR": os.environ.get(
+                "MAW_DATA_DIR", os.path.join(repo_root, "data")
             ),
         },
     )
@@ -1227,78 +1050,62 @@ async def _explorer_async(state: dict, engine: str) -> dict:
             context_parts.append("Tasks to execute:\n" +
                                  "\n".join(f"  {i+1}. {t}" for i, t in enumerate(tasks)))
         if state.get("mpi_slots"):
-            # get_resources reports nnodes INCLUDING the allocation's spare
-            # node, so an mpiexec sized from the environment alone would
-            # claim one more node than it should.
+            # The allocation is exactly this shape, so get_resources agrees
+            # with it: nnodes, ntasks and ranks_per_node are the same numbers.
+            # Stated here anyway because the rank LAYOUT matters and not just
+            # the total -- 1x8 and 2x4 are both 8 ranks and need different
+            # `--map-by ppr:N:node` values.
             context_parts.append(
                 f"MPI capacity: {state['mpi_nodes']} nodes x "
-                f"{state['mpi_cpus_per_node']} cores = {state['mpi_slots']} "
-                f"slots. Size mpiexec to this, not to what get_resources "
-                f"reports -- the allocation holds one extra spare node."
+                f"{state['mpi_ranks_per_node']} ranks per node = "
+                f"{state['mpi_slots']} ranks total. get_resources reports the "
+                f"same shape. Launch with "
+                f"`-np {state['mpi_slots']} --map-by "
+                f"ppr:{state['mpi_ranks_per_node']}:node` -- the ranks-per-node "
+                f"in that layout must equal the allocation's mpiprocs, or the "
+                f"launch fails with 'not enough slots available'."
             )
 
         # condition A never touches skills/ at all, not even to list use_cases/,
         # so the whole auto-detection block below just gets skipped
         _enabled = state.get("condition", "B") != "A"
         _base_skill = _read_skill("agents/explorer", enabled=_enabled)
+
+        # The domain is chosen on the command line (--domain) and validated
+        # against the folders under skills/use_cases/ before the run starts, so
+        # here it is just read. Nothing is matched, guessed or scanned for.
+        #
+        # What used to be here: the --domain label substring-matched against
+        # every folder name in both directions, and failing that, each
+        # candidate skill's first 500 characters sniffed for a package name
+        # from the installer's stack decision. Either could pick the wrong
+        # folder, and when they picked none the run carried on with no domain
+        # knowledge and reported nothing -- which is the same observable
+        # behaviour as a domain skill that simply has little to say.
         _uc_skill = ""
-        if _enabled:
-            _uc_dir = os.path.join(_SKILLS_ROOT, "use_cases")
-            _domain_lower = (state.get("domain") or "").strip().lower()
-
-            # prefer the explicit --domain flag over guessing. substring match both
-            # ways since domain labels don't always match the folder name exactly
-            # (--domain MOLECULAR vs the use_cases/molecular_nucleation/ folder)
-            if _domain_lower and os.path.isdir(_uc_dir):
-                # Exact folder-name match first, then substring matches. Two
-                # things made the old plain os.listdir() loop unreliable:
-                # os.listdir order is arbitrary, and the substring test matches
-                # both ways -- so "molecular_nucleation" matches the folder
-                # new_molecular_nucleation, which has only domain.SKILL.md and
-                # no explorer.SKILL.md. Reading that returned "" and the
-                # unconditional `break` then ended the search, leaving the run
-                # with no domain skill at all, depending purely on listdir
-                # order. Sorting exact-first makes the choice deterministic,
-                # and only breaking once something was actually read means a
-                # near-miss no longer shadows the real match.
-                _names = sorted(os.listdir(_uc_dir),
-                                key=lambda n: (n.lower() != _domain_lower, n.lower()))
-                for uc_name in _names:
-                    uc_lower = uc_name.lower()
-                    if _domain_lower in uc_lower or uc_lower in _domain_lower:
-                        content = _read_skill(f"use_cases/{uc_name}/explorer")
-                        if content:
-                            _uc_skill = content
-                            console.print(f"[dim cyan][explorer] loaded use case skill via --domain: {uc_name}[/dim cyan]")
-                            break
-
-            # fallback if --domain wasn't passed or didn't match: scan every
-            # use_cases/*/explorer.SKILL.md and match on stack_decision package names.
-            # shaky heuristic, package names rarely show up in a skill's own description
-            if not _uc_skill:
-                _stack_lower = [p.lower() for p in stack_decision]
-                if os.path.isdir(_uc_dir):
-                    for uc_name in os.listdir(_uc_dir):
-                        # Probe the header only. The match is decided on the
-                        # first 500 characters, but _read_skill reads whole
-                        # files -- across the use_cases/ tree that is ~39KB
-                        # pulled off disk to look at ~1.5KB of it, and the
-                        # discarded reads also land in the trace as skill_load
-                        # events for skills that were never used. The full read
-                        # happens once, below, for the one that actually matched.
-                        desc_lower = _peek_skill(f"use_cases/{uc_name}/explorer").lower()
-                        if not desc_lower:
-                            continue
-                        if any(pkg in desc_lower for pkg in _stack_lower):
-                            _uc_skill = _read_skill(f"use_cases/{uc_name}/explorer")
-                            console.print(f"[dim cyan][explorer] loaded use case skill via stack match: {uc_name}[/dim cyan]")
-                            break
+        _domain = (state.get("domain") or "").strip()
+        if _enabled and _domain:
+            _uc_path = _domain_skill(_domain)
+            _uc_skill = _read_skill(_uc_path)
+            if _uc_skill:
+                console.print(f"[dim cyan][explorer] domain skill: {_uc_path}[/dim cyan]")
+            else:
+                # Say so. The run can continue without domain knowledge, but
+                # silently is how this went unnoticed before.
+                console.print(
+                    f"[bold yellow][explorer] domain '{_domain}' has no readable "
+                    f"skill file (looked for {_uc_path}.SKILL.md) -- continuing "
+                    f"without domain knowledge[/bold yellow]"
+                )
+        elif _enabled:
+            console.print("[dim yellow][explorer] no --domain given -- running "
+                          "without a domain skill[/dim yellow]")
 
         # force-load the engine skills instead of leaving it to the model to call
         # load_skill("adios"), that's exactly how you get imports with no real API use.
         # systems/<engine> loads before knowledge/<ENGINE> so the operational rules
         # land before the long general reference
-        _sys_skill_path, _know_skill_path = _ENGINE_SKILLS.get(engine, (None, None))
+        _sys_skill_path, _know_skill_path = ENGINE_SKILLS.get(engine, (None, None))
         _engine_skill = ""
         if _sys_skill_path:
             _engine_skill = "\n\n".join(_dedupe_skills([
@@ -1422,9 +1229,11 @@ async def _explorer_async(state: dict, engine: str) -> dict:
 
                 console.print(f"[dim cyan][explorer] calling tool: {tool_name}({json.dumps(tool_args, indent=2)[:200]})[/dim cyan]")
 
-                if tool_name == "run_workflow":
+                if tool_name in ("run_workflow", "run_mpmd"):
+                    _ranks = tool_args.get("ranks", 0)
                     console.print(Panel(
-                        f"file={tool_args.get('filename', 'workflow.py')}",
+                        f"file={tool_args.get('filename', 'workflow.py')}"
+                        + (f"  ranks={_ranks}" if _ranks else ""),
                         title=f"[bold yellow]Running {engine} workflow[/bold yellow]",
                         border_style="yellow",
                     ))
@@ -1477,13 +1286,15 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                 except Exception as e:
                     tool_result = json.dumps({"error": str(e)})
 
-                # Determine success/failure from the result
+                # Determine success/failure from the result.
+                #
+                # Every server now returns the same shapes, because they all
+                # inherit these tools from one base class -- so this no longer
+                # has to guess at per-engine response formats.
                 tool_succeeded = False
                 display_status = "?"
                 try:
                     parsed = json.loads(tool_result)
-                    # counts as success: status completed/success, exit_code 0, installed True,
-                    # or a files/content key present. no error key either way
                     status_val = parsed.get("status")
                     exit_code = parsed.get("exit_code")
                     has_error = "error" in parsed
@@ -1492,35 +1303,31 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                         tool_succeeded = False
                         display_status = f"failed (exit {exit_code})"
                     elif status_val == "rejected":
-                        # write_workflow's validation refusal. Previously fell
-                        # through to "unknown response", which scored it as a
-                        # failure for the right reason by pure accident and gave
-                        # the orchestrator no way to tell a malformed file apart
-                        # from a broken tool.
+                        # write_file refused to commit the file -- a syntax
+                        # error, or a path outside the work directory. Scored
+                        # as a failure so the orchestrator can tell a malformed
+                        # file apart from a broken tool.
                         tool_succeeded = False
-                        display_status = "rejected (validation)"
+                        display_status = "rejected"
                     elif has_error:
                         tool_succeeded = False
                         display_status = f"error: {parsed['error'][:80]}"
                     elif status_val in ("completed", "success", "written", "cleaned up"):
-                        # "written" is what write_workflow returns on success.
-                        # It was in none of the accepted sets, so every
-                        # successful write_workflow fell through every branch to
-                        # the "unknown shape -> call it a failure" default and
-                        # was recorded as a FAILED tool call -- in the console,
-                        # in exploration_log, and in the trace. The orchestrator
-                        # reads that log to decide whether to re-route to the
-                        # explorer, so a clean run looked partly broken to it,
-                        # and the trace's success counts were wrong for every
-                        # run this project has ever done.
+                        # "written" is what write_file and write_xml return on
+                        # success, "completed" what a run_workflow that exited 0
+                        # returns. Both are successes; a file written with
+                        # warnings is still written, and the warnings are
+                        # surfaced separately below.
                         tool_succeeded = True
                         display_status = status_val
+                        if parsed.get("warnings"):
+                            display_status += f" ({len(parsed['warnings'])} warning(s))"
                     elif exit_code == 0:
                         tool_succeeded = True
                         display_status = "exit_code: 0"
                     elif parsed.get("installed") is True:
                         tool_succeeded = True
-                        display_status = "installed"
+                        display_status = f"installed v{parsed.get('version', '?')}"
                     elif parsed.get("installed") is False:
                         tool_succeeded = True  # query succeeded, package just isn't there
                         display_status = "not installed"
@@ -1530,17 +1337,19 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                     elif "content" in parsed:
                         tool_succeeded = True
                         display_status = f"{parsed.get('total_lines', '?')} lines"
-                    elif "version" in parsed:
+                    elif "runs" in parsed:
+                        # get_status with no run_id. An empty list is a valid
+                        # answer -- nothing has been run yet.
                         tool_succeeded = True
-                        display_status = f"v{parsed['version']}"
-                    elif "tasks" in parsed:
-                        tool_succeeded = True
-                        display_status = f"{parsed.get('total', '?')} tasks"
+                        display_status = f"{parsed.get('total', 0)} run(s)"
                     elif "nnodes" in parsed:
-                        # get_resources has no status field, nnodes present just means it worked
+                        # get_resources has no status field; nnodes being
+                        # present is what says it worked.
                         tool_succeeded = True
                         launcher = parsed.get("launcher") or "none"
-                        display_status = f"nodes={parsed['nnodes']} ranks={parsed.get('ntasks',1)} launcher={launcher}"
+                        display_status = (f"nodes={parsed['nnodes']} "
+                                          f"ranks={parsed.get('ntasks', 1)} "
+                                          f"launcher={launcher}")
                     else:
                         # unknown shape, call it a failure so nothing gets silently swallowed
                         tool_succeeded = False
@@ -1577,24 +1386,25 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                         console.print(f"[dim {color}][explorer]   $ {_launch_cmd}[/dim {color}]")
                 except (json.JSONDecodeError, AttributeError):
                     pass
-                if tool_name == "write_workflow":
-                    # surface the apps/tasks/stages the server actually found, so a
-                    # structurally-wrong file is visible before it ever runs
+                if tool_name in ("write_file", "write_xml"):
+                    # Print the server's warnings in full. They say whether the
+                    # file looks like it uses the engine at all -- no Parsl app,
+                    # no @task, no ADIOS2 stream -- so a structurally-wrong
+                    # workflow is visible here rather than after a run that
+                    # exits 0 having done nothing with the engine.
                     try:
                         r = json.loads(tool_result)
-                        _shape = {k: v for k, v in r.items() if k in (
-                            "bash_apps", "python_apps", "tasks", "binary_tasks",
-                            "mpi_tasks", "stages", "adios_writes", "adios_reads",
-                            "launch_mode")}
-                        if _shape:
-                            console.print(f"[dim {color}][explorer]   {json.dumps(_shape)}[/dim {color}]")
+                        for _warning in r.get("warnings", []):
+                            console.print(f"[yellow][explorer]   warning: {_warning}[/yellow]")
+                        for _problem in r.get("errors", []):
+                            console.print(f"[red][explorer]   {_problem}[/red]")
                     except (json.JSONDecodeError, AttributeError):
                         pass
                 if engine_verified is False:
                     console.print(
-                        f"[bold red][explorer] WARNING: did not exercise the real "
-                        f"{engine} API in '{tool_args.get('name', tool_name)}' "
-                        f"(engine_backend={engine_backend})[/bold red]"
+                        f"[bold red][explorer] WARNING: the file written by "
+                        f"'{tool_name}' does not look like it uses the real "
+                        f"{engine} API (engine_backend={engine_backend})[/bold red]"
                     )
 
                 # log the full result to trace, not truncated, need it for debugging failed runs
@@ -1642,7 +1452,7 @@ async def _explorer_async(state: dict, engine: str) -> dict:
 
         # record what actually got produced, so scoring can read straight from the
         # trace instead of re-deriving it from tool-call text
-        work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work")
+        work_dir = _work_dir()
         artifacts = []
         if os.path.isdir(work_dir):
             artifacts = [{"path": full, "size_bytes": size}
