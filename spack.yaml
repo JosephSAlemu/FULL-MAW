@@ -1,7 +1,6 @@
 spack:
   specs:
   - boost
-  - openmpi@4.1.6
   - openjdk@21
   - python@3.12
   - graphviz
@@ -13,9 +12,7 @@ spack:
   - pkgconf
   - libxml2
   - papi
-  - adios2 +mpi +python +sst ~hdf5
 
-  # Flexible concretization to prevent strict puzzle locks
   concretizer:
     unify: when_possible
 
@@ -37,27 +34,28 @@ spack:
             cxx: /usr/bin/g++
             fortran: /usr/bin/gfortran
 
-    all:
+    c:
       require:
-      - "%gcc@13.2.0"
-      providers:
-        mpi: [openmpi]
+      - gcc@13.2.0
+    cxx:
+      require:
+      - gcc@13.2.0
+    fortran:
+      require:
+      - gcc@13.2.0
 
     openjdk:
       buildable: true
+      require: "@21.0.0_35"
       externals:
       - spec: openjdk@21.0.0_35
         prefix: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-zen3/gcc-12.3.0/openjdk-21.0.0_35-23zksi2
 
     openmpi:
-      # buildable: false so a typo in the prefix below fails loudly at
-      # concretization instead of silently triggering a from-source OpenMPI
-      # build that would then not match hacc_tpm's ABI.
       buildable: false
-      externals:
-      # The prefix the HACC envfile exports as MPI_HOME. Verified present on a
-      # compute node:
-      #   ls .../openmpi-4.1.6-knzkvb2/bin/mpirun   -> exists
-      #   mpiexec --version                          -> mpiexec (OpenRTE) 4.1.6
-      - spec: openmpi@4.1.6%gcc@13.2.0
-        prefix: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-zen3/gcc-13.2.0/openmpi-4.1.6-knzkvb2
+    mpich:
+      buildable: false
+    intel-oneapi-mpi:
+      buildable: false
+    mvapich2:
+      buildable: false

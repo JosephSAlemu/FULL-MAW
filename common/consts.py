@@ -119,9 +119,24 @@ ENV_NOTES = {
 
 # __ PBS Pro constants __________________________________________________________
 
-# Modules the workers load before activating the venv, passed verbatim to
-# `module load`. Site-specific: these names are Improv's.
-HPC_MODULES = "gcc/13.2.0 openmpi/4.1.7"
+# Modules the Explorer's worker loads before activating the venv, passed
+# verbatim to `module load`. EMPTY BY DESIGN -- the load line is skipped
+# entirely when this is blank.
+#
+# It used to be "gcc/13.2.0 openmpi/4.1.7", which was wrong twice over.
+# openmpi/4.1.7 is not a module on this machine (4.1.6 and 5.0.6 are), and a
+# `module load` of a name that does not exist prints an error and carries on,
+# so the worker silently got neither module. More importantly, loading an MPI
+# here contradicts how MPI is now provided: a task loads the module its own
+# tool needs, inside its own command string, and a module already loaded in
+# the worker would be inherited by every task including the ones that want a
+# different one -- or none at all.
+#
+# The worker itself compiles nothing and launches nothing directly: it runs
+# the MCP server, which runs the generated workflow file, whose tasks load
+# what they need. If a future engine genuinely needs a module in the worker
+# environment, name it here -- but not an MPI.
+HPC_MODULES = ""
 
 # Removed: DEFAULT_NCPUS. It reserved cores for a Planner/Installer placement
 # mode that no longer exists -- both run in the launching process, on the login
@@ -139,8 +154,11 @@ HPC_MODULES = "gcc/13.2.0 openmpi/4.1.7"
 DEFAULT_WALLTIME = "01:00:00"
 
 # Cores per compute node on this machine. Reference only -- nothing imports it,
-# and nothing should size an allocation from it. The Explorer's block requests
-# `select=<nodes>:mpiprocs=<ranks>` with no ncpus, so PBS applies its own
-# per-chunk default and rank placement is decided by mpiprocs alone. This number
-# is here to answer "how much is on a node", not to be passed to anything.
+# and nothing should size an allocation from it. This number is here to answer
+# "how much is on a node", not to be passed to anything.
+#
+# (This comment used to claim the block requests no ncpus. It does: make_config
+# passes cpus_per_node=<ranks>, which the provider renders as ncpus. Two other
+# places said the same wrong thing and have been corrected -- if you change the
+# provider call, change all three.)
 CORES_PER_NODE = 128

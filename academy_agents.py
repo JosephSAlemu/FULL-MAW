@@ -11,7 +11,8 @@ Pipeline:
 Environments
 ------------
 Every --env is started the same way, with the Python CLI. On LCRC, source
-setup_hpc.sh first; it sets the Intel MPI library paths and VENV_PYTHON.
+setup_hpc.sh first; it sets MAW_PYTHON and the non-MPI library paths. It
+configures no MPI: a task loads the module its own tool needs.
 
     --env local       every agent in this process's event loop, on this
                       machine.
@@ -21,9 +22,9 @@ setup_hpc.sh first; it sets the Intel MPI library paths and VENV_PYTHON.
                       run this on its compute node. Nothing is submitted.
 
     --env multi-node  Orchestrator, Planner and Installer in this process;
-                      the Explorer on the head node of a (nodes + 1)-node PBS
-                      job this script submits. That node's worker_init
-                      sources the same setup_hpc.sh.
+                      the Explorer on the first node of a <nodes>-node PBS job
+                      this script submits. That node's worker_init sources the
+                      same setup_hpc.sh.
 
 All output appears in the terminal you ran this from, in every mode. Under
 local and hpc the Explorer prints there directly. Under multi-node it is in
@@ -50,14 +51,15 @@ submits to.
 
 What the multi-node block asks PBS for
 --------------------------------------
-`select=<nodes+1>:ncpus=<ranks>:mpiprocs=<ranks>`. Both come from the one
---ranks value: mpiprocs puts one line per rank slot in $PBS_NODEFILE, and
-ncpus reserves a core for each of those slots. Neither can be left at its
-default of 1 -- that gives 1 nodefile line per node, or 1 core per node
-however many slots the nodefile advertises. They are passed through
-different PBSProProvider parameters (cpus_per_node and select_options)
-because the provider's template already emits ncpus; a second one in the
-same chunk makes qsub reject the job outright.
+`select=<nodes>:ncpus=<ranks>:mpiprocs=<ranks>`. The block is exactly --nodes
+wide -- there is no spare node; see the note above make_config. Both of the
+other numbers come from the one --ranks value: mpiprocs puts one line per rank
+slot in the node list, and ncpus reserves a core for each of those slots.
+Neither can be left at its default of 1 -- that gives 1 node-list line per
+node, or 1 core per node however many slots the list advertises. They are
+passed through different PBSProProvider parameters (cpus_per_node and
+select_options) because the provider's template already emits ncpus; a second
+one in the same chunk makes qsub reject the job outright.
 
 Why the multi-node block uses SingleNodeLauncher
 ------------------------------------------------
@@ -68,7 +70,7 @@ by PBS but untouched by Parsl, so the generated workflow's mpirun owns
 them outright -- all of them, as one MPI world.
 
 MpiExecLauncher would be wrong here twice over: it would start a pool on
-every node (nodes+1 workers for one agent), and pools on non-head nodes
+every node (one worker per node for a single agent), and pools on non-head nodes
 may not be able to read $PBS_NODEFILE, which lives in the head node's
 local spool directory.
 
@@ -304,8 +306,11 @@ def make_worker_init(run_dir: Path, engine: str = "parsl") -> str:
     """Shell prelude for the Explorer's worker pool, run before the launcher.
 
     It sources setup_hpc.sh, the same script you source before running this,
-    so the Explorer's node has the same MPI library paths and VENV_PYTHON as
-    an --env hpc run. That node never saw your shell, so nothing you exported
+    so the Explorer's node has the same interpreter and non-MPI library paths
+    as an --env hpc run. Neither that script nor this prelude configures an
+    MPI -- the worker starts with `module purge`, and a task loads the module
+    its own tool needs in its own command string. A module left loaded here
+    would be inherited by every task, including the ones that want none. That node never saw your shell, so nothing you exported
     there reaches it any other way. Sourcing is safe here only because the
     script sets no shell options: a `set -u` left behind would abort this
     submit script on the unset $PYTHONPATH two commands later.
@@ -324,10 +329,32 @@ def make_worker_init(run_dir: Path, engine: str = "parsl") -> str:
     if not os.path.isfile(SETUP_SCRIPT_PATH):
         raise RuntimeError(
             f"{SETUP_SCRIPT_PATH} not found. The multi-node Explorer sources it on "
-            f"its compute node for the Intel MPI library paths and VENV_PYTHON."
+            f"its compute node for MAW_PYTHON and the non-MPI library paths."
         )
-    prelude = [
-        f"module load {HPC_MODULES}",
+    # `module` is a shell function, and a submit script has not necessarily
+    # sourced the file that defines it -- the same failure mode setup_hpc.sh
+    # documents for `spack`. Without this guard every module line below is a
+    # silent "command not found".
+    prelude = ['[ -z "$(type -t module)" ] && source /etc/profile.d/modules.sh']
+
+    # START WITH NOTHING LOADED. A module inherited from the submitting shell,
+    # or loaded by the site default, is an MPI (and a compiler) that nothing in
+    # this run asked for -- and it is inherited by every task the Explorer
+    # launches, including the ones that want a different module or none at all.
+    # Each task loads what it needs in its own command string, so the worker
+    # itself should hold nothing.
+    #
+    # `|| true` because purge on a shell with no modules loaded is an error on
+    # some lmod builds, and that must not take the block down.
+    prelude.append("module purge 2>/dev/null || true")
+
+    if HPC_MODULES:
+        # Empty by default -- see consts.py. If something here ever genuinely
+        # needs a module in the WORKER environment, it goes in that constant.
+        # An MPI never does.
+        prelude.append(f"module load {HPC_MODULES}")
+
+    prelude += [
         f"source {venv_dir()}/bin/activate",
         f"source {SETUP_SCRIPT_PATH}",
         f"cd {run_dir}",
@@ -336,9 +363,9 @@ def make_worker_init(run_dir: Path, engine: str = "parsl") -> str:
         # to setup_hpc.sh because run_dir is a per-run decision made in THIS
         # process (work/run0, possibly rotated aside first) -- the setup script
         # cannot know it, and the Explorer's node never saw the shell that did.
-        # Everything else the servers need (JAVA_HOME, MAW_MPI_LAUNCHER, the
-        # ADIOS2 and MPI library paths, the headless rendering variables) is
-        # site knowledge and belongs in that script. PyCOMPSs needs nothing
+        # Everything else the servers need (JAVA_HOME, MAW_LD_BASE, the
+        # headless rendering variables) is site knowledge and belongs in that
+        # script. It exports no MPI launcher and no LD_LIBRARY_PATH. PyCOMPSs needs nothing
         # beyond the activated venv it was pip-installed into, which the
         # `source .../activate` two lines up provides.
         f"export MAW_REPO_ROOT={PROJECT_DIR}",
@@ -391,8 +418,8 @@ def user_input():
     parser.add_argument("--ranks", type=int, default=0,
                         help="multi-node only: MPI ranks per node (mpiprocs). This is "
                              "the cap on ranks the agent can place on any one node, so "
-                             "--nodes x --ranks is the rank ceiling for the run. No core "
-                             "count is requested -- PBS applies its own per-chunk default")
+                             "--nodes x --ranks is the rank ceiling for the run. It also "
+                             "sets ncpus, so one core is reserved per rank slot")
     args = parser.parse_args()
 
     if args.list_domains:
@@ -543,10 +570,12 @@ def collect_inputs(args) -> UserInput:
 def make_config(nodes: int, ranks: int, run_dir: Path, engine: str = "parsl") -> Config:
     """Build the config: one block, for the Explorer.
 
-    Renders `select=<nodes+1>:ncpus=<ranks>:mpiprocs=<ranks>`, i.e. (nodes+1) x
-    ranks lines in $PBS_NODEFILE, with one core reserved per rank slot. ncpus
-    goes in via cpus_per_node and mpiprocs via select_options -- see the note
-    on the provider below for why they cannot both go in the same place.
+    Renders `select=<nodes>:ncpus=<ranks>:mpiprocs=<ranks>`, i.e. nodes x ranks
+    rank slots, with one core reserved per slot. The block is exactly --nodes
+    wide; the "+1" earlier versions of this docstring described was removed
+    along with the spare node -- see the note above. ncpus goes in via
+    cpus_per_node and mpiprocs via select_options -- see the note on the
+    provider below for why they cannot both go in the same place.
 
     `run_dir` is work/run0, so Parsl's scratch goes to work/run0/runinfo and
     everything this run produces is under one directory. That is also where the
@@ -562,49 +591,6 @@ def make_config(nodes: int, ranks: int, run_dir: Path, engine: str = "parsl") ->
         # outputs in both.
         run_dir=str(run_dir / "runinfo"),
         executors=[
-            # ---------------------------------------------------------------
-            # Explorer: one worker on the head node of an allocation
-            # (nodes + 1) wide, every node offering `ranks` rank slots.
-            #
-            # One core per rank slot, both sides derived from the single
-            # --ranks value: cpus_per_node sets ncpus, select_options sets
-            # mpiprocs.
-            #
-            # They go in through DIFFERENT parameters because PBSProProvider's
-            # template already emits ncpus itself:
-            #
-            #     #PBS -l select=${nodes_per_block}:ncpus=${ncpus}${select_options}
-            #
-            # so ncpus comes from cpus_per_node and select_options is appended
-            # after it. Putting "ncpus=" in select_options as well produces a
-            # second one in the same chunk and qsub rejects the whole job with
-            # "duplicated resource within a section of a select specification".
-            #
-            # Neither value can be left out. cpus_per_node DEFAULTS TO 1, which
-            # is where this came from on Improv:
-            #
-            #     Resource_List.select = 3:ncpus=1:mpiprocs=4
-            #     Resource_List.ncpus  = 3
-            #
-            # 12 rank slots in $PBS_NODEFILE and 3 cores to run them on. A
-            # workflow's `mpiexec -np 8 --bind-to core` then asks for 4 cores
-            # on nodes that hold 1 -- it either fails outright or
-            # oversubscribes 4:1 (observed as cpupercent 353 against a walltime
-            # of 13 minutes and cput of 25).
-            #
-            # Deriving both from --ranks keeps the one flag the caller can
-            # actually answer ("how many ranks per node"). An earlier version
-            # exposed --ncpus separately, and it served as the core reservation
-            # AND the rank cap at once, so sizing it for either got the other
-            # wrong -- 32 cores reserved to run 8 ranks.
-            #
-            # Threads per rank are deliberately not expressible: that would
-            # need cpus_per_node = ranks x threads plus ompthreads, and nothing
-            # in the workflow asks for them yet.
-            #
-            # max_workers_per_node=1 because exactly one thing runs in this
-            # block: the Explorer. The ranks are not Parsl workers -- they are
-            # launched by mpirun from inside the generated workflow, in the
             # allocation this block holds.
             # ---------------------------------------------------------------
             HighThroughputExecutor(
@@ -636,6 +622,7 @@ def make_state(args, inputs) -> AgentState:
         pdf_path=inputs.pdf,
         literature_findings=[],
         stack_decision=[],
+        modules=[],            # filled by the planner from the domain skill
         tasks=[],
         exploration_log=[],
         selected_data_files=inputs.data_files,
@@ -656,12 +643,6 @@ def make_state(args, inputs) -> AgentState:
         # multi-node MPI. The run metadata still records the real --env.
         env="hpc" if multi_node else args.env,
         condition=args.condition,
-        # The folder name IS the domain -- one flag, one field. It was briefly
-        # two (--domain as a free-text label, --use-case as the folder), which
-        # meant the trace could record a domain that matched no folder and the
-        # skill lookup could disagree with the label. run_archiver already read
-        # metadata.domain as the use case (`usecase = metadata.domain or ...`),
-        # so this is the name that was always meant to carry it.
         domain=inputs.domain,
         explorer_summary="",
         run_succeeded=True,

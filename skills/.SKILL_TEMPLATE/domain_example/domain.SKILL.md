@@ -6,6 +6,8 @@ description: >
   slice from a HACC simulation — HACC, GenericIO, halo catalog, Last Journey."
 ---
 
+# Modules
+The modules you want the agent to load.
 
 # Tools
 **The tool you run.** Its name, where it lives (the full path), and whether it's

@@ -10,6 +10,10 @@ from pydantic import BaseModel
 class AgentSteps(str, Enum):
     START = "start"
     PLANNER_COMPLETE = "planner_complete"
+    # Retained so an archived trace from before the installer was collapsed to
+    # a single pass still deserializes. Nothing produces it now: the installer
+    # writes requirements.txt and installs it in one action, so the only step
+    # it reports is INSTALLER_COMPLETE.
     INSTALLER_REQUIREMENTS_PENDING_APPROVAL = "installer_requirements_pending_approval"
     INSTALLER_COMPLETE = "installer_complete"
     EXPLORER_COMPLETE = "explorer_complete"
@@ -21,6 +25,10 @@ class AgentState(TypedDict):
     pdf_path:              str
     literature_findings:   list[str]
     stack_decision:        list[str]
+    modules:               list[str]        # environment modules this run's tools need,
+                                            # read by the planner out of the domain skill.
+                                            # The installer builds compiled packages under
+                                            # them; each task loads them in its own command.
     tasks:                 list[str]
     exploration_log:       list[dict]       # explorer output (tool call records)
     selected_data_files:   list[str]        # filenames chosen from data/ at startup
@@ -59,6 +67,18 @@ class OrchestratorOutput(BaseModel):
 class PlannerOutput(BaseModel):
     literature_findings: list[str]
     stack_decision:      list[str]
+    #: Environment modules the domain skill says this run's tools need, e.g.
+    #: ["lammps"]. Names only -- no `module load` prefix, no version guessing.
+    #:
+    #: It is a planner output because the planner is the agent that reads the
+    #: domain skill, and the module is stated there in prose. The installer has
+    #: no language model and cannot extract it; without this field it had no way
+    #: to know which module to build compiled packages (mpi4py, bindings with
+    #: MPI-linked extensions) under, and pip silently compiled against whatever
+    #: the launching shell happened to have.
+    #:
+    #: Empty when the domain names no module.
+    modules:             list[str] = []
     tasks:               list[str]
     skill_requests:      list[str] = []
 

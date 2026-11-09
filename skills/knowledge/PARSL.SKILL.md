@@ -131,7 +131,7 @@ the files, not merely on the producer's exit.
 
 ---
 
-## `File(url)`
+## Files
 
 ### `parsl.data_provider.files.File(url: os.PathLike | str)`
 A location-independent handle on a file.
@@ -144,6 +144,8 @@ A location-independent handle on a file.
 
 A bare path gets scheme `file`. `http://`, `https://`, `ftp://` and `globus://`
 URLs are also accepted and are staged by the executor's `storage_access`.
+
+### Example:
 
 ---
 
