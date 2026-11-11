@@ -28,6 +28,9 @@ envfile=`/lcrc/project/PEDAL/HACC/HACC_go/env/bashrc.improv.cpu`
 paramfile=`/home/jalemu/FULL-MAW/data/indat.params`
 output=`/lcrc/project/PEDAL/HACC/SampleRun_go/params/output/__TYPE__/__STEP__/m000p`
 
+**HACC Variables**
+CHAINING_MESH_THREADS in indat.params. Use as many threads as provided in that input file for the simulation.
+
 **HACC Path Explanations**
 
 exe:  the path of the HACC executable
@@ -54,6 +57,7 @@ Takes in the particle snapshot and the halo catalog file to do the following:
 - Lastly, Bin the particles' (x, y) into a mass-weighted 2D histogram, restricted to particles within a slice thickness (default 4 Mpc/h) around the halo z:
 - The steps at which HACC writes full particle snapshots and halo catalogs are listed separately in indat.params, and they are not the final step. In the sample configuration, snapshots are written at steps 205 and 310, halo properties at step 205, and only the power spectrum at the final step 624. Read both step lists from indat.params and use a step that appears in both, normally the latest common one. Never assume the final step, and never take the step from the paper.
 - The snapshot and halo output steps are set by files, not by the paper or by fixed numbers in this skill. Take the full-snapshot step list from indat.params. Take the halo-properties step list from the halo-steps file named in the CosmoTools configuration that indat.params references (in the sample run this is params/halosteps.dat, which lists 624). Read both from those files on every run.
+- The sample deck (indat.params with params/halosteps.dat) runs to final step 624, with halo output requested at 624 and full snapshots also written at earlier steps such as 205. Expect a full 8-rank run to need on the order of an hour, and plan the run's time limit from that. Do not shorten the deck's step range to fit a short limit.
 
 # Outputs
 ## HACC
@@ -62,7 +66,7 @@ The output of HACC are the following:
   read the master file (not a per-rank shard), skip `#` comment lines, take columns
   `x, y, z, vx, vy, vz, phi`. Mass is not a column — compute it:
   `mp = Omega_m * rho_crit0 * (RL / NP)**3`, with `rho_crit0 = 2.77536627e11`
-  (h^2 Msun/Mpc^3) and `NP` = particles per side (`64` for this sample, `64^3` total).
+  (h^2 Msun/Mpc^3) and `NP` = particles per side
 - *Halo catalog* (e.g. `analysis/haloproperties/step_624/m000p-624.haloproperties`):
   written by HACC's own halo finder — parse it, do not reimplement FOF/SOD. Read the
   tab-separated header for column order. **Most massive halo = row with the largest
@@ -114,6 +118,7 @@ is downscaled and may not match published values)
 - The reference PBS job file is for reference only: never modify it, never submit it, and never fall back to running the workflow by submitting a batch script. The producer and the catalog reader are each a single command-line step that the workflow runs directly; the whole producer–analysis–visualization sequence must be expressible as ordered command-line steps in one run without any batch submission.
 Before naming the producer's expected output files, confirm the snapshot and halo-catalog step from indat.params. If the expected master files are missing after a run, first list the step_<S> folders that were written before concluding the simulation failed. Never re-run the simulation just because the expected step was guessed wrong.
 Do not hard-code or forbid particular time steps. The workflow's result should represent the end of the simulation whenever the configuration writes snapshots and halos there. Any expected step numbers in this skill are examples only; the configuration files and the step folders on disk take precedence.
+The HACC simulation is the expensive stage: launch it once, with a time budget that covers the whole run. Analysis and visualization must always be re-runnable against existing hacc_run output on their own, without the simulation stage being involved.
 
 ---
 
@@ -121,6 +126,12 @@ Do not hard-code or forbid particular time steps. The workflow's result should r
 
 | The run 'fails' right after the simulation even though hacc_run is full of snapshot and halo files | The workflow looked for snapshot and catalog files at the final step, or expected one shard per node. Check the output step against the snapshot and halo-property step lists in indat.params and against the step_<S> folders actually written. Expect exactly one shard per MPI rank (64 for 8 nodes x 8 ranks), not one per node. |
 | The slice and halo catalog come from an intermediate step (e.g. 205 or 310) even though the simulation ran to the final step (624) and wrote a full snapshot there | Choose the latest step that has both a full snapshot folder and a halo-properties folder actually written under the run directory. When the final step has both, it is the analysis step. Do not exclude the final step on the assumption that it holds only a power spectrum. |
+| The run stops at about 30 minutes; hacc.log ends mid-step (for example around step 296 of 624) with no end-of-run message, no exit-code record, and only early step folders under output/full_snapshots and analysis/haloproperties | The 8-rank sample simulation to its final step (624) takes well over 30 minutes. Set the overall run time limit to at least the PBS walltime (1 hour or more), not just the simulation stage's limit. If a run was cut off, do not relaunch the simulation. Use the latest step that has a complete snapshot and haloproperties set (master file plus 8 shards), e.g. step 205, and run only analysis and visualization on it. |
+| hacc.log contains only the executable's usage text and the run ends at once with a failure code | The arguments after the parameter file were not given the way the sample-run job file gives them. Copy the argument order and options exactly from the sample-run job file in /lcrc/project/PEDAL/HACC/SampleRun_go/ (read it, never submit it) before launching. |
+
+
+
+
 
 
 

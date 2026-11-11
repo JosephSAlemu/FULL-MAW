@@ -61,6 +61,16 @@ When it comes to code, you should generate parsl code.
 If you need to use the shell or an external tool, use a @bash_app
 If you need to create a parallel python program, you annotate a method with @python_app
 
+## Always match PbsPro walltime for any bash_app
+
+**FOR ANY GENERATED FILE WITH A @BASH_APP ANNOTATION, THE ANNOTATION'S WALLTIME PARAMETER SHOULD MATCH THE PBS PRO'S WALLTIME.**
+
+For example, our default walltime is usually an hour, so we would write the following for all bash_app annotations:
+```py
+@bash_app
+def blah(walltime=3600):
+    ...
+```
 ## Scope Matters!
 **!!!!!!ALL IMPORTS, CONSTANTS, ETCS. FOR PARSL ARE LOCAL TO THE METHODS THEMSELVES. YOU MUST IMPORT IN THE METHODS TO USE IN THE METHOD!!!!!!!!!!!!!!!**
 

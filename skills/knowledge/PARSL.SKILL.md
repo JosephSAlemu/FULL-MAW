@@ -98,6 +98,8 @@ Accepted by any app, consumed by Parsl rather than passed to the function body.
 | `stderr` | path or `AUTO_LOGNAME` | Where its stderr goes. Parsl also writes the executed command string here, between `--> executable follows <--` markers |
 | `walltime` | seconds | Per-app timeout; exceeding it raises `AppTimeout` |
 
+**IN ALL BASH_APPS, ALWAYS SET THE WALLTIME PARAMETER FOR EVERY METHOD WITH THE BASH APP ANNOTATION. HAVE THAT PARAMETER MATCH THE WALLTIME OF THE PBSPRO WALLTIME IN SECONDS.**
+
 Inside the body, read paths off the objects rather than rebuilding them:
 `outputs[0].filepath` is the path the command must write, and it is the same
 path Parsl will then track.
