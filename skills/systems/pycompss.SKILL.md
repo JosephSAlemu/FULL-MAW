@@ -1,6 +1,5 @@
 ---
-name: systems/pycompss
-description: >
+name: systems/pycompss description: >
   Writing a PyCOMPSs application for MAW: the execution contract, @task/@binary/
   @mpi, the four rank layouts, the server-generated topology, and why a completed
   run is not a successful one. Load for every --engine pycompss run; the API
@@ -39,8 +38,7 @@ command-line arguments (every other parameter is appended to argv), and
 `fail_by_exit_value=True`.
 
 All of them live in the **same file**. A simulation plus its visualization is
-one
-file with an `@mpi` task and a `@task` — not two files, not two tool calls.
+one file with an `@mpi` task and a `@task` — not two files, not two tool calls.
 
 ### What `write_file` checks
 
@@ -233,10 +231,10 @@ COMPSs hands the task body a *renamed* file in the worker's sandbox
 declared name afterwards. Two consequences:
 
 - **Never assume the name.** Write to the parameter you were given; do not
-  rebuild the path from a constant, and do not append an extension. `np.save`
-  appends `.npy` unless the name already ends in it, so it silently writes
-  beside the tracked file — use `with open(path, "wb") as fh: np.save(fh, arr)`.
-  `fig.savefig` infers the format from the extension, so pass `format="png"`.
+  rebuild the path from a constant or append an extension. `np.save` appends
+  `.npy` unless the name already ends in it, writing beside the tracked file —
+  use `with open(path, "wb") as fh: np.save(fh, arr)`. `fig.savefig` infers the
+  format from the extension, so pass `format="png"`.
 - **Replacing the file can break the copy-back.** `shutil.copy2(src, dest)` onto
   a `FILE_OUT` has been observed to leave the declared path missing after the
   run. If the product already exists on the shared filesystem, prefer passing
@@ -396,20 +394,10 @@ raises at import. Mandatory marked `*`.
 | `@constraint` | `computing_units` — threads per rank, when the binary is hybrid |
 
 Stacking order outermost first: `@constraint`, `@mpi`/`@binary`, `@task`
-innermost — both of the latter require `@task` beneath them. Parameter types come
-from `pycompss.api.parameter`: `FILE_IN`, `FILE_OUT`, `FILE_INOUT`, and
+innermost — both of the latter require `@task` beneath them. Parameter types
+come from `pycompss.api.parameter`: `FILE_IN`, `FILE_OUT`, `FILE_INOUT`, and
 `FILE_OUT_STDOUT`. COMPSs has other decorators; if a task cannot be expressed
 with these four, report that rather than reaching for one.
-
-## What Differs From a Dataflow Engine
-
-Two things are worth internalising if you have written Parsl before. **There is
-no shell**: a `@binary` has no pipes, no `&&` and no `source`, so anything a
-command string would have done belongs in a downstream `@task`. And **the
-allocation is declarative**: Parsl spans nodes by getting out of the way and
-letting an app's `mpiexec` inherit `$PBS_NODEFILE`, while COMPSs spans nodes
-only because `resources.xml` says they exist. Dependencies are likewise
-automatic here, derived from task parameters rather than from explicit futures.
 
 ## Common Pitfalls
 
@@ -443,7 +431,8 @@ automatic here, derived from task parameters rather than from explicit futures.
 | Transcribing input-deck values into module constants | Parse the deck in the task; transcribed values drift from the file the run actually used |
 | Rendering without `matplotlib.use("Agg")` | Headless nodes have no display |
 | `{Type: FILE_IN}` without importing `Type` | `NameError` at import. Import it, or use the bare `param=FILE_IN` form |
-| `install_package("pycompss")` mid-run | Cannot work; see below |
+| `install_package("pycompss")` mid-run | It would attempt the full distribution build inside a 900s timeout, which it will not finish, and a half-finished install shadows a good one. If `check_package` says False, REPORT it |
+| Reading `installed: True` as "the runtime works" | It means only that the Python half imports. The pip package installs a large Java distribution as a side effect, and that half can be missing; a broken runtime shows up as a failed `run_workflow` with Java errors. `version: unknown` is normal |
 | A `launch_command` without `-m pycompss` | Ran sequentially with every decorator ignored, and exited 0 |
 | Hunting the filesystem for binaries, env files or module paths | They are in the domain skill under `skills/use_cases/<domain>/`. If one is missing, report that |
 
@@ -472,31 +461,15 @@ log collection.
 
 ### Engine-specific behaviour
 
-Beyond the tools every engine shares, this server adds four things:
-
-- **The topology is generated before every run** and reported under
-  `compss_topology`. A `multi_node` plan where no host can start a worker is
-  **refused**, not launched. `write_xml` overrides a kind for the session.
-- **`COMPSS_MPIRUN_TYPE` is set by `launch_env()`**, defaulting to `openmpi`.
-- **Log collection reaches `~/.COMPSs`.** The inherited `collect_logs` sees only
-  the work directory; this one also tails the newest
-  `~/.COMPSs/<app>_NN/jobs/*`, which is where a failed task's real error lives.
-- **Stdout and stderr stream to `<run_id>.out`/`.err`** in the work directory
-  while the run is in flight, so a long run can be watched with `read_file`
-  rather than waited on. They survive a timeout kill.
-
-### `check_package("pycompss")`
-
-`installed: True` means the Python package imports under the interpreter that
-will run the workflow. It does **not** mean the runtime behind it works: the pip
-package installs a large Java distribution as a side effect, and the Python half
-can import while that half is missing. A broken runtime shows up as a failed
-`run_workflow` with Java errors, not as a failed import. `version: unknown` is
-normal — the package defines no `__version__`.
-
-If it comes back `False`, **report, do not fix**. `install_package("pycompss")`
-would attempt the full distribution build inside a 900-second timeout, which it
-will not finish, and a half-finished install shadows a good one.
+Beyond the shared tools, this server adds four things. **The topology is
+generated before every run** and reported under `compss_topology`; a
+`multi_node` plan where no host can start a worker is **refused**, not launched.
+**`COMPSS_MPIRUN_TYPE` is set by `launch_env()`** to `openmpi`. **Log collection
+reaches `~/.COMPSs`** — the inherited `collect_logs` sees only the work
+directory, this one also tails the newest `~/.COMPSs/<app>_NN/jobs/*` where a
+failed task's real error lives. And **stdout/stderr stream to
+`<run_id>.out`/`.err`** while the run is in flight, so a long run can be watched
+with `read_file` rather than waited on; they survive a timeout kill.
 
 ### The launch command
 

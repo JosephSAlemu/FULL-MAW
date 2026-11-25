@@ -197,9 +197,19 @@ class WilkinsServer(Server):
         memory and on disk); both 0 means the dataset goes nowhere. Filenames
         and dataset names support patterns, e.g. `*.h5/particles`.
 
-        A task's `func` must be linked against Henson and built position
-        independent -- that is Wilkins' execution model, not an option. A plain
-        MPI binary will not work as a task without that link step.
+        A task's `func` is dispatched by its SUFFIX:
+
+        - `.py` -- imported as a module and called, so it **must define
+          `main()`**; without one the task silently does nothing. Plain h5py,
+          no Wilkins or LowFive calls, no Henson.
+        - anything else -- a Henson-linked, position-independent shared object
+          named `./<name>.hx`. That is Wilkins' execution model, not an option:
+          a plain MPI binary will not work as a task without that link step.
+
+        Keep `taskCount` out of a Python workflow. The driver sets its ensemble
+        flag once and never clears it, so from the first `taskCount > 1` task
+        onward every task -- including a later `.py` one -- is looked up as
+        `./<func>.hx`.
 
         Args:
             content: the full YAML document
@@ -210,7 +220,19 @@ class WilkinsServer(Server):
             and any structural warnings
         """
         name = filename or self.DEFAULT_CONFIG
-        path = self._resolve_write_path(name)
+        # Rejected here rather than by the driver, which regex-matches
+        # `(.*yaml)` and exits 1 after the launch. Cheap to catch now.
+        if not name.endswith("yaml"):
+            return self._json({
+                "status": "rejected",
+                "engine": self.ENGINE,
+                "error": f"config filename must end in 'yaml', got {name!r}. "
+                         f"Wilkins rejects '.yml' outright.",
+            })
+        try:
+            path = self._resolve_write_path(name)
+        except ValueError as e:
+            return self._json({"status": "rejected", "error": str(e)})
         os.makedirs(os.path.dirname(path) or self.work_dir, exist_ok=True)
         with open(path, "w") as f:
             f.write(content)
@@ -260,19 +282,28 @@ class WilkinsServer(Server):
             return None, str(e)
 
     def total_ranks(self, parsed: dict) -> int:
-        """Sum of every task's nprocs -- the rank count the launcher needs.
+        """Sum of taskCount x nprocs over every task -- what the launcher needs.
 
-        Wilkins runs all tasks inside ONE MPI job and gives each its slice, so
-        launching with fewer ranks than the config asks for does not run a
-        smaller workflow; it starves a task of the ranks it declared.
+        taskCount, NOT just nprocs: an ensemble task runs taskCount instances of
+        nprocs ranks each, and Wilkins assigns every instance its own contiguous
+        block. Summing nprocs alone under-counts an ensemble, and launching
+        short does not run a smaller workflow -- it starves the tasks at the
+        tail, which never run. (Upstream's own generate_run_script.py has this
+        bug; do not copy its number.)
         """
         total = 0
         for task in parsed.get("tasks", []) or []:
-            if isinstance(task, dict):
-                try:
-                    total += int(task.get("nprocs", 1))
-                except (TypeError, ValueError):
-                    total += 1
+            if not isinstance(task, dict):
+                continue
+            try:
+                nprocs = int(task.get("nprocs", 1))
+            except (TypeError, ValueError):
+                nprocs = 1
+            try:
+                count = max(1, int(task.get("taskCount", 1)))
+            except (TypeError, ValueError):
+                count = 1
+            total += count * nprocs
         return total
 
     def _check_config(self, parsed: dict) -> list:
@@ -298,51 +329,67 @@ class WilkinsServer(Server):
             if not task.get("func"):
                 notes.append(f"Task {i}: no `func` -- nothing to run.")
             if "nprocs" not in task:
+                # Not a default: Wilkins reads nprocs unguarded, so a missing
+                # one throws a YAML parser exception and exits 1.
                 notes.append(
-                    f"Task {i}: no `nprocs`, so it gets the default. State it, "
-                    f"since the launcher's total rank count is the sum of these."
+                    f"Task {i}: no `nprocs`. It is REQUIRED and unguarded -- "
+                    f"Wilkins throws a YAML parser exception and exits."
                 )
             for port_key, bucket in (("outports", outs), ("inports", ins)):
                 for port in task.get(port_key, []) or []:
                     if not isinstance(port, dict):
                         continue
                     fname = port.get("filename", "")
-                    for dset in port.get("dsets", []) or []:
+                    dsets = port.get("dsets", []) or []
+                    if not dsets:
+                        notes.append(
+                            f"Task {i}, {port_key} {fname}: no `dsets`, so this "
+                            f"port creates no channel and is silently ignored."
+                        )
+                    for dset in dsets:
                         if not isinstance(dset, dict):
                             continue
-                        bucket.setdefault(f"{fname}{dset.get('name', '')}", []).append(i)
-                        # metadata/passthru are how the dataset moves. Both
-                        # absent is the quiet case: the channel exists and
-                        # carries nothing.
-                        if "metadata" not in dset and "passthru" not in dset:
+                        bucket.setdefault(f"{fname}{dset.get('name', '')}",
+                                          []).append(i)
+                        # Omitting BOTH is fine -- Wilkins defaults metadata to 1
+                        # and passthru to 0, i.e. in-memory. Only an explicit
+                        # 0/0 is wrong, and upstream makes that a hard error.
+                        if (str(dset.get("metadata", 1)) == "0"
+                                and str(dset.get("passthru", 0)) == "0"):
                             notes.append(
                                 f"Task {i}, {port_key} {fname}"
-                                f"{dset.get('name', '')}: neither `metadata` "
-                                f"nor `passthru` set. Set metadata: 1 to "
-                                f"transport in memory over MPI, passthru: 1 to "
-                                f"write a real HDF5 file."
+                                f"{dset.get('name', '')}: metadata and passthru "
+                                f"are both 0. Wilkins exits with 'Either "
+                                f"metadata or passthru must be enabled'."
                             )
-                        elif (str(dset.get("metadata", 0)) == "0"
-                              and str(dset.get("passthru", 0)) == "0"):
+                        elif (str(dset.get("metadata", 1)) != "0"
+                                and str(dset.get("passthru", 0)) != "0"):
                             notes.append(
                                 f"Task {i}, {port_key} {fname}"
-                                f"{dset.get('name', '')}: both metadata and "
-                                f"passthru are 0, so this dataset goes nowhere."
+                                f"{dset.get('name', '')}: metadata and passthru "
+                                f"are both set. LowFive does not do both -- "
+                                f"memory wins and passthru is ignored."
                             )
 
-        # An inport nothing produces is the commonest way a Wilkins workflow
-        # hangs: the consumer waits on a channel that was never created.
-        # Pattern ports (*) are skipped -- matching them here would duplicate
-        # Wilkins' own matcher and get it wrong.
+        # An inport nothing produces is a real defect: with metadata it is a
+        # hard error naming the port, and with passthru it silently degrades to
+        # plain file I/O that transports nothing.
+        #
+        # Matched with fnmatch in BOTH directions, because Wilkins matches
+        # globs: a literal inport "outfile.h5" IS produced by an outport
+        # "*.h5". Comparing the key strings alone reported that as unproduced.
+        from fnmatch import fnmatch
+
         for key, consumers in ins.items():
-            if "*" in key:
+            if any(key == o or fnmatch(key, o) or fnmatch(o, key) for o in outs):
                 continue
-            if key not in outs:
-                notes.append(
-                    f"Task(s) {consumers} read {key!r}, which no task's "
-                    f"outports produce. Wilkins builds channels by matching "
-                    f"these names, so this consumer has nothing to wait on."
-                )
+            notes.append(
+                f"Task(s) {consumers} read {key!r}, which no task's outports "
+                f"produce. Wilkins builds channels by glob-matching these "
+                f"names: in memory mode it exits with 'No matching link "
+                f"found'; in passthru mode it silently reads a real file "
+                f"instead and transports nothing."
+            )
         return notes
 
     # __ Engine specifics ______________________________________________________

@@ -3,7 +3,13 @@ Your agent skill file contains your full operating instructions. Follow them.
 
 Return ONLY a valid JSON object with exactly these keys:
 - literature_findings: list[str] -- specific, quantitative facts extracted from the paper
-- stack_decision:      list[str] -- packages to install into the local venv
+- stack_decision:      list[str] -- pip packages to install into the local venv
+- modules:             list[str] -- environment modules this run's tools need, by
+                       NAME only, e.g. ["lammps"]. No `module load` prefix and no
+                       invented versions. Take them from the domain skill; [] when
+                       it names none. The installer builds compiled packages under
+                       these, and each task loads them in its own command string,
+                       so a module omitted here is one nothing will load.
 - tasks:               list[str] -- ordered, Python-API-level implementation steps
 - skill_requests:      list[str] -- skill paths to load (first call only; empty on subsequent calls)
 

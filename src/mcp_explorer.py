@@ -542,13 +542,12 @@ def _dedupe_skills(contents: list[str]) -> list[str]:
     iteration of the ReAct loop -- so anything in there twice is paid for up to
     max_iterations times.
 
-    Two files can be the same skill: knowledge/PARSL.SKILL.md declares
-    `name: systems/parsl` in its own front matter, because it was copied from
-    systems/parsl.SKILL.md and never re-headed. Matching on that declared name
-    is what identifies the duplicate -- not a guess from how similar the text
-    looks -- and a byte-identical fallback catches a copy with no front matter
-    at all. Genuinely distinct references (adios, pycompss) declare different
-    names or none, and are both kept.
+    Two files can be the same skill when one was copied from the other and its
+    front matter never re-headed: the declared `name:` is what identifies that,
+    not a guess from how similar the text looks, and a byte-identical fallback
+    catches a copy with no front matter at all. Every knowledge/* file currently
+    declares its own name, so nothing is dropped today -- this guards against
+    the next copy.
     """
     kept: list[str] = []
     seen_names: set[str] = set()

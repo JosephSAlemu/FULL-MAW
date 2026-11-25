@@ -1,5 +1,5 @@
 ---
-name: use_cases/new_comsology/domain
+name: use_cases/new_cosmology/domain
 description: >
   Reproduce a HACC cosmological N-body result: run the existing HACC simulation, then
   analyze its halo output and produce a dark-matter density-slice image. Applies

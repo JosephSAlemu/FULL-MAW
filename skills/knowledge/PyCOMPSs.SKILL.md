@@ -1,345 +1,160 @@
 ---
 name: knowledge/PyCOMPSs
 description: >
-  PyCOMPSs API reference: the synchronization calls (compss_wait_on, compss_open,
-  compss_barrier, compss_wait_on_file/directory), the @local decorator, file and
-  object deletion, and task groups. Load alongside systems/pycompss, which
-  carries the MAW execution contract (write_xml/write_file/run_workflow, the
-  @task/@binary/@mpi rules, and the runtime lifecycle) that this manual serves.
+  PyCOMPSs API reference: @task parameter directions and types, the @binary,
+  @mpi, @multinode and @constraint argument lists, the compss_* synchronisation
+  and deletion calls, and the python -m pycompss launcher. Load alongside
+  systems/pycompss, which carries the MAW execution contract (write_file/
+  run_workflow, the rank layouts, the pitfalls and the runtime lifecycle) that
+  this manual serves.
 ---
 
 # PyCOMPSs — API Reference
 
 The companion to `systems/pycompss`. That skill states the rules every generated
-driver must obey; this one is the API manual you consult while writing it.
+driver must obey; this one is the API manual you consult while writing it. If
+anything here seems to permit what `systems/pycompss` forbids, the contract
+wins.
 
-Nothing here overrides the contract. If a snippet below appears to permit
-something `systems/pycompss` forbids -- a `subprocess` call, an `mpirun` you
-typed yourself, a shell wrapper -- the contract wins. Note that `write_file`
-no longer refuses these for you: it rejects only a syntax error, so a file that
-breaks the contract will be written and will run, with the work happening
-outside COMPSs. The contract still binds.
-
-Two things to carry over from the contract while reading:
-
-- **`compss_wait_on` only where the driver needs a real value.** The examples
-  below show it liberally because they are illustrating the call. Waiting after
-  every submission serializes the graph COMPSs just built.
-- **Ordering comes from parameters, not from these calls.** `compss_barrier()`
-  forces a wait; it does not create a dependency. If a consumer needs a
-  producer's file, declare it `FILE_OUT` on the producer and `FILE_IN` on the
-  consumer -- see "The producer MUST declare its outputs" in `systems/pycompss`.
+Signatures were read from the **COMPSs 3.4** Python binding source
+(`pycompss.api.*`). The installed runtime may differ;
+`check_package("pycompss")` reports whether the package imports (its version
+is often `unknown`). Where behaviour on the machine disagrees with this file,
+the installed runtime wins.
 
 ---
 
 # API
 
-PyCOMPSs provides an API for data synchronization and other functionalities, such as task group definition and automatic function parameter synchronization (local decorator).
+## `@task` — parameter directions and types
 
-## Synchronization
+```python
+from pycompss.api.task import task
+from pycompss.api.parameter import FILE_IN, FILE_OUT, FILE_INOUT
+```
 
-The main program of the application is a sequential code that contains calls to the selected tasks. In addition, when synchronizing for task data from the main program, there exist six API functions that can be invoked:
+`@task(name=DIRECTION, ..., returns=..., priority=..., time_out=...,
+on_failure=...)`. An unlisted parameter is passed by value as an input. Any
+other keyword raises at import.
 
-### `compss_open(file_name, mode=’r’)`
+| Type | Meaning |
+|---|---|
+| `IN`, `OUT`, `INOUT` | Python object read / produced / modified in place |
+| `FILE_IN`, `FILE_OUT`, `FILE_INOUT` | Path to a file read / produced / modified |
+| `DIRECTORY_IN`, `DIRECTORY_OUT`, `DIRECTORY_INOUT` | Same, for a directory |
+| `COLLECTION_IN`, `COLLECTION_OUT`, `COLLECTION_INOUT` | A list whose elements are tracked individually |
+| `FILE_OUT_STDOUT`, `FILE_IN_STDIN`, `FILE_OUT_STDERR` | Redirect a stream to or from the file; used with `@binary`/`@mpi` as `{Type: FILE_OUT_STDOUT}` |
+| `CONCURRENT`, `FILE_CONCURRENT`, `COMMUTATIVE`, `FILE_COMMUTATIVE` | Relaxed `INOUT`: tasks may update the same data concurrently or in any order |
 
-Similar to the Python `open()` call. It synchronizes for the last version of file `file_name` and returns the file descriptor for that synchronized file. It can have an optional parameter `mode`, which defaults to `‘r‘`, containing the mode in which the file will be opened (the open modes are analogous to those of Python `open()`).
+Other keywords on `@task`:
+
+| Keyword | Meaning |
+|---|---|
+| `returns` | Number of return values (`returns=1`) or a type; the call then yields a future to pass on or synchronise |
+| `priority` | Boolean; schedule ahead of other ready tasks |
+| `time_out` | Seconds before the task is killed |
+| `on_failure` | `'RETRY'` (default), `'IGNORE'`, `'CANCEL_SUCCESSORS'` or `'FAIL'` |
+
+Dependencies are derived from these declarations alone. A task's *return value*
+is a future: passing it to another task is an edge, no `compss_wait_on` needed.
+
+## `@binary`, `@mpi`, `@multinode`, `@constraint`
+
+Each is stacked above `@task`; `@constraint` goes above the others. The accepted
+argument sets (anything else raises at import):
+
+| Decorator | Arguments (`*` mandatory) |
+|---|---|
+| `@binary` | `binary`*, `working_dir`, `args`, `fail_by_exit_value` |
+| `@mpi` | `runner`*, `binary`, `processes`, `processes_per_node`, `working_dir`, `args`, `flags`, `scale_by_cu`, `fail_by_exit_value` |
+| `@multinode` | `computing_nodes`, `processes_per_node` |
+| `@constraint` | `computing_units` (cores reserved per task); other resource keys exist and are not covered here |
+
+`@mpi`: `processes` is the TOTAL rank count. `@task` divides it by
+`processes_per_node` to get the node count, so `processes` must be `>=` and a
+multiple of `processes_per_node` or `PyCOMPSsException` is raised. The default
+`processes_per_node=1` makes `processes` a node count; the contract's rule to
+set it explicitly follows from that.
+
+`@multinode` is a different thing: it reserves nodes for a Python task body and
+has **no `binary=`**, so it cannot launch a program (use `@mpi` or `@binary`
+for that). Its `computing_nodes` is used as given — it is NOT divided by
+`processes_per_node`, which defaults to 1 in the code even where the docs say
+otherwise. Pass both explicitly.
+
+`@constraint(computing_units=N)` sets how many cores one task occupies on its
+node; it is not a rank count. For `@mpi` it is the threads-per-rank figure, see
+`systems/pycompss`.
+
+---
+
+## Synchronisation
+
+Import from `pycompss.api.api`. The main program is sequential code that
+submits tasks; these calls bring results back to it.
+
+### `compss_wait_on(*obj, mode='rw')`
+Waits for the last version of each object and returns it (one object in, one
+out; several in, a list out). Rebind the result:
+`obj = compss_wait_on(obj)`. Pass `mode='r'` when the master will not modify it.
+A list or dict of futures is synchronised recursively, element by element:
+
+```python
+results = [step(i) for i in range(10)]   # each call returns a future
+results = compss_wait_on(results)        # one call, after the loop
+```
 
 ### `compss_wait_on_file(*file_name)`
-
-Synchronizes for the last version of the file/s specified by `file_name`. Returns `True` if success (`False` otherwise).
+Waits until the last version of the file(s) has been produced and brought to
+the master; returns the name(s). Accepts a path, or a list or tuple of paths.
 
 ### `compss_wait_on_directory(*directory_name)`
+Same, for directories.
 
-Synchronizes for the last version of the directory or directories specified by `directory_name` Returns `True` if success (`False` otherwise).
+### `compss_open(file_name, mode='r')`
+Like `open()`, after synchronising the last version of the file. Use it to read
+a task's `FILE_OUT` from the master.
 
 ### `compss_barrier(no_more_tasks=False)`
-
-Performs a explicit synchronization, but does not return any object. The use of `compss_barrier()` forces to wait for all tasks that have been submitted before the `compss_barrier()` is called. When all tasks submitted before the `compss_barrier()` have finished, the execution continues. The `no_more_tasks` is used to specify if no more tasks are going to be submitted after the `compss_barrier()`.
-
-### `compss_barrier_group(group_name)`
-
-Performs a explicit synchronization over the tasks that belong to the group `group_name`, but does not return any object. The use of `compss_barrier_group()` forces to wait for all tasks that belong to the given group submitted before the `compss_barrier_group()` is called. When all group tasks submitted before the `compss_barrier_group()` have finished, the execution continues. See Task Groups for more information about task groups.
-
-### `compss_wait_on(*obj, mode=”r” | “rw”)`
-
-Synchronizes for the last version of object/s specified by `obj` and returns the synchronized object. It can have an optional string parameter `mode`, which defaults to `rw`, that indicates whether the main program will modify the returned object. It is possible to wait on a list of objects. In this particular case, it will synchronize all future objects contained in the list recursively.
-
-To illustrate the use of the aforementioned API functions, the following example (Code 133) first invokes a task `func` that writes a file, which is later synchronized by calling `compss_open()`. Later in the program, an object of class `MyClass` is created and a task method `method` that modifies the object is invoked on it; the object is then synchronized with `compss_wait_on`, so that it can be used in the main program from that point on.
-
-Then, a loop calls again ten times to `func` task. Afterwards, the `compss_barrier()` call performs a synchronization, and the execution of the main user code will not continue until the ten `func` tasks have finished. This call does not retrieve any information.
-
-### Code 133 PyCOMPSs Synchronization API functions usage
+Blocks until every task submitted so far has finished and returns nothing. It
+creates no dependency; pass `no_more_tasks=True` on the last barrier.
 
 ```python
-from pycompss.api.api import compss_open
-from pycompss.api.api import compss_wait_on
-from pycompss.api.api import compss_wait_on_file
-from pycompss.api.api import compss_wait_on_directory
-from pycompss.api.api import compss_barrier
-
-if __name__=='__main__':
-    my_file = 'file.txt'
-    func(my_file)
-    fd = compss_open(my_file)
-    ...
-
-    my_file2 = 'file2.txt'
-    func(my_file2)
-    compss_wait_on_file(my_file2)
-    ...
-
-    my_directory = '/tmp/data'
-    func_dir(my_directory)
-    compss_wait_on_directory(my_directory)
-    ...
-
-    my_obj2 = MyClass()
-    my_obj2.method()
-    my_obj2 = compss_wait_on(my_obj2)
-    ...
-
-    for i in range(10):
-        func(str(i) + my_file)
-    compss_barrier()
-    ...
+sim(params, "out.dat")                   # @task(product=FILE_OUT) underneath
+compss_wait_on_file("out.dat")           # master needs the file now
+with compss_open("out.dat") as fh:
+    head = fh.readline()
 ```
 
-The corresponding task definition for the example above would be (Code 134):
-
-### Code 134 PyCOMPSs Synchronization API usage tasks
-
-```python
-@task(f=FILE_OUT)
-def func(f):
-    ...
-
-class MyClass(object):
-    ...
-
-    @task()
-    def method(self):
-        ... # self is modified here
-```
-
-> **Tip**
->
-> It is possible to synchronize a list of objects. This is particularly useful when the programmer expect to synchronize more than one elements (using the `compss_wait_on` function) (Code 135). This feature also works with dictionaries, where the value of each entry is synchronized. In addition, if the structure synchronized is a combination of lists and dictionaries, the `compss_wait_on` will look for all objects to be synchronized in the whole structure.
-
-### Code 135 Synchronization of a list of objects
-
-```python
-if __name__=='__main__':
-    # l is a list of objects where some/all of them may be future objects
-    l = []
-    for i in range(10):
-        l.append(ret_func())
-
-    ...
-
-    l = compss_wait_on(l)
-```
-
-> **Important**
->
-> In order to make the COMPSs Python binding function correctly, the programmer should not use relative imports in the code. Relative imports can lead to ambiguous code and they are discouraged in Python, as explained in: http://docs.python.org/2/faq/programming.html#what-are-the-best-practices-for-using-import-in-a-module
-
-## Local Decorator
-
-Besides the synchronization API functions, the programmer has also a decorator for automatic function parameters synchronization at his disposal. The `@local` decorator can be placed over functions that are not decorated as tasks, but that may receive results from tasks (Code 136). In this case, the `@local` decorator synchronizes the necessary parameters in order to continue with the function execution without the need of using explicitly the `compss_wait_on` call for each parameter.
-
-### Code 136 @local decorator example
-
-```python
-from pycompss.api.task import task
-from pycompss.api.api import compss_wait_on
-from pycompss.api.parameter import INOUT
-from pycompss.api.local import local
-
-@task(v=INOUT)
-def append_three_ones(v):
-    v += [1, 1, 1]
-
-@local
-def scale_vector(v, k):
-    return [k*x for x in v]
-
-if __name__=='__main__':
-    v = [1,2,3]
-    append_three_ones(v)
-    # v is automatically synchronized when calling the scale_vector function.
-    w = scale_vector(v, 2)
-```
-
-## File/Object deletion
-
-PyCOMPSs also provides two functions within its API for object/file deletion. These calls allow the runtime to clean the infrastructure explicitly, but the deletion of the objects/files will be performed as soon as the objects/files dependencies are released.
+## Deletion
 
 ### `compss_delete_file(*file_name)`
-
-Notifies the runtime to delete a file/s.
+Tells the runtime to delete the file(s) everywhere. Asynchronous: it happens
+once no pending task still needs them. Returns `True` on success.
 
 ### `compss_delete_object(*object)`
+Same for the files backing an object. Collections are not supported.
 
-Notifies the runtime to delete all the associated files to a given object/s.
+---
 
-> **Warning**
->
-> It does not support collections.
+## Launching
 
-The following example (Code 137) illustrates the use of the aforementioned API functions.
+`python -m pycompss [run|enqueue] <runcompss flags> app.py [app args]`. The
+action defaults to `run` and the rest is the `runcompss` flag set passed through
+verbatim. `run_workflow` builds this command; the server owns the flags (see
+`systems/pycompss`).
 
-### Code 137 PyCOMPSs delete API functions usage
+The shipped `COMPSS_MPIRUN_TYPE` values are `impi`, `openmpi` and `slurm`; any
+other value is silently ignored.
 
-```python
-from pycompss.api.api import compss_delete_file
-from pycompss.api.api import compss_delete_object
+## Topology XML
 
-if __name__=='__main__':
-    my_file = 'file.txt'
-    func(my_file)
-    compss_delete_file(my_file)
-    ...
+A `<MasterNode>` holding `<Processor><ComputingUnits>` plus an empty
+`<ResourcesList>` is COMPSs' own single-node topology: the master runs tasks
+itself. A **bare** `<MasterNode/>` contributes no slots at all. The server
+writes both files; this is only for reading one it produced.
 
-    my_obj = MyClass()
-    my_obj.method()
-    compss_delete_object(my_obj)
-    ...
-```
+## Source rules
 
-The corresponding task definition for the example above would be (Code 138):
-
-### Code 138 PyCOMPSs delete API usage tasks
-
-```python
-@task(f=FILE_OUT)
-def func(f):
-    ...
-
-class MyClass(object):
-    ...
-
-    @task()
-    def method(self):
-        ... # self is modified here
-```
-
-## Task Groups
-
-COMPSs also enables to specify task groups. To this end, COMPSs provides the `TaskGroup` context (Code 139) which can be tuned with the group name, and a second parameter (boolean) to perform an implicit barrier for the whole group. Users can also define task groups within task groups.
-
-### `TaskGroup(group_name, implicit_barrier=True)`
-
-Python context to define a group of tasks. All tasks submitted within the context will belong to `group_name` context and are sensitive to wait for them while the rest are being executed. Tasks groups are depicted within a box into the generated task dependency graph.
-
-### Code 139 PyCOMPSs Task group definition
-
-```python
-from pycompss.api.task import task
-from pycompss.api.api import TaskGroup
-from pycompss.api.api import compss_barrier_group
-
-@task()
-def func1():
-    ...
-
-@task()
-def func2():
-    ...
-
-if __name__=='__main__':
-    # Creation of group
-    with TaskGroup('Group1', False):
-        for i in range(NUM_TASKS):
-            func1()
-            func2()
-        ...
-    ...
-    compss_barrier_group('Group1')
-    ...
-```
-
-### `compss_barrier_group(group_name)`
-
-Task Groups are commonly used to implement the exception mechanism in PyCOMPSs applications (see `@on_failure` section for more information about this feature.). Moreover, developers can also cancel task groups using the `compss_cancel_group` API call, indicating the name of the group to cancel as depicted in (Code 140).
-
-### Code 140 PyCOMPSs Task group cancellation
-
-```python
-from pycompss.api.task import task
-from pycompss.api.api import TaskGroup
-from pycompss.api.api import compss_cancel_group
-
-@task()
-def func1():
-    ...
-
-@task()
-def func2():
-    ...
-
-if __name__=='__main__':
-    # Creation of group
-    with TaskGroup('Group1', False):
-        for i in range(NUM_TASKS):
-            func1()
-            func2()
-        ...
-    ...
-    compss_cancel_group('Group1')
-    ...
-```
-
-## Other
-
-PyCOMPSs also provides other function within its API to check if a file exists.
-
-### `compss_file_exists(*file_name)`
-
-Checks if a file or files exist. If it does not exist, the function checks if the file has been accessed before by calling the runtime.
-
-Code 141 illustrates its usage.
-
-### Code 141 PyCOMPSs API file exists usage
-
-```python
-from pycompss.api.api import compss_file_exists
-
-if __name__=='__main__':
-    my_file = 'file.txt'
-    func(my_file)
-    if compss_file_exists(my_file):
-        print("Exists")
-    else:
-        print("Not exists")
-    ...
-```
-
-The corresponding task definition for the example above would be (Code 142):
-
-### Code 142 PyCOMPSs delete API usage tasks
-
-```python
-@task(f=FILE_OUT)
-def func(f):
-    ...
-```
-
-## API Summary
-
-Finally, Table 13 summarizes the API functions to be used in the main program of a COMPSs Python application.
-
-### Table 13 COMPSs Python API functions
-
-| Type | API Function | Description |
-|---|---|---|
-| Synchronization | `compss_open(file_name, mode=’r’)` | Synchronizes for the last version of a file and returns its file descriptor. |
-| Synchronization | `compss_wait_on_file(*file_name)` | Synchronizes for the last version of the specified file/s. |
-| Synchronization | `compss_wait_on_directory(*directory_name)` | Synchronizes for the last version of the specified directory or directories. |
-| Synchronization | `compss_barrier(no_more_tasks=False)` | Wait for all tasks submitted before the barrier. |
-| Synchronization | `compss_barrier_group(group_name)` | Wait for all tasks that belong to `group_name` group submitted before the barrier. |
-| Synchronization | `compss_wait_on(*obj, mode=”r” | “rw”)` | Synchronizes for the last version of an object (or a list of objects) and returns it. |
-| File/Object deletion | `compss_delete_file(*file_name)` | Notifies the runtime to remove the given file/s. |
-| File/Object deletion | `compss_delete_object(*object)` | Notifies the runtime to delete the associated file to the object/s. |
-| Task Groups | `TaskGroup(group_name, implicit_barrier=True)` | Context to define a group of tasks. `implicit_barrier` forces waiting on context exit. |
-| Task Groups | `compss_cancel_group(group_name)` | Cancel all the task defined in a TaskGroup |
-| Other | `compss_file_exists(*file_name)` | Check if a file or files exist. |
+The COMPSs docs discourage relative imports in the application; use absolute
+imports.

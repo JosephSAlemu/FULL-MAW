@@ -842,18 +842,29 @@ class Orchestrator(Agent):
                 f"{_step} is {result.next}[/dim yellow]"
             )
 
-        # THE ONE EXCEPTION. At the approval step the orchestrator may replace
-        # the package list -- the installer has no language model, so a
-        # different list is the only thing that changes the outcome.
+        # THE TWO EXCEPTIONS. The orchestrator never sends an agent back, so the
+        # only way it can act on an objection is to fix the thing itself and let
+        # the fixed version travel forward on the normal route.
         if _step == AgentSteps.INSTALLER_REQUIREMENTS_PENDING_APPROVAL:
+            # The installer has no language model, so a different list is the
+            # only thing that changes the outcome.
             if result.requirements_override:
-                result.requirements_approved = True
                 console.print(
                     "[yellow][orchestrator] correcting requirements.txt to: "
                     f"{', '.join(result.requirements_override)}[/yellow]"
                 )
-            else:
-                result.requirements_approved = True
+            result.requirements_approved = True
+
+        tasks_update: dict = {}
+        if _step == AgentSteps.PLANNER_COMPLETE and result.tasks_override:
+            # The corrected plan goes forward to the installer on the fixed
+            # route; the planner is not re-entered.
+            tasks_update["tasks"] = result.tasks_override
+            console.print(
+                f"[yellow][orchestrator] replacing the planner's "
+                f"{len(state.get('tasks', []))} task(s) with "
+                f"{len(result.tasks_override)} corrected task(s)[/yellow]"
+            )
 
         # FEEDBACK GOES NOWHERE. The installer is corrected with a list, not
         # with prose, and no other agent is ever revised -- so there is no
@@ -891,6 +902,7 @@ class Orchestrator(Agent):
             "requirements_approved": result.requirements_approved,
             "requirements_override": result.requirements_override,
             "current_step":          f"orchestrator_routed_to_{result.next}",
+            **tasks_update,
             **revision_update,
         }
 

@@ -14,18 +14,13 @@ description: >
 The companion to `systems/parsl`. That skill states the rules every generated
 driver must obey; this one is the API manual you consult while writing it.
 
-Nothing here overrides the contract. If a snippet below appears to permit
-something `systems/parsl` forbids -- a `subprocess` call, an `mpirun` string
-outside a `@bash_app` body, a driver that never loads a config -- the contract
-wins. Note that `write_file` no longer refuses these for you: it rejects only a
-syntax error and reports the rest as warnings, so a file that takes the work
-outside Parsl will be written and will run. The contract still binds.
+Nothing here overrides the contract: if a snippet seems to permit something
+`systems/parsl` forbids, the contract wins.
 
 Signatures below were read from **parsl 2026.10.19**. Defaults and parameter
-names change between releases, and the installed version may differ -- a cluster
-pinned to 2026.08.10, for instance, is a different release from this one.
-`check_package("parsl")` reports what is actually installed; when a signature
-here disagrees with that version, the installed one wins.
+names change between releases. `check_package("parsl")` reports what is
+actually installed; when a signature here disagrees with that version, the
+installed one wins.
 
 ---
 
@@ -35,12 +30,10 @@ here disagrees with that version, the installed one wins.
 
 ### `parsl.load(config: Optional[Config] = None) -> DataFlowKernel`
 Starts the DataFlowKernel and the executors the config declares. Must be called
-before any app is invoked. Called with no argument, Parsl uses a built-in
-single-node default; the contract requires an explicit `Config`.
+before any app is invoked. Pass an explicit `Config`.
 
 ### `parsl.clear() -> None`
-Shuts the DataFlowKernel down and releases the executors. Call it at the end of
-the driver, in a `finally`, so a failing app still tears the runtime down.
+Shuts the DataFlowKernel down and releases the executors. Call it in a `finally`.
 
 ### `parsl.dfk() -> DataFlowKernel`
 The currently loaded DataFlowKernel. Rarely needed in a generated driver.
@@ -51,17 +44,15 @@ final future when the driver has no single terminal result.
 
 ### `parsl.AUTO_LOGNAME`
 Sentinel (`-1`) for `stdout`/`stderr`. Parsl picks a per-task filename under its
-`run_dir`, in `task_logs/`. Preferred over a hand-chosen path: two tasks cannot
-collide, and the file is named for the task that wrote it.
+`run_dir`, in `task_logs/`, so two tasks cannot collide.
 
 ---
 
 ## App decorators
 
 ### `@python_app(function=None, data_flow_kernel=None, cache=False, executors='all', ignore_for_cache=None)`
-Runs the decorated function on a worker. The body must import everything it
-uses: a worker process does not share the driver's namespace. Returns an
-`AppFuture` immediately.
+Runs the decorated function on a worker (scoping rules: `systems/parsl`).
+Returns an `AppFuture` immediately.
 
 ### `@bash_app(function=None, data_flow_kernel=None, cache=False, executors='all', ignore_for_cache=None)`
 The decorated function **returns a command string**, which Parsl runs in a
@@ -96,9 +87,7 @@ Accepted by any app, consumed by Parsl rather than passed to the function body.
 | `outputs` | sequence of `File` | Declares products. Parsl returns a `DataFuture` per entry on `.outputs` |
 | `stdout` | path or `AUTO_LOGNAME` | Where the command's stdout goes (`@bash_app`) |
 | `stderr` | path or `AUTO_LOGNAME` | Where its stderr goes. Parsl also writes the executed command string here, between `--> executable follows <--` markers |
-| `walltime` | seconds | Per-app timeout; exceeding it raises `AppTimeout` |
-
-**IN ALL BASH_APPS, ALWAYS SET THE WALLTIME PARAMETER FOR EVERY METHOD WITH THE BASH APP ANNOTATION. HAVE THAT PARAMETER MATCH THE WALLTIME OF THE PBSPRO WALLTIME IN SECONDS.IF YOU CAN'T FIND IT ASSUME THE WALLTIME IS AN HOUR IN SECONDS.**
+| `walltime` | seconds | Per-app timeout; exceeding it raises `AppTimeout`. Value rule is in `systems/parsl` |
 
 Inside the body, read paths off the objects rather than rebuilding them:
 `outputs[0].filepath` is the path the command must write, and it is the same
@@ -144,84 +133,43 @@ A location-independent handle on a file.
 | `.filename` | `y.txt` |
 | `.scheme` | `file` |
 
-A bare path gets scheme `file`. `http://`, `https://`, `ftp://` and `globus://`
-URLs are also accepted and are staged by the executor's `storage_access`.
-
-### Example:
+A bare path gets scheme `file`.
 
 ---
 
 ## Configuration
 
 ### `Config(...)`
-Key parameters for a generated driver:
+The keys a generated driver sets; the skeleton itself is in `systems/parsl`.
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `executors` | `None` | The executors to start. Required in practice |
-| `run_dir` | `'runinfo'` | Where Parsl writes block logs, submit scripts and `task_logs/`. Relative to the process cwd unless set absolutely |
+| `run_dir` | `'runinfo'` | Where Parsl writes block logs and `task_logs/`; relative to the cwd unless absolute |
 | `retries` | `0` | Automatic retries per task |
-| `retry_handler` | `None` | `(Exception, TaskRecord) -> float` deciding whether and how long to wait before retrying |
-| `strategy` | `'simple'` | Block scaling strategy; `'none'` pins the block count to the provider's settings |
-| `strategy_period` | `5` | Seconds between scaling decisions |
-| `max_idletime` | `120.0` | Seconds an idle block survives before `'simple'` scales it in |
+| `strategy` | `'simple'` | Block scaling; `'none'` pins the block count |
 | `initialize_logging` | `True` | Whether Parsl configures logging itself |
-| `app_cache` / `checkpoint_mode` | — | Memoization and checkpointing, when `cache=True` apps are used |
 
 ### `HighThroughputExecutor(...)`
-The general-purpose executor.
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `label` | `'HighThroughputExecutor'` | Name used by `executors=[...]` on an app |
 | `provider` | `None` | Where blocks come from |
-| `max_workers_per_node` | `None` | Hard cap on workers per node. **This is what expresses "one wide slot"** |
-| `cores_per_worker` | `1.0` | Cores each worker claims. Parsl divides detected cores by this to decide the worker count, so a large value alone does **not** give one worker -- pair it with `max_workers_per_node=1` |
-| `mem_per_worker` | `None` | GB per worker, as a second cap |
-| `cpu_affinity` | `'none'` | `'block'` or `'alternating'` to pin workers to cores |
-| `working_dir` | `None` | Worker cwd |
-| `worker_debug` | `False` | Verbose worker logs |
-| `encrypted` | `True` | Encrypt the worker/interchange channel |
+| `max_workers_per_node` | `None` | Hard cap on workers per node: the concurrency knob |
+| `cores_per_worker` | `1.0` | Divisor for the worker count, not a reservation (see `systems/parsl`) |
+| `cpu_affinity` | `'none'` | `'block'` or `'alternating'` pins workers to cores |
 
-### Providers
-
-#### `LocalProvider(nodes_per_block=1, launcher=SingleNodeLauncher(), init_blocks=1, min_blocks=0, max_blocks=1, worker_init='', cmd_timeout=30, parallelism=1)`
-Runs blocks on the current machine. The right provider for a driver that is
-already inside an allocation -- it does not submit anything.
-
-#### `PBSProProvider(account=None, queue=None, scheduler_options='', select_options='', worker_init='', nodes_per_block=1, cpus_per_node=1, init_blocks=1, min_blocks=0, max_blocks=1, parallelism=1, launcher=SingleNodeLauncher(), walltime='00:20:00', cmd_timeout=120)`
-Submits blocks with `qsub`. The select line is built as:
-
-```
-#PBS -l select=${nodes_per_block}:ncpus=${cpus_per_node}${select_options}
-```
-
-so `ncpus` comes from `cpus_per_node` and `select_options` is appended after
-it. Both default to 1 per chunk. Putting `ncpus=` in `select_options` as well
-produces a duplicate in the same chunk and `qsub` rejects the job with
-"duplicated resource within a section of a select specification".
-
-| Parameter | Note |
-|---|---|
-| `account` | The project to charge |
-| `cpus_per_node` | Becomes `ncpus` -- cores reserved per node |
-| `select_options` | Appended to the chunk, e.g. `"mpiprocs=4"`. A leading colon is added if absent |
-| `scheduler_options` | Extra `#PBS` lines, verbatim |
-| `worker_init` | Shell run on the node before the worker starts -- modules, venv, environment script |
-| `nodes_per_block` | Nodes per block, i.e. the `select` count |
-| `init_blocks`/`min_blocks`/`max_blocks` | All equal pins the topology; no scaling |
+### `LocalProvider(nodes_per_block=1, launcher=SingleNodeLauncher(), init_blocks=1, min_blocks=0, max_blocks=1, worker_init='', cmd_timeout=30, parallelism=1)`
+Runs blocks on the current machine without submitting anything. `worker_init`
+is shell run before each worker starts.
 
 ### Launchers
 
 | Launcher | Starts the worker as |
 |---|---|
-| `SingleNodeLauncher()` | One worker on the block's head node. Correct when the block's own MPI work is launched from inside an app |
+| `SingleNodeLauncher()` | One worker pool on the block's head node |
 | `SimpleLauncher()` | One worker, no wrapping |
-| `MpiExecLauncher()` | Workers via `mpiexec` across the block's nodes |
-| `SrunLauncher()` | Workers via `srun`, for Slurm |
-
-Wrapping the worker in an MPI launcher and then launching MPI inside an app
-nests two MPI jobs; pick one level.
 
 ---
 
@@ -234,10 +182,4 @@ From `parsl.app.errors`:
 | `BashAppNoReturn` | A `@bash_app` body returned `None` instead of a command string |
 | `BashExitFailure` | The command exited non-zero. `.exitcode` carries the status |
 | `AppTimeout` | A `walltime` was exceeded |
-| `MissingOutputs` | A declared `outputs` file does not exist after the app finished. **The honest output check** -- it is about files this app declared, so a stale file from an earlier run cannot satisfy it the way a `test -s` in the command string can |
-| `AppBadFormatting` | The command string failed to format |
-| `BadStdStreamFile` | `stdout`/`stderr` could not be opened |
-
-`parsl.executors.errors.BadStateException` is raised when an executor cannot
-start its blocks at all -- a rejected `qsub` surfaces here, with the scheduler's
-stderr quoted.
+| `MissingOutputs` | A declared `outputs` file does not exist after the app finished. A stale file from an earlier run cannot satisfy it the way a `test -s` can |

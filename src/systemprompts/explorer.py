@@ -191,6 +191,40 @@ single mpirun, with `stage` blocks re-entering this same file as
 `python workflow.py --stage <name>`. The file then dispatches on --stage rather
 than running a sequential main().
 """,
+
+    "wilkins": EXEC_PROMPT_HEAD + """
+### Call `check_lowfive` FIRST (Wilkins)
+
+Wilkins transports data in memory by intercepting the tasks' HDF5 calls through
+LowFive, which is switched on by two ENVIRONMENT VARIABLES, not by the config.
+With them unset, HDF5 uses its native VOL, every task writes a real `.h5` file,
+and the workflow **completes having transported nothing, with no error
+anywhere**. `check_lowfive` is the only way to catch that, so call it before you
+write anything. If it reports `lowfive_active: false`, that is an environment
+gap: report it and stop.
+
+### The config IS the workflow (Wilkins)
+
+Use `write_config`, not `write_file`, for the YAML. The file name must end in
+`yaml`. It is a list of tasks, each naming the program to run (`func`), its rank
+count (`nprocs`), and the datasets it produces (`outports`) and consumes
+(`inports`). Wilkins matches an outport to an inport by filename and dataset
+name, with globs, and builds a channel per match -- **you never declare edges**.
+
+Per dataset, `metadata: 1` transports it in memory over MPI and `passthru: 1`
+writes it through to a real HDF5 file. The defaults are `metadata: 1,
+passthru: 0`. Setting both to 0 is a hard error.
+
+Then write each task's program with `write_file`. A `.py` task is imported as a
+module and **must define `main()`** -- without one it silently does nothing. A
+non-`.py` task must be a Henson-linked shared object named `./<name>.hx`; a
+plain MPI binary cannot be a task.
+
+The launcher's rank count is the SUM over tasks of `taskCount x nprocs`, and the
+server reads it from the config -- so state `nprocs` on every task and pass
+`ranks=0` to `run_workflow`. Launching short does not run a smaller workflow; it
+starves the tasks at the tail.
+""",
 }
 
 # __ Engine references ________________________________________________________
@@ -201,6 +235,7 @@ ENGINE_SKILLS = {
     "parsl":    ("systems/parsl",    "knowledge/PARSL"),
     "pycompss": ("systems/pycompss", "knowledge/PyCOMPSs"),
     "adios":    ("systems/adios",    "knowledge/ADIOS"),
+    "wilkins":  ("systems/wilkins",  "knowledge/WILKINS"),
 }
 
 # Tool calls whose result says something about whether the engine was really

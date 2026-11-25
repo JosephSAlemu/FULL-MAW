@@ -99,14 +99,18 @@ class OrchestratorOutput(BaseModel):
     #: withheld approval could achieve on its own.
     requirements_approved: bool = False
 
-    #: THE ONE FIELD THAT CHANGES ANYTHING. The corrected package list, when
-    #: the orchestrator does not want the one the installer wrote.
-    #:
-    #: The installer has no language model: it writes a list to disk and runs
-    #: pip. So a different list is the only thing that alters the outcome, and
-    #: the orchestrator -- the agent holding the objection -- supplies it
-    #: rather than asking anyone else to.
+    #: The corrected package list, when the orchestrator does not want the one
+    #: the installer wrote. The installer has no language model -- it writes a
+    #: list to disk and runs pip -- so a different list is the only thing that
+    #: alters the outcome, and the orchestrator supplies it itself.
     requirements_override: list[str] = []
+
+    #: The corrected TASK list, when the orchestrator finds a problem in the
+    #: planner's output. Same principle as requirements_override: the
+    #: orchestrator fixes it rather than sending it back, because the planner
+    #: owns the plan and re-entering it costs a full LLM session plus a PDF
+    #: re-read, observed to return the same output. Empty means no correction.
+    tasks_override:        list[str] = []
 
     #: First call only.
     skill_requests:        list[str] = []

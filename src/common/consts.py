@@ -141,10 +141,10 @@ ENV_KNOWLEDGE = {
 # keeps working. Nothing is redirected any more.
 #
 # It used to map use_cases/<key>/<agent> to a consolidated file, so that asking
-# for cosmology's per-agent skills quietly got you new_comsology/domain instead.
+# for cosmology's per-agent skills quietly got you new_cosmology/domain instead.
 # That existed because the folder was chosen by matching a --domain label rather
-# than being named outright. It is now named outright: `--use-case new_comsology`
-# loads that folder, and `--use-case cosmology` loads the other one, with no
+# than being named outright. It is now named outright: `--domain new_cosmology`
+# loads that folder, and `--domain cosmology` loads the other one, with no
 # table in between deciding which you actually meant.
 #
 # Add an entry only to make one folder's skill requests resolve to a different
