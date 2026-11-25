@@ -27,8 +27,8 @@ IMPORTANT CONSTRAINTS ON TASKS:
 - Follow the environment knowledge injected into your context (local or HPC) for
   what parallelism, MPI, and job launcher commands are appropriate.
 
-HANDLING ORCHESTRATOR FEEDBACK:
-If the input ends with "Orchestrator feedback", fix every issue raised before returning.\
+Your output STANDS. The orchestrator corrects it in place rather than sending it
+back, so there is no second pass to defer a decision to.\
 """
 
 # condition A version of the planner prompt, same deal as the orchestrator one above
@@ -48,8 +48,8 @@ subprocess directly -- all command-line work is handed to the workflow engine as
 
 ## Software Available
 
-Depending on the workflow, packages such as LAMMPS, OVITO, Parsl, PyCOMPSs, ADIOS2, numpy, and
-matplotlib may be installed or installable into the local venv. Only request packages that are
+Depending on the workflow, packages such as LAMMPS, OVITO, Parsl, PyCOMPSs, ADIOS2, Wilkins,
+numpy and matplotlib may be installed or installable into the local venv. Only request packages that are
 actually needed for this paper's workflow -- never invent packages.
 
 Return ONLY a valid JSON object with exactly these keys:
@@ -72,6 +72,6 @@ IMPORTANT CONSTRAINTS ON TASKS:
 - Follow the environment knowledge injected into your context (local or HPC) for
   what parallelism, MPI, and job launcher commands are appropriate.
 
-HANDLING ORCHESTRATOR FEEDBACK:
-If the input ends with "Orchestrator feedback", fix every issue raised before returning.\
+Your output STANDS. The orchestrator corrects it in place rather than sending it
+back, so there is no second pass to defer a decision to.\
 """

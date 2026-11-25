@@ -402,9 +402,10 @@ def write_config(content: str, filename: str = "") -> str:
     Per dataset: `metadata: 1` transports it in memory over MPI, `passthru: 1`
     writes it through to a real HDF5 file. Both 0 means it goes nowhere.
 
-    The launcher's rank count is the SUM of every task's nprocs, and the server
-    reads it from this file -- so state nprocs on every task and pass ranks=0
-    to run_workflow.
+    The launcher's rank count is the SUM over tasks of taskCount x nprocs, and
+    the server reads it from this file -- so state nprocs on every task and pass
+    ranks=0 to run_workflow. Launching short does not run a smaller workflow; it
+    starves the tasks at the tail.
 
     Args:
         content: the full YAML document
@@ -656,9 +657,9 @@ def _adios_only_tools() -> list:
 
 
 # Tools that exist for one engine only, bound just for that engine so the model
-# is never offered a tool the server does not implement. PyCOMPSs needs its XML
-# topology written before the runtime can start; Wilkins needs its YAML and the
-# LowFive check; ADIOS depends on the build (see above); parsl needs nothing.
+# is never offered a tool the server does not implement. PyCOMPSs's write_xml is
+# an OVERRIDE -- the server generates the topology itself; Wilkins needs its YAML
+# and the LowFive check; ADIOS depends on the build; parsl needs nothing.
 _ENGINE_ONLY_TOOLS = {
     "pycompss": [write_xml],
     "wilkins":  [write_config, check_lowfive],

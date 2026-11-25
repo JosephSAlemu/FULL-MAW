@@ -58,6 +58,8 @@ In addition to the variables in src/servers/server.py:
                               host in PBS_NODEFILE without checking.
     MAW_COMPSS_ENV_SCRIPT     script COMPSs sources on each worker. Default: a
                               generated one restating JAVA_HOME.
+    MAW_COMPSS_MPIRUN         absolute launcher path for @mpi(runner=...).
+                              Default: MAW_MPI_LAUNCHER resolved on PATH.
     COMPSS_MPIRUN_TYPE        MPI dialect COMPSs builds @mpi args for.
                               Default: "ompi".
 
@@ -69,6 +71,7 @@ than the one pip put in that venv is not something this server will help with.
 import os
 import re
 import shlex
+import shutil
 import time
 
 if __package__:
@@ -681,15 +684,37 @@ class PyCompssServer(Server):
     DEFAULT_MPIRUN_TYPE = "openmpi"
 
     def launch_env(self) -> dict:
-        """Inherited environment, plus the MPI dialect COMPSs builds args for.
+        """Inherited environment, plus the MPI dialect and the resolved launcher.
 
         Set here and not in the generated file: by the time the application
         module is imported the JVM already has its copy of the environment.
+
+        COMPSS_MPIRUN is exported because @mpi's `runner=` has to be an ABSOLUTE
+        path -- a bare "mpirun" resolves off the worker's own thin PATH and a
+        miss there is exit 127, three resubmissions and a TOTALLY FAILED task.
+        The skill tells the agent to read this variable, so something has to
+        put it there.
         """
         env = super().launch_env()
         env.setdefault("COMPSS_MPIRUN_TYPE",
                        os.environ.get("COMPSS_MPIRUN_TYPE", self.DEFAULT_MPIRUN_TYPE))
+        runner = self.mpi_runner()
+        if runner:
+            env.setdefault("COMPSS_MPIRUN", runner)
         return env
+
+    def mpi_runner(self) -> str:
+        """Absolute path of the launcher for @mpi(runner=...), or "".
+
+        MAW_COMPSS_MPIRUN wins; otherwise the launcher name is resolved on PATH
+        here, in the master, where the environment is the one the operator
+        built. "" means it was not found, which is worth reporting rather than
+        papering over with a bare name that fails on the worker.
+        """
+        explicit = os.environ.get("MAW_COMPSS_MPIRUN", "")
+        if explicit:
+            return explicit
+        return shutil.which(self.mpi_launcher) or ""
 
     def resource_info(self) -> dict:
         """Report the launcher, the XML state and the topology COMPSs will see.
@@ -699,8 +724,12 @@ class PyCompssServer(Server):
         the first call rather than after a failed run.
         """
         plan = self._topology or self.plan_topology()
+        runner = self.mpi_runner()
         return {
             "launcher": f"{self.python} -m pycompss",
+            # What @mpi(runner=...) must be given. "" means the launcher was not
+            # found on PATH -- report that; a bare name fails on the worker.
+            "mpi_runner": runner,
             "compss_install_dir": self.compss_install_dir,
             "compss_xml": {
                 kind: {

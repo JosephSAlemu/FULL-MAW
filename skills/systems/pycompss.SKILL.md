@@ -249,7 +249,7 @@ omitting any one of them has produced a `TOTALLY FAILED` task on this cluster.
 ```python
 import os
 
-RUNNER = os.environ.get("COMPSS_MPIRUN", "mpirun")   # absolute, not a bare name
+RUNNER = os.environ.get("COMPSS_MPIRUN", "mpirun")   # absolute; see below
 
 @mpi(binary=SIM_EXE,
      runner=RUNNER,                         # 1. absolute, else exit 127
@@ -268,10 +268,13 @@ multi-node MPI run needs **no shell, no wrapper and no `subprocess`**.
 
 **`runner=` must be an absolute path.** A bare `"mpirun"` resolves off the
 *worker's* `PATH` and a miss there is exit 127, three resubmissions and a
-`TOTALLY FAILED` task. Read the resolved launcher from the environment —
-decorator arguments are evaluated in the master, so a module-level constant is
-fine here. Use `.get` with a fallback, never `os.environ["..."]`, which raises
-at import before any task is submitted and looks exactly like "nothing ran".
+`TOTALLY FAILED` task. The server resolves it in the master and reports it as
+`mpi_runner` in `get_resources`, and exports the same value as `COMPSS_MPIRUN`
+— so read that variable, with `.get` and a fallback, never
+`os.environ["..."]`, which raises at import before any task is submitted and
+looks exactly like "nothing ran". Decorator arguments are evaluated in the
+master, so a module-level constant is fine here. **An empty `mpi_runner` means
+the launcher was not found: report it, do not fall back to a bare name.**
 
 ### `processes_per_node` IS NOT OPTIONAL
 
@@ -407,7 +410,7 @@ with these four, report that rather than reaching for one.
 | Writing a `.sh`, `.pbs` or any file other than the workflow `.py` | Two XML files (server) and one Python file (you). Nothing else |
 | `@mpi(processes=N)` without `processes_per_node`, or set to anything but `units_per_host` | It defaults to **1**, so N is read as N NODES. 1x8 and 2x4 are both eight ranks and are not interchangeable |
 | A `@binary`/`@mpi` task with edge-only parameters and no `args=` | Every parameter lands on argv. Name the real arguments in `args="{{a}} {{b}}"` |
-| `runner="mpirun"` as a bare name | Resolved off the worker's thin PATH; exit 127. Use `os.environ.get("COMPSS_MPIRUN", "mpirun")` |
+| `runner="mpirun"` as a bare name | Resolved off the worker's thin PATH; exit 127. Use `get_resources`' `mpi_runner`, or `os.environ.get("COMPSS_MPIRUN")` |
 | Rebuilding a `FILE_OUT` path, appending an extension, or `copy2`-ing onto one | You get a renamed sandbox path. Write to the parameter you were given; `np.save` and `fig.savefig` both guess at extensions, so use an open handle or pass `format=`. To re-export an existing file, pass it as `FILE_IN` |
 | `total_slots: 0` in `compss_topology` | No worker can start; the run is refused. Report the gap and stop |
 | Looking for a decorator that sources an env file, or one outside the four here | Neither exists. Report what you cannot express instead |

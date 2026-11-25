@@ -59,8 +59,9 @@ you write beside the config.
 
 ## The config
 
-- The config filename must end in `yaml` -- `wilkins.yaml`. A `.yml` name is
-  rejected by the driver (`write_config` will still write it; it will not run).
+- The config filename must end in `yaml` -- `wilkins.yaml`. `write_config`
+  rejects a `.yml` name outright, because the driver would reject it after the
+  launch.
 - The only top-level key is `tasks`. Each task REQUIRES `func` and `nprocs`;
   omit either and the parser throws and the run exits.
 - `args` is a list of **strings**. Quote numbers: `args: ["100", "0.5"]`.
@@ -294,11 +295,9 @@ declaration order get no ranks and never run, and the driver prints `Wilkins
 error: Group sizes of producer, consumer, and dataflow exceed total size of
 world communicator`. Extra ranks idle.
 
-**Check the server's number.** `write_config` reports `total_ranks`, but the
-server sums only `nprocs` and defaults a missing `nprocs` to 1. It does not
-multiply by `taskCount`. For any config with `taskCount > 1` compute the total
-yourself from the rule above. Prefer `taskCount: 1` (omit it) with Python
-tasks: see Pitfalls.
+`write_config` reports `total_ranks` by that rule, so `ranks=0` on
+`run_workflow` uses the right number -- check it against your own sum anyway.
+Prefer `taskCount: 1` (omit it) with Python tasks: see Pitfalls.
 
 # Practices
 
@@ -359,8 +358,9 @@ task code, then confirm each `.py` task defines `main`.
 3. Write each task program as a `.py` module with `main()`, using the literal
    filename and dataset path from step 2.
 4. Write the YAML with `write_config`. Read the returned `warnings` and fix
-   each, remembering the server's `total_ranks` ignores `taskCount`.
-5. Work out the rank total yourself: the sum of `taskCount x nprocs`.
+   each.
+5. Check the rank total `write_config` reports against your own sum of
+   `taskCount x nprocs`.
 6. `run_workflow(filename="wilkins.yaml", ranks=0)`.
 7. Verify in-memory transport happened: the channel files (`outfile.h5`) must
    NOT appear on disk, and each consumer must have printed its data.
@@ -417,7 +417,6 @@ Total = 2 + 1 + 1 = **4**. Each consumer gets its own `io_freq`.
 | One side a glob, the other a literal | The pairing depends on which task is declared first. Use identical strings both sides |
 | `io_freq` on an outport | Only inports take it. Values: a positive integer, or `latest` |
 | Launching with fewer ranks than the sum | The tail tasks starve and never run. Use `ranks=0` |
-| Trusting `total_ranks` with `taskCount > 1` | The server does not multiply by `taskCount`. Compute `taskCount x nprocs` per task yourself |
 | `taskCount > 1` on a Python task | The driver switches to Henson `./<func>-inst<N>.hx` for that task and every later one. Keep `taskCount` out of Python workflows |
 | `taskCount > 1` with a dotless filename | The port filename is split at its FIRST dot; with no dot the config load crashes. Use `name.h5` |
 | Reordering tasks after sizing them | Ranks follow declaration order, so reordering moves every task's ranks |
