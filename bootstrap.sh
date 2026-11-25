@@ -168,11 +168,19 @@ case "${MAW_ADIOS:-serial}" in
         note "MAW_ADIOS=serial -- adios2 from PyPI (SST, no MPI)"
         ;;
     mpi)
-        note "MAW_ADIOS=mpi -- adios2 comes from the engines environment"
-        echo "    removing the PyPI wheel so there is only one adios2"
-        venv3/bin/python3 -m pip uninstall -y adios2 >/dev/null 2>&1 || true
-        echo "    add this to spack_mpi/spack.yaml's specs, then rebuild:"
-        echo "        - adios2 +mpi +python +sst ~fortran ~hdf5"
+        note "MAW_ADIOS=mpi -- tasks load the +mpi adios2 module"
+        # The wheel STAYS. Both builds coexist: PYTHONPATH precedes the venv's
+        # site-packages in sys.path, so `module load adios2/<ver>-<mpi>`
+        # shadows the wheel and `module unload` restores it. Nothing is
+        # installed or removed to switch, which is what makes the choice a
+        # per-task one rather than a per-machine one.
+        echo "    the PyPI wheel stays; the module shadows it when loaded"
+        echo "    build the +mpi one, if you have not already:"
+        echo "        module load <the MPI your domains use>"
+        echo "        cd spack_mpi && cp spack.yaml.in spack.yaml"
+        echo "        # uncomment: - adios2 +mpi +python +sst ~fortran ~hdf5"
+        echo "        spack -e . external find openmpi mpich intel-oneapi-mpi"
+        echo "        spack -e . install && spack -e . module lmod refresh -y"
         ;;
     *)
         die "MAW_ADIOS must be 'serial' or 'mpi', got '${MAW_ADIOS}'"
@@ -195,10 +203,9 @@ fi
 # The assumption the adios engine rests on, checked rather than trusted. A
 # future wheel built against an MPI would put two implementations in one
 # process once a task loads its domain's, and that hangs rather than erroring.
-_lib=""
-if [ "${MAW_ADIOS:-serial}" = "serial" ]; then
-    _lib="$(venv3/bin/python3 -c 'import adios2,os;print(os.path.dirname(adios2.__file__))' 2>/dev/null || true)"
-fi
+# Checked whatever MAW_ADIOS says: the wheel is installed either way now, and
+# MAW_ADIOS=serial depends on it being serial.
+_lib="$(venv3/bin/python3 -c 'import adios2,os;print(os.path.dirname(adios2.__file__))' 2>/dev/null || true)"
 if [ -n "${_lib}" ] && ls "${_lib}"/libadios2_core.so.* >/dev/null 2>&1; then
     if readelf -d "${_lib}"/libadios2_core.so.* 2>/dev/null | grep -q 'NEEDED.*libmpi'; then
         echo

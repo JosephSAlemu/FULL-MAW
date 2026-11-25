@@ -39,44 +39,26 @@ console = Console()
 # A sibling: this module lives in src/ alongside servers/.
 _SERVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "servers")
 
-# "adios" resolves to one of two servers depending on which ADIOS2 the
-# operator installed -- see MAW_ADIOS in bootstrap.sh:
+# "adios" is ONE server file that starts one of two classes, chosen by
+# MAW_ADIOS at startup -- see src/servers/adios.py's header.
 #
-#   serial  the PyPI wheel. No MPI, SST over TCP, stages are separate files
-#           run concurrently. adios works for every domain whatever MPI it
-#           names, but cannot do MPMD or a collective parallel write.
-#   mpi     built +mpi in the engines environment. MPMD and collective writes,
-#           but bound to that one MPI, so adios becomes gated like wilkins.
+#   serial  the PyPI wheel in venv3. SST over TCP, no MPI. Works for every
+#           domain whatever MPI it names; no MPMD, no collective write.
+#   mpi     the +mpi build in spack_mpi/, reached by `module load adios2/...`
+#           in each task command. MPMD and collective writes, bound to that
+#           one MPI.
 #
-# Resolved here rather than inside the server because the two expose DIFFERENT
-# tools -- run_pipeline versus run_mpmd -- and the explorer's tool list is
-# built from whichever one it connected to.
-_ADIOS_SERVERS = {
-    "serial": os.path.join(_SERVERS_DIR, "adios_sst.py"),
-    "mpi": os.path.join(_SERVERS_DIR, "adios_mpmd.py"),
-}
-
-
-def _adios_server() -> str:
-    """Server file for the installed ADIOS2 build.
-
-    MAW_ADIOS is authoritative; it is what bootstrap.sh acted on, so it matches
-    what is actually on disk. An unrecognised value falls back to serial with a
-    warning rather than failing: the serial server is the one that works for
-    every domain, so it is the safer thing to be wrong about.
-    """
-    choice = os.environ.get("MAW_ADIOS", "serial").strip().lower()
-    if choice not in _ADIOS_SERVERS:
-        print(f"[explorer] MAW_ADIOS={choice!r} is not 'serial' or 'mpi'; "
-              f"using the serial ADIOS2 server.", file=sys.stderr)
-        choice = "serial"
-    return _ADIOS_SERVERS[choice]
-
-
+# BOTH ARE INSTALLED. PYTHONPATH precedes the venv's site-packages in
+# sys.path, so a loaded module shadows the wheel and unloading restores it --
+# nothing is installed or removed to switch. bootstrap.sh keeps both.
+#
+# The choice is read inside the server rather than here because it decides
+# which TOOLS are registered (run_pipeline vs run_mpmd), and the server is the
+# thing that registers them.
 ENGINE_SERVERS = {
     "parsl": os.path.join(_SERVERS_DIR, "parsl_server.py"),
     "pycompss": os.path.join(_SERVERS_DIR, "pycompss_server.py"),
-    "adios": _adios_server(),
+    "adios": os.path.join(_SERVERS_DIR, "adios.py"),
     "wilkins": os.path.join(_SERVERS_DIR, "wilkins.py"),
 }
 
@@ -287,33 +269,156 @@ def write_xml(kind: str, content: str) -> str:
 
 
 @tool
-def run_mpmd(blocks: list, filename: str = "workflow.py", timeout: int = 7200) -> str:
-    """Run the pipeline as ONE mpirun with a rank block per program. ADIOS runs only.
+def run_mpmd(blocks: list, timeout: int = 7200) -> str:
+    """Run the pipeline as ONE mpirun with a rank block per program. ADIOS2 +mpi only.
 
     Use this instead of run_workflow when a compiled MPI binary and the Python
-    stages must be alive AT THE SAME TIME, so ADIOS2's SST engine can stream
-    between them live. run_workflow with `ranks` launches N copies of one
-    program; this launches several different programs as rank blocks of one
-    job, which is the only way an external binary can be one of the roles.
+    stages must be alive AT THE SAME TIME so SST can stream between them live.
+    run_workflow with `ranks` launches N copies of ONE program; this launches
+    several different programs as rank blocks of one job, which is the only way
+    an external binary can be one of the roles.
 
-    Each block is an object with `ranks` plus either `exe` (a program, with
-    optional `args`) or `stage` (the name of a stage function in the workflow
-    file, which is re-entered as `python workflow.py --stage <name>`). At least
-    two blocks, or nothing streams to anything.
+    Each block is an object with `ranks` plus either `file` (a stage file in the
+    work directory, written with write_stage) or `exe` (an external program),
+    plus optional `args`. At least two blocks, or nothing streams to anything.
 
-    The file is re-entered once per stage block, so it must read --stage and
-    dispatch to the named function, and must select the SST engine.
+    EVERY STAGE MUST SPLIT THE COMMUNICATOR. All blocks share one
+    MPI_COMM_WORLD. The server exports ADIOS2_STAGE_COLOR per block; each stage
+    reads it, splits MPI.COMM_WORLD on it, and passes the SPLIT communicator to
+    adios2.Stream(..., comm=app). Two stages with the same colour merge, and the
+    writer's rank count then includes the reader's ranks. run_mpmd refuses a
+    stage file that never reads that variable.
 
     Args:
         blocks: rank blocks in launch order, e.g.
                 [{"ranks": 8, "exe": "/path/sim", "args": ["in.params"]},
-                 {"ranks": 4, "stage": "analyze"}]
-        filename: workflow file the `stage` blocks re-enter (default: workflow.py)
+                 {"ranks": 4, "file": "stage_analysis.py"}]
         timeout: seconds before the run is killed (default: 7200)
     """
-    return _call_mcp_tool("run_mpmd", {
-        "blocks": blocks, "filename": filename, "timeout": timeout,
+    return _call_mcp_tool("run_mpmd", {"blocks": blocks, "timeout": timeout})
+
+
+@tool
+def write_stage(stage: str, content: str, overwrite: bool = True) -> str:
+    """Write one MPMD stage file as stage_<name>.py. ADIOS2 +mpi only.
+
+    A convenience over write_file that enforces the naming run_mpmd expects and
+    checks each stage separately, so a stage that forgot to split its
+    communicator is reported as that stage rather than as a line number in a
+    combined file.
+
+    Args:
+        stage: stage name, e.g. "sim", "analysis", "render"
+        content: the stage's full Python source
+        overwrite: replace an existing file (default: true)
+    """
+    return _call_mcp_tool("write_stage", {
+        "stage": stage, "content": content, "overwrite": overwrite,
     })
+
+
+@tool
+def run_pipeline(stages: list, timeout: int = 7200) -> str:
+    """Run stage files CONCURRENTLY so they stream over SST. Serial ADIOS2 only.
+
+    Use this, not run_workflow, whenever one stage writes an SST stream another
+    reads. run_workflow runs a single file to completion, so a writer started
+    that way streams to nobody -- and in this build it does not even fail: it
+    completes, leaves the .sst directory on disk, and a later reader picks that
+    up as though it had been streamed.
+
+    There is no MPI here, so `ranks` does not apply and stages are ordinary OS
+    processes. Select the SST engine in every stage.
+
+    Args:
+        stages: stage descriptions in start order, at least two, e.g.
+                [{"file": "sim.py"}, {"file": "analysis.py", "delay": 2}]
+                `delay` holds a reader back so the writer opens first.
+        timeout: seconds before every surviving stage is killed (default: 7200)
+    """
+    return _call_mcp_tool("run_pipeline", {"stages": stages, "timeout": timeout})
+
+
+@tool
+def write_bp(name: str, bp_path: str, python_code: str, timeout: int = 1800) -> str:
+    """Write a BP file through a Stream the SERVER opens. Serial ADIOS2 only.
+
+    `python_code` runs with `stream` already bound to an open
+    adios2.Stream(bp_path, "w"). Call stream.write(var, data, shape, start,
+    count) on it directly. Do NOT import adios2 or open your own Stream -- the
+    server did both, and opening the same path twice corrupts it.
+
+    For a stage that streams to another stage, write a stage file and use
+    run_pipeline instead: this runs to completion before returning, so nothing
+    can be reading while it writes.
+
+    Args:
+        name: descriptive name for this write
+        bp_path: output .bp path (/app/ aliases are resolved)
+        python_code: code that calls stream.write(...)
+        timeout: seconds before the write is killed (default: 1800)
+    """
+    return _call_mcp_tool("write_bp", {
+        "name": name, "bp_path": bp_path, "python_code": python_code,
+        "timeout": timeout,
+    })
+
+
+@tool
+def read_bp(name: str, bp_path: str, python_code: str, timeout: int = 1800) -> str:
+    """Read a BP file through a Stream the SERVER opens. Serial ADIOS2 only.
+
+    `python_code` runs with `stream` already bound to an open
+    adios2.Stream(bp_path, "r"). Iterate `for _ in stream.steps():` and call
+    stream.read(var) on it. Do NOT import adios2 or open your own Stream.
+
+    Args:
+        name: descriptive name for this read
+        bp_path: input .bp path (/app/ aliases are resolved)
+        python_code: code that calls stream.read(...)
+        timeout: seconds before the read is killed (default: 1800)
+    """
+    return _call_mcp_tool("read_bp", {
+        "name": name, "bp_path": bp_path, "python_code": python_code,
+        "timeout": timeout,
+    })
+
+
+@tool
+def write_config(content: str, filename: str = "") -> str:
+    """Write the Wilkins workflow YAML. Wilkins runs only. THIS IS the workflow.
+
+    A list of tasks, each naming the program to run (`func`), its rank count
+    (`nprocs`), and the datasets it produces (`outports`) and consumes
+    (`inports`). Wilkins matches an outport to an inport by filename and
+    dataset name and builds a channel for each match -- you do not declare
+    edges.
+
+    Per dataset: `metadata: 1` transports it in memory over MPI, `passthru: 1`
+    writes it through to a real HDF5 file. Both 0 means it goes nowhere.
+
+    The launcher's rank count is the SUM of every task's nprocs, and the server
+    reads it from this file -- so state nprocs on every task and pass ranks=0
+    to run_workflow.
+
+    Args:
+        content: the full YAML document
+        filename: config file name (default: wilkins.yaml)
+    """
+    return _call_mcp_tool("write_config", {"content": content, "filename": filename})
+
+
+@tool
+def check_lowfive() -> str:
+    """Check that LowFive is the active HDF5 VOL. Wilkins runs only. CALL FIRST.
+
+    Wilkins transports data by intercepting HDF5 calls through LowFive, which
+    is enabled by HDF5_VOL_CONNECTOR and HDF5_PLUGIN_PATH -- not by the config.
+    With those unset, HDF5 uses its native VOL, every task writes a real .h5
+    file, and the workflow COMPLETES having transported nothing in memory, with
+    no error anywhere. That is why this has to be checked rather than observed.
+    """
+    return _call_mcp_tool("check_lowfive", {})
 
 
 @tool
@@ -529,20 +634,46 @@ _COMMON_TOOLS = [
     write_file, run_workflow,
 ]
 
+def _adios_only_tools() -> list:
+    """ADIOS's engine-only tools depend on WHICH adios2 the run uses.
+
+    The two variants expose different tools -- run_pipeline for the serial
+    build, run_mpmd and write_stage for the +mpi one -- and the server
+    registers only its own. Binding the wrong set offers the model a tool the
+    server does not implement, which it discovers by calling it.
+
+    An earlier version bound run_mpmd unconditionally, so a MAW_ADIOS=serial
+    run was offered MPMD and never offered run_pipeline, write_bp or read_bp
+    at all.
+    """
+    if os.environ.get("MAW_ADIOS", "serial").strip().lower() == "mpi":
+        return [run_mpmd, write_stage]
+    return [run_pipeline, write_bp, read_bp]
+
+
 # Tools that exist for one engine only, bound just for that engine so the model
 # is never offered a tool the server does not implement. PyCOMPSs needs its XML
-# topology written before the runtime can start; the other two need nothing.
+# topology written before the runtime can start; Wilkins needs its YAML and the
+# LowFive check; ADIOS depends on the build (see above); parsl needs nothing.
 _ENGINE_ONLY_TOOLS = {
     "pycompss": [write_xml],
-    "adios":    [run_mpmd],
+    "wilkins":  [write_config, check_lowfive],
+    "adios":    None,          # resolved per run by _adios_only_tools()
 }
 
 EXPLORER_TOOLS = _COMMON_TOOLS
 
 
 def _tools_for_engine(engine: str) -> list:
-    """Tools to bind for this run: the common set plus this engine's own."""
-    return _COMMON_TOOLS + _ENGINE_ONLY_TOOLS.get(engine, [])
+    """Tools to bind for this run: the common set plus this engine's own.
+
+    `adios` is the one entry resolved per run rather than looked up, because
+    which tools its server registers depends on MAW_ADIOS.
+    """
+    own = _ENGINE_ONLY_TOOLS.get(engine, [])
+    if engine == "adios":
+        own = _adios_only_tools()
+    return _COMMON_TOOLS + own
 
 
 # __ Explorer System Prompt ____________________________________________________
