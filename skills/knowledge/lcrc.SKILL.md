@@ -31,10 +31,11 @@ LCRC compute node (inside an allocation)
             └── MPI tasks launched via: mpirun -n <ranks> <executable>
 ```
 
-Activate the project venv before running:
+Activate the Spack environment before running — it puts the venv on `PATH` and
+sets the compiler, `JAVA_HOME` and the non-MPI library paths:
 
 ```bash
-source /path/to/MCP_Approach/setup_hpc.sh
+spack env activate <repo>
 python academy_agents.py --env hpc --paper 1 --goal "..."
 ```
 
@@ -42,10 +43,10 @@ python academy_agents.py --env hpc --paper 1 --goal "..."
 
 ## MPI Comes From a Module
 
-**No MPI is configured before the run.** `setup_hpc.sh` sets no MPI variables and
-no `LD_LIBRARY_PATH`, and the Spack environment contains nothing MPI-linked. This
-is deliberate: which MPI a run needs is a property of the tools it runs, not of
-the machine, so nothing picks one in advance.
+**No MPI is configured before the run.** The Spack environment sets no MPI
+variables and contains nothing MPI-linked. This is deliberate: which MPI a run
+needs is a property of the tools it runs, not of the machine, so nothing picks
+one in advance.
 
 MPI arrives one way only — **a module, loaded by the task that needs it**:
 
@@ -187,11 +188,12 @@ module load <module> && mpirun -n <ranks> <program> <args>
 You never type these commands into a shell yourself — they go into the generated
 workflow file, and the engine runs them. How depends on the engine:
 
-- **Parsl**: a `@bash_app` whose body returns the command string.
-- **PyCOMPSs**: an `@mpi(binary=..., runner="mpirun", processes=N)` task —
-  `processes=` carries the rank count, so no launcher text is written.
-- **ADIOS2**: a stage function that calls `subprocess` internally, since ADIOS2
-  has no launcher of its own.
+**How, exactly, is in your `systems/<engine>` skill — follow that, not a recipe
+here.** In outline: Parsl puts the command string in a `@bash_app` body;
+PyCOMPSs uses `@mpi(processes=N, processes_per_node=M)` and writes no launcher
+text at all; ADIOS2 and Wilkins launch their stages through the server's own
+tools (`run_pipeline`, `run_mpmd`, `run_workflow` on the YAML) rather than from
+inside a file.
 
 Size the rank count from `get_resources` and the goal rather than hardcoding it.
 

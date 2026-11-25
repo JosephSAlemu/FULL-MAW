@@ -1,541 +1,500 @@
 ---
 name: systems/adios
 description: >
-  ADIOS2 reference for MAW workflows. Covers the generated-file execution model
-  (write_file/run_workflow/run_mpmd), the staged-pipeline structure, Stream read/write
-  round trips, MPMD in-situ streaming over SST, BP format, the
-  MPI-enabled build, and how ADIOS2 differs from Parsl/PyCOMPSs.
+  Writing an ADIOS2 pipeline for MAW: which of the two server variants is
+  running (serial SST or MPI MPMD), the one-file-PER-STAGE contract, the four
+  rank layouts, the Stream calls actually used, and the pitfalls table. Load for
+  every --engine adios run; the API manual is knowledge/ADIOS.
 ---
 
 # ADIOS2 — System Skill
 
-ADIOS2 is a high-performance I/O framework from ORNL for scientific
-simulations. It moves data between workflow stages through BP files, SST
-streams, and in-memory transports.
+ADIOS2 is an I/O and transport library, not a scheduler. It has no task
+decorator and launches nothing. A pipeline is several PROGRAMS, one stage file
+each, that exchange arrays through ADIOS2 streams while they are alive at the
+same time. Load for every `--engine adios` run; the API manual is
+`knowledge/ADIOS`.
 
-Load this skill when generating or debugging an ADIOS2 workflow.
+**This run's engine is ADIOS2. Do not import, use or reference Parsl, PyCOMPSs
+or Wilkins.**
 
----
+# Which variant is running
 
-## READ THIS FIRST: You Write One File, Structured as a Pipeline
+`--engine adios` starts ONE of two server classes, chosen by `MAW_ADIOS`. They
+need DIFFERENT tools. **Determine which you are on before writing anything.**
 
-The adios engine is **generated-file only**. You have these execution tools:
+| | `serial` (THE DEFAULT) | `mpi` |
+|---|---|---|
+| Server class | `AdiosSstServer` | `AdiosMpmdServer` |
+| Engine-only tools | `run_pipeline`, `write_bp`, `read_bp` | `run_mpmd`, `write_stage` |
+| Write a stage with | `write_file` | `write_stage` (names it `stage_<name>.py`) |
+| Concurrency | separate OS processes, started together | rank blocks of ONE `mpirun` |
+| mpi4py in a stage | FORBIDDEN; `comm=` raises | REQUIRED |
+| Collective parallel write | no | yes |
+| External compiled binary as a stage | no | yes, via `exe` |
+| `ranks` on `run_workflow` | ignored | `mpirun -n <ranks>`, every rank runs the same file |
+
+**Serial is the default.** An unset or unrecognised `MAW_ADIOS` starts the serial
+server, so assume serial unless `get_resources` says otherwise.
+
+**Detect it:** call `get_resources` and read `adios2_build`.
+
+| `adios2_build` | Variant |
+|---|---|
+| `serial (PyPI wheel)` (also says `mpi: none`) | serial: `run_pipeline` |
+| `MPI (+mpi +python +sst)` (also gives `launcher`, `color_var`) | mpi: `run_mpmd` |
+
+The tool list agrees. **Never reach for a tool the other variant owns** -- it is not registered here.
+The sections below say which variant each statement applies to; the Rules and
+Stream API apply to both.
+
+# Rules
+
+## Main tools (both variants)
 
 | Tool | What it does |
 |---|---|
-| `write_file(path, content)` | Writes a file under `/app/work/run0/` — the ONE standalone workflow file, and anything it reads |
-| `run_workflow(filename, ranks)` | Launches it as `<python> workflow.py`, or `mpirun -n <ranks> <python> workflow.py` |
-| `run_mpmd(blocks)` | Launches several programs as rank blocks of ONE mpirun. For when a compiled binary must stream to Python stages live |
+| `write_file(path, content)` | Writes a file under `/app/work/run0/`: stage files (serial), inputs, anything a stage reads. A syntax error is rejected; structural problems come back as `warnings` on a file that WAS written |
+| `run_workflow(filename)` | Runs ONE file to completion. For a single standalone program only; never for stages that must stream to each other |
+| `get_resources`, `check_package(pkg)` | Call both before writing; see "Performance and hygiene" |
 
-**You never execute anything yourself.** You do not call the CLI from your
-tools, write a bash script, or write a PBS script. You describe the whole
-pipeline in one file and hand it to the server.
+## ONE FILE PER STAGE, in both variants
 
-### ADIOS2 is an I/O library, not a scheduler
+A pipeline is NOT one file with functions called in order. Each stage (simulate,
+analyze, render, ...) is its own file and its own process. Serial: write each
+with `write_file`, launch with `run_pipeline`. MPI: write each with
+`write_stage`, launch with `run_mpmd`. The only data that crosses between stages
+is what goes through ADIOS2.
 
-This is the key difference from Parsl and PyCOMPSs. ADIOS2 has **no task
-decorator** — no `@bash_app`, no `@task`, nothing that wraps a function and
-schedules it. What it gives you is high-performance data movement between
-stages.
+## Data between stages is a real round trip
 
-So the generated file is a **staged pipeline**, and what matters is that the
-stages are real and that data flows between them through ADIOS2:
+The producing stage does `stream.write(...)`; the consuming stage does
+`stream.read(...)` on the same stream name in ITS OWN process. Reusing an
+in-memory copy, a pickle or a `.npy` is a pipeline that never used the engine,
+and it is the failure this skill most exists to prevent. Both variants warn on a
+file with no `import adios2` or no `.write(` / `.read(`; treat every warning as
+a defect.
 
-- Each stage is a **top-level function**.
-- A **`main()`** calls the stages in order.
-- Inter-stage numerical data moves through ADIOS2: the producing stage calls
-  `stream.write(...)` on an `adios2.Stream(path, "w")`, and the consuming stage
-  reads it back with `stream.read(...)` from an `adios2.Stream(path, "r")`.
-  **Write it, then actually read it back** — do not keep using the in-memory
-  copy, because then no real I/O happened.
-- Human-facing outputs (PNG, summary text) stay plain files. BP is for the
-  numerical arrays flowing between stages.
+Human-facing output (PNG, summary text) stays a plain file. Streams carry the
+numerical arrays between stages.
 
-### CLI steps
+## Select the SST engine in EVERY stage
 
-Because ADIOS2 cannot launch programs, a CLI step for an **external compiled
-binary** is a stage function that uses `subprocess` internally. **That is allowed
-only inside a stage body.** `subprocess` at the top level of the file is rejected
-— at that point the file is a flat script rather than a pipeline.
+The `Stream(path, mode)` shortcut opens a BP file. With BP a reader opens a file
+the writer has not closed and silently reads whatever is there: no error, no
+hang, wrong data. Build an `IO`, call `set_engine("SST")`, and pass it to
+`Stream` (see "Stream API"). Both ends must select SST and use the identical
+stream name.
 
-Python stages must never be subprocesses: they go in this same file and talk to
-each other through ADIOS2. See "MPMD Mode" below for running the whole pipeline
-under a single `mpirun` with zero per-stage subprocesses.
+## Stages must be alive AT THE SAME TIME
 
-### What `write_file` checks
+SST is a live rendezvous, so the writer and its readers must run concurrently.
+That is what `run_pipeline` / `run_mpmd` are for. **`run_workflow` on a lone
+writer does not even fail in the serial build**: it completes, leaves the
+`<name>.sst` directory behind, and a later reader picks that up as though it had
+been streamed live. The pipeline looks like it worked and nothing was streamed.
+The server clears stale `*.sst` before every launch, but that cannot save a
+pipeline that was never concurrent.
 
-A Python file is parsed before it is written, so a **syntax error** comes back
-as `"status": "rejected"` and nothing reaches disk. Fix it and write again.
+## Both launchers refuse a single stage
 
-Everything structural comes back as `warnings` on a file that *was* written:
+`run_pipeline` needs at least two stages and `run_mpmd` at least two blocks.
+With one, nothing streams to anything: use `run_workflow`, or add the consumer.
 
-- `adios2` never imported
-- nothing written to a stream (`.write(` / `.put(`)
-- nothing read back (`.read(` / `.get(`)
-- no `main()` and no `--stage` dispatch
+## Never type a launch yourself
 
-Warnings do not block the run, and that is the trap this engine is most prone
-to: a pipeline that imports adios2 and never calls it runs fine, exits 0, and
-has moved no data through ADIOS2 at all. Treat every warning as a defect.
+No `subprocess` to start another stage, no `mpirun` in your code, no bash or PBS
+script. The server builds the launch.
 
-`subprocess` at module top level is no longer refused for you either. Keep it
-inside a stage body anyway — at top level the file is a flat script rather than
-a pipeline, and nothing about it is reproducible as an ADIOS2 workflow.
+## Domain detail comes from the domain skill
 
----
+The simulation binary, its parameters, its output format and the variable names
+to stream: take them from the domain skill. This skill only wires stages.
 
-## Worked Example: simulate → analyze, with a real BP round trip
+# 1. One node, one rank, two stages
+
+Resources: 1 node, serial build. A producer and a consumer, started together.
+
+## Serial variant
 
 ```python
+# sim.py  (write_file "sim.py")
+import numpy as np
+import adios2
+
+STREAM = "/app/work/run0/field_stream"   # identical in the reader
+
+def main():
+    ad = adios2.Adios()
+    io = ad.declare_io("sim")
+    io.set_engine("SST")                 # a stream, not a file
+    with adios2.Stream(io, STREAM, "w") as s:   # opened ONCE, outside the loop
+        for step in range(5):
+            u = np.full((64, 64), float(step), dtype=np.float64)
+            s.begin_step()
+            s.write("U", u, u.shape, [0, 0], u.shape)
+            s.write_attribute("step_id", step)
+            s.end_step()
+
+main()
+```
+
+```python
+# analyze.py  (write_file "analyze.py")
+import numpy as np
+import adios2
+import matplotlib
+matplotlib.use("Agg")                    # headless node
+import matplotlib.pyplot as plt
+
+STREAM = "/app/work/run0/field_stream"
+
+def main():
+    ad = adios2.Adios()
+    io = ad.declare_io("ana")
+    io.set_engine("SST")
+    means = []
+    with adios2.Stream(io, STREAM, "r") as s:
+        for _ in s.steps():              # ends when the writer closes
+            u = s.read("U")              # the real read, from the stream
+            means.append(float(np.mean(u)))
+    plt.plot(means)
+    plt.savefig("/app/work/run0/means.png", dpi=150)   # deliverable: plain file
+    print("steps seen:", len(means))
+
+main()
+```
+
+Launch (serial only):
+
+```python
+run_pipeline(stages=[{"file": "sim.py"},
+                     {"file": "analyze.py", "delay": 2}])
+```
+
+`steps seen: 5` in the reader's stdout is the evidence the stream carried data.
+
+## MPI variant
+
+One rank per block still goes through `run_mpmd`, and a stage still splits
+`COMM_WORLD` on the server's colour. Resources: 1 node, 2 rank slots.
+
+```python
+# stage_sim.py  (write_stage stage="sim")
 import os
 import numpy as np
 import adios2
+from mpi4py import MPI
 
-WORK = "/app/work/run0"
-BP = f"{WORK}/particles.bp"
+STREAM = "/app/work/run0/field_stream"
 
+color = int(os.environ["ADIOS2_STAGE_COLOR"])        # the server assigns it
+world = MPI.COMM_WORLD
+comm = world.Split(color, world.Get_rank())          # this stage's ranks only
 
-def simulate(paramfile, bp_path):
-    """CLI stage: run the simulation binary, then publish its output via BP.
-
-    subprocess is used here because ADIOS2 cannot launch programs. It lives
-    inside the stage body, never at module level.
-    """
-    import subprocess
-
-    subprocess.run(
-        ["mpirun", "-n", "8", "/path/to/sim_binary", paramfile],
-        check=True,
-    )
-
-    arr = np.loadtxt(f"{WORK}/raw_output.txt", dtype=np.float32)
-    with adios2.Stream(bp_path, "w") as s:
-        s.write("positions", arr, arr.shape, [0] * arr.ndim, arr.shape)
-        s.write_attribute("nparticles", arr.shape[0])
-    return bp_path
-
-
-def analyze(bp_path, outdir):
-    """Analysis stage: read the array back out of BP, render it."""
-    import matplotlib
-    matplotlib.use("Agg")            # headless compute node
-    import matplotlib.pyplot as plt
-
-    with adios2.Stream(bp_path, "r") as s:
-        for _ in s.steps():
-            positions = s.read("positions")
-
-    os.makedirs(outdir, exist_ok=True)
-    plt.hist2d(positions[:, 0], positions[:, 1], bins=256)
-    png = os.path.join(outdir, "density.png")
-    plt.savefig(png, dpi=150)
-    plt.close()
-    return png
-
-
-def main():
-    os.makedirs(WORK, exist_ok=True)
-    simulate("/path/to/indat.params", BP)
-    png = analyze(BP, WORK)
-    print(f"wrote {png}")
-
-
-if __name__ == "__main__":
-    main()
+ad = adios2.Adios(comm)
+io = ad.declare_io("sim")
+io.set_engine("SST")
+with adios2.Stream(io, STREAM, "w", comm) as s:
+    for step in range(5):
+        u = np.full((64, 64), float(step), dtype=np.float64)
+        s.begin_step()
+        s.write("U", u, u.shape, [0, 0], u.shape)
+        s.end_step()
 ```
 
-What makes this legal: named stages driven by `main()`, `subprocess` confined
-to a stage body, and `positions` genuinely written to BP and read back out
-rather than passed in memory.
-
----
-
-## MPMD Mode: One `mpirun`, Ranks Provisioned Per Stage
-
-The pipeline above is sequential: each stage runs to completion before the next
-starts, and data lands in a `.bp` file in between. For true **in-situ**
-streaming — producer and consumer running *concurrently*, data moving through
-memory over SST — run every stage as a rank block of a single `mpirun`.
-
-There are two ways to do that. Pick by whether an external compiled binary has
-to be one of the ranks.
-
-There are two ways to do that. Pick by whether an external compiled binary has
-to be one of the ranks. **Both are chosen at the tool call, not declared in the
-file** — the server no longer reads `MPMD_LAYOUT` or `MPI_RANKS` out of your
-code, so those top-level constants do nothing.
-
-| | `run_mpmd(blocks=...)` | `run_workflow(ranks=N)` |
-|---|---|---|
-| Launch | `mpirun -n 8 sim : -n 4 python wf.py --stage analyze` | `mpirun -n 12 python wf.py` |
-| Programs | several, one rank block each | one, N copies of this file |
-| External binary as a rank | **yes** | no |
-| Stage selection | `--stage` argument | `rank < N` role test |
-| Use when | a simulation binary streams to Python analysis | every stage is Python |
-
-### `run_mpmd` — different programs, one launch
-
-This is the gray-scott colon form. Pass the blocks to the tool; the server
-builds the command line.
+`stage_analyze.py` is the mirror: the same three lines for `color`/`comm`,
+`Adios(comm)`, `set_engine("SST")`, then
+`adios2.Stream(io, STREAM, "r", comm)` and `for _ in s.steps(): s.read("U")`.
 
 ```python
-run_mpmd(blocks=[
-    {"ranks": 8, "exe": "/lcrc/project/PEDAL/HACC/HACC_go/improv.cpu/mpi/bin/hacc_tpm",
-     "args": ["./params/indat.params"]},
-    {"ranks": 4, "stage": "analyze"},
-    {"ranks": 1, "stage": "render"},
+run_mpmd(blocks=[{"ranks": 1, "file": "stage_sim.py"},
+                 {"ranks": 1, "file": "stage_analyze.py"}])
+```
+
+which runs `mpirun -n 1 env ADIOS2_STAGE_COLOR=1 <python> stage_sim.py : -n 1
+env ADIOS2_STAGE_COLOR=2 <python> stage_analyze.py`.
+
+# 2. One node, more concurrent stages
+
+## Serial variant
+
+Concurrency is more stage files in one `run_pipeline` call, each a separate
+process. Two shapes.
+
+A chain, every hop a separate stream with its own name:
+
+```python
+run_pipeline(stages=[
+    {"file": "sim.py"},                        # writes  chain_a
+    {"file": "analyze.py", "delay": 2},        # reads chain_a, writes chain_b
+    {"file": "plot.py", "delay": 2},           # reads chain_b, writes the PNG
 ])
 ```
 
-produces
-
-```bash
-mpirun -n 8 /.../hacc_tpm ./params/indat.params \
-     : -n 4 python workflow.py --stage analyze \
-     : -n 1 python workflow.py --stage render
-```
-
-13 ranks, one job, three programs. The simulation and the analysis are alive at
-the same time, so SST streams between them instead of the analysis waiting on a
-finished file.
-
-- A block with `"exe"` launches that program with `"args"`.
-- A block with `"stage"` re-enters **this same file** as
-  `python workflow.py --stage <name>`, so Python stages are rank blocks rather
-  than subprocesses.
-- `run_mpmd` reports `launch_mode: "mpmd:13:3blocks"` and the exact
-  `launch_command` it used.
-- At least two blocks. With one, nothing streams to anything — use
-  `run_workflow`.
-
-Because the file is re-entered once per Python block, it must dispatch on
-`--stage`:
+Independent pairs, one stream name per pair (`pair0_stream`, `pair1_stream`):
 
 ```python
-import argparse
-import numpy as np
-import adios2
-from mpi4py import MPI
-
-STREAM = "halo_stream"
-
-
-def analyze(comm):
-    """Reads the simulation's SST stream, writes halo properties onward."""
-    ad = adios2.Adios(comm)                 # the block's own comm, not COMM_WORLD
-    io = ad.declare_io("ana")
-    io.set_engine("SST")                    # concurrent blocks -> stream, not file
-    reader = io.open(STREAM, adios2.bindings.Mode.Read, comm)
-    out = adios2.Adios(comm).declare_io("halos")
-    out.set_engine("SST")
-    writer = out.open("halo_props", adios2.bindings.Mode.Write, comm)
-    hvar = None
-    while True:
-        if reader.begin_step() != adios2.bindings.StepStatus.OK:
-            break
-        v = reader.inquire_variable("positions") if hasattr(reader, "inquire_variable") \
-            else io.inquire_variable("positions")
-        n = int(v.shape()[0])
-        buf = np.zeros(n, dtype=np.float64)
-        v.set_selection([[0], [n]])
-        reader.get(v, buf)
-        reader.end_step()
-
-        halos = buf * 1.0                    # real FOF/SOD work goes here
-        if hvar is None:                     # define ONCE, outside the loop
-            hvar = out.define_variable("halo_mass", halos, [halos.size], [0], [halos.size])
-        writer.begin_step(); writer.put(hvar, halos); writer.end_step()
-    reader.close(); writer.close()
-
-
-def render(comm):
-    """Final block: reads halo properties, writes the PNG deliverable."""
-    import matplotlib
-    matplotlib.use("Agg")                    # headless compute node
-    import matplotlib.pyplot as plt
-    ad = adios2.Adios(comm)
-    io = ad.declare_io("viz")
-    io.set_engine("SST")
-    e = io.open("halo_props", adios2.bindings.Mode.Read, comm)
-    while True:
-        if e.begin_step() != adios2.bindings.StepStatus.OK:
-            break
-        v = io.inquire_variable("halo_mass")
-        n = int(v.shape()[0])
-        buf = np.zeros(n, dtype=np.float64)
-        v.set_selection([[0], [n]])
-        e.get(v, buf); e.end_step()
-        plt.hist(buf, bins=128)
-    e.close()
-    plt.savefig("/app/work/run0/dm_density_slice.png", dpi=150)
-
-
-STAGES = {"analyze": analyze, "render": render}
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", required=True, choices=sorted(STAGES))
-    args = ap.parse_args()
-    STAGES[args.stage](MPI.COMM_WORLD)       # this block's ranks only
+run_pipeline(stages=[
+    {"file": "sim_0.py"}, {"file": "ana_0.py", "delay": 1},
+    {"file": "sim_1.py"}, {"file": "ana_1.py", "delay": 1},
+])
 ```
 
-Note what `COMM_WORLD` means here: mpirun gives **each rank block its own
-`COMM_WORLD`** under the colon form, so a `--stage` block does not need to
-`Split()` — it already has just its own ranks. That is the opposite of
-`ranks` mode below, where every rank shares one `COMM_WORLD` and splitting
-is mandatory.
+Derive each pair's stream name and output directory from the pair index, so two
+pairs never share a name or a file.
 
-### `run_workflow(ranks=N)` — one program, roles by rank
+Rules for `run_pipeline`:
 
-Simpler, and right when every stage is Python. The server launches
-`mpirun -n N python workflow.py`; all ranks share `COMM_WORLD`, so each stage
-must carve out its own communicator. N is passed to the tool, not declared in
-the file.
-
-```python
-# launched with run_workflow(filename="workflow.py", ranks=4)
-
-import numpy as np, adios2
-from mpi4py import MPI
-
-world = MPI.COMM_WORLD
-rank, size = world.Get_rank(), world.Get_size()
-
-NPROD = 2                                   # ranks 0-1 produce, 2-3 consume
-role = 0 if rank < NPROD else 1
-comm = world.Split(color=role, key=rank)    # each stage gets its own communicator
-lrank, lsize = comm.Get_rank(), comm.Get_size()
-
-def simulate(comm):
-    ad = adios2.Adios(comm)                 # pass the SPLIT comm, not COMM_WORLD
-    io = ad.declare_io("sim")
-    io.set_engine("SST")                    # in-memory streaming, no file
-    u = np.zeros(4, dtype=np.float64)
-    var = io.define_variable("U", u, [lsize*4], [lrank*4], [4])   # define ONCE
-    e = io.open("gs_stream", adios2.bindings.Mode.Write, comm)
-    for step in range(3):
-        u[:] = float(step * 10 + lrank)
-        e.begin_step(); e.put(var, u); e.end_step()
-    e.close()
-
-def analyze(comm):
-    ad = adios2.Adios(comm)
-    io = ad.declare_io("ana")
-    io.set_engine("SST")
-    e = io.open("gs_stream", adios2.bindings.Mode.Read, comm)
-    while True:
-        if e.begin_step() != adios2.bindings.StepStatus.OK:
-            break
-        v = io.inquire_variable("U")
-        n = int(v.shape()[0])
-        out = np.zeros(n, dtype=np.float64)
-        v.set_selection([[0], [n]])
-        e.get(v, out)
-        e.end_step()
-        print(f"consumer {lrank}: sum {out.sum()}")
-    e.close()
-
-simulate(comm) if role == 0 else analyze(comm)
-```
-
-With either declaration, `main()` is not required: rank role or `--stage`
-selects the work.
-
-### Sizing the rank budget
-
-Total ranks across all blocks must fit the allocation. Call `get_resources`
-first.
-
-- Under `--env hpc` the budget is `ntasks` from `get_resources`.
-- Under `--env multi-node` use the **MPI capacity line in your task context**,
-  and `get_resources` — the allocation is exactly as wide as what the
-  application may use, so the two agree.
-- Under `--env local` there is no PBS fabric; keep the total small (2–4) or
-  stay with a serial pipeline.
-
-### What is checked, and what is not
-
-`run_mpmd` checks only the shape of the blocks you pass it: at least two, each
-with an integer `ranks` of 1 or more and either `exe` or `stage`. One block is
-refused, because one block streams to nothing.
-
-**Nothing else is checked.** These are on you, and each fails at run time
-rather than at the tool call:
-
-- the file reads `--stage` and dispatches on it — without this every stage
-  block runs the same default path
-- every `"stage"` you name exists as a top-level function in the file
-- an SST engine is selected — concurrent blocks sharing a BP file make the
-  consumer wait on a file the producer has not closed, which looks like a hang
-- under `ranks`, `MPI.COMM_WORLD` is split and the split comm is passed to
-  `Adios(comm)` / `io.open(name, mode, comm)`
-
-### MPMD gotchas
-
-| Gotcha | Rule |
+| Key | Meaning |
 |---|---|
-| `define_variable` inside the step loop | Raises "variable U already defined". Define once before the loop, reuse the handle |
-| Passing `COMM_WORLD` to a stage's `Adios()` under `ranks` | Stages must get their own split comm, or they collide. Under `run_mpmd` each block already has its own `COMM_WORLD` |
-| Reading without `set_selection` | A reader rank must declare which slice of the global array it wants |
-| `v.Shape()` | The Python binding is lowercase `v.shape()` |
-| SST writer with no reader | Blocks on the rendezvous. Both roles must exist in the same launch |
-| SST between two threads of one process | Deadlocks. SST expects separate ranks — use `run_mpmd` or `ranks`, not threads |
-| A run that times out, then every later run times out | A killed run leaves a stale `<name>.sst` rendezvous file and the next open waits on a peer that is gone. The server clears `*.sst` before every launch, so this should not recur — if it does, the file is being written somewhere outside the work directory |
-| `subprocess` to launch the simulation when using `run_mpmd` | Pointless and wrong — give the binary its own `{"ranks": N, "exe": ...}` block so it shares the launch and can stream |
-| Total ranks exceeding the allocation | mpirun fails with "not enough slots available". Size from `get_resources` / the MPI capacity line |
+| `file` | stage file relative to the work directory. Required; must already exist |
+| `args` | list of arguments; the stage reads them from `sys.argv` |
+| `delay` | seconds to sleep BEFORE starting this stage. Delays ACCUMULATE: in the example above `plot.py` starts about 4 s after `sim.py`. SST tolerates either order; a reader started first spends its timeout in rendezvous |
 
----
-## Key API
+`timeout` (default 7200 s) is one shared deadline for all stages. A stage whose
+peer failed does not exit on its own and is killed only at that deadline, so set
+a timeout sized for the real run, not the default.
+
+Output: `<run_id>_<i>.out` / `.err` per stage in the work directory; the result
+carries `exit_code` and stdout/stderr tails per stage, and `status` is `failed`
+if ANY stage exited non-zero.
+
+What it refuses (`status: "rejected"`, nothing started): fewer than two stages,
+a stage that is not an object, a stage with no `file`, or a file that does not
+exist.
+
+## MPI variant
+
+Several concurrent stages are more blocks of the same `mpirun`. Resources: 1
+node, 8 rank slots; a 4-rank producer, a 2-rank analysis, a 2-rank render. The
+block ranks SUM to the allocation:
+
+```python
+run_mpmd(blocks=[{"ranks": 4, "file": "stage_sim.py"},
+                 {"ranks": 2, "file": "stage_analyze.py"},
+                 {"ranks": 2, "file": "stage_render.py"}])    # 4+2+2 = 8
+```
+
+Independent pairs are more blocks, with a distinct stream name per pair.
+
+# 3. One node, many ranks
+
+## Serial variant: NOT AVAILABLE
+
+There is no MPI in this build. `ranks` is ignored by `run_workflow`; launching
+N copies would make N processes that each believe they are the only writer,
+racing on one metadata index, and a run can exit 0 with wrong output. Do not
+try `mpirun` yourself and do not pass `comm=`: `adios2.Stream` raises
+`Cannot use MPI since ADIOS2 was built without MPI support`.
+
+What to do instead, in order of preference:
+
+1. One `.bp` PER PROCESS (`part_0.bp`, `part_1.bp`, ...), each written by its
+   own stage, combined by a later reader.
+2. Gather to ONE writer stage, which is the only process that writes the global
+   array.
+3. If the goal genuinely needs a collective parallel write or many ranks, say
+   so and ask for the `mpi` variant (`MAW_ADIOS=mpi`). Do not fake it.
+
+## MPI variant
+
+One multi-rank program per block, each block splitting its own communicator.
+Resources: 1 node, 8 rank slots. A decomposed write: each rank writes its slice
+of one global array.
+
+```python
+# stage_sim.py: 4 ranks, each owns NLOCAL rows of a (4*NLOCAL, 64) array
+import os
+import numpy as np
+import adios2
+from mpi4py import MPI
+
+color = int(os.environ["ADIOS2_STAGE_COLOR"])
+world = MPI.COMM_WORLD
+comm = world.Split(color, world.Get_rank())
+rank, size = comm.Get_rank(), comm.Get_size()
+
+NLOCAL = 16
+ad = adios2.Adios(comm)                       # the SPLIT comm, never COMM_WORLD
+io = ad.declare_io("sim")
+io.set_engine("SST")
+with adios2.Stream(io, "/app/work/run0/field_stream", "w", comm) as s:
+    for step in range(5):
+        local = np.full((NLOCAL, 64), float(step * 10 + rank))
+        s.begin_step()
+        s.write("U", local, [size * NLOCAL, 64], [rank * NLOCAL, 0], [NLOCAL, 64])
+        s.end_step()
+```
+
+```python
+run_mpmd(blocks=[{"ranks": 4, "file": "stage_sim.py"},
+                 {"ranks": 4, "file": "stage_analyze.py"}])    # 4+4 = 8
+```
+
+A reader rank asks for its slice with `stream.read("U", start, count)`.
+
+# 4. Many nodes
+
+## Serial variant: NOT AVAILABLE
+
+One node, no MPI, no multi-node launch. Everything in section 3 applies; the
+answer is again one `.bp` per process, gather to one writer, or switch variant.
+
+## MPI variant
+
+Resources: 2 nodes, 4 rank slots each. The block ranks sum to
+`nnodes x ranks_per_node` from `get_resources`; the server does NOT check the
+sum. Over-asking fails inside `mpirun` with "not enough slots available".
+
+```python
+# From get_resources().
+NODES, RANKS_PER_NODE = 2, 4      # 8 slots in all
+
+run_mpmd(blocks=[{"ranks": 5, "exe": SIM_EXE, "args": ["in.params"]},
+                 {"ranks": 2, "file": "stage_analyze.py"},
+                 {"ranks": 1, "file": "stage_render.py"}])    # 5+2+1 = 8
+```
+
+`SIM_EXE` is `/path/to/sim` here: take the real binary, its arguments and its
+required MPI from the domain skill. An `exe` block is launched directly, so the
+compiled program must itself open the stream as SST on the same name. A binary
+needing the MPI C++ bindings cannot be a block at all if the build is Open MPI 5
+(`get_resources` states the constraint). The build is bound to ONE MPI: a domain
+whose tools use another cannot use this variant.
+
+# `run_mpmd` and `write_stage` (mpi variant only)
+
+`write_stage(stage, content, overwrite=True)` writes `stage_<name>.py` in the
+work directory (name reduced to letters, digits, `_`, `-`) and applies the MPMD
+checks to that stage alone. A stage name with no usable characters is rejected.
+
+`run_mpmd(blocks, timeout=7200)` takes at least two blocks, each:
+
+| Key | Meaning |
+|---|---|
+| `ranks` | integer >= 1. Required |
+| `file` | a stage file in the work directory, run as `<python> stage_x.py` |
+| `exe` | an external program, launched directly. Use INSTEAD of `file` |
+| `args` | optional list of arguments |
+
+It builds ONE command:
+`mpirun -n R1 env ADIOS2_STAGE_COLOR=1 <prog1> : -n R2 env ADIOS2_STAGE_COLOR=2 <prog2> : ...`
+after loading the adios2 module itself. The result carries `launch_mode`
+(`mpmd:<total ranks>:<n>blocks`), `blocks`, `stage_colors` and the exact
+command.
+
+**`ADIOS2_STAGE_COLOR`** is the block's index plus one. Every block shares ONE
+`MPI_COMM_WORLD`, so every stage must read it and `Split` on it. Two stages with
+the same colour merge into one communicator and the writer's rank count then
+includes the reader's ranks; a hardcoded colour can collide, and passing
+`COMM_WORLD` to ADIOS2 makes a stage write on behalf of every other stage.
+
+What it refuses (`status: "rejected"`, nothing launched): fewer than two blocks;
+a block that is not an object; `ranks` not an integer >= 1; neither `file` nor
+`exe`; a `file` that does not exist (named per block, because `mpirun` would
+abort the whole job naming only the first); and a stage file whose text does not
+contain `ADIOS2_STAGE_COLOR`. Missing adios2 module on disk raises before launch.
+
+`run_workflow(filename, ranks=N)` still exists here: N copies of ONE file, which
+must still split by role. Stages go through `run_mpmd`.
+
+# `write_bp` and `read_bp` (serial variant only)
+
+One-shot BP file access. The SERVER opens the `Stream` and binds it to `stream`;
+`python_code` runs inside it.
+
+| Tool | Binds | Use |
+|---|---|---|
+| `write_bp(name, bp_path, python_code, timeout=1800)` | `stream` open for `"w"` | `stream.write(...)`, `stream.write_attribute(...)` |
+| `read_bp(name, bp_path, python_code, timeout=1800)` | `stream` open for `"r"` | `for _ in stream.steps(): stream.read(...)` |
+
+```python
+read_bp(name="inspect", bp_path="/app/inputs/data/particles.bp",
+        python_code="for _ in stream.steps():\n    print(stream.read('positions').shape)")
+```
+
+It REJECTS code that contains `import adios2` or `adios2.Stream(`: opening the
+same path twice corrupts it. The result has `stream_used`; false (code never
+called `.write(` / `.read(` / `*_attribute(`) comes with a warning, and for a
+write that means an empty `.bp` and exit 0. These tools run to completion before
+returning, so they are NOT stage exchange: use them to write a result or read an
+input file, never to connect two stages.
+
+# Stream API
+
+The small set actually used. The long manual is `knowledge/ADIOS`.
 
 ```python
 import adios2
-import numpy as np
 
-# Stream API (preferred -- this is what the validator looks for)
-with adios2.Stream("output.bp", "w") as s:
-    s.write("temperature", arr, arr.shape, [0], arr.shape)
-    s.write_attribute("units", "kelvin")
-
-with adios2.Stream("output.bp", "r") as s:
-    for _ in s.steps():
-        data = s.read("temperature")
-        units = s.read_attribute("units")
-
-# Lower-level engine API, for streaming (SST) producers
-adios = adios2.ADIOS()
-io = adios.declare_io("SimOutput")
+# SST: build the IO, select the engine, pass it to Stream.
+ad = adios2.Adios()                    # mpi variant: adios2.Adios(comm)
+io = ad.declare_io("name")
 io.set_engine("SST")
-writer = io.open("stream.bp", adios2.Mode.Write)
-writer.begin_step()
-writer.put(var, data)
-writer.end_step()
-writer.close()
+stream = adios2.Stream(io, "stream_name", "w")     # mpi: ..., "w", comm)
 ```
 
-`stream.write(name, array, shape, start, count)` — the last three describe the
-global shape and this writer's slice of it, which is what makes parallel writes
-compose into one logical array.
+| Call | Meaning |
+|---|---|
+| `adios2.Stream(io, name, mode)` | `mode` is `"w"` or `"r"`; use as `with ... as s:` so it closes. SST needs the `io` form |
+| `adios2.Stream(path, mode)` | opens a BP FILE. Fine for `write_bp`, `read_bp` and input data; NOT for stage-to-stage streaming |
+| `s.write(name, data, shape, start, count)` | `shape` = global array, `start`/`count` = this writer's slice. On one process, `[0]*ndim` and `data.shape` |
+| `s.read(name)` | returns the numpy array. `s.read(name, start, count)` reads a slice |
+| `s.steps()` | `for _ in s.steps():` loops until the writer closes, one iteration per step |
+| `s.begin_step()` / `s.end_step()` | writer side: bracket the writes of one step, balanced inside the loop |
+| `s.write_attribute(name, value)` / `s.read_attribute(name)` | small metadata (units, counts) |
+| `comm=` / `Adios(comm)` | MPI variant ONLY; raises on serial |
 
----
+Not covered here: DataMan, the HDF5 engine, block reads and engine parameters.
+The server does nothing for them; verify against `knowledge/ADIOS` first.
 
-## Data Formats
+# Performance and Hygiene
 
-- **BP (Binary Pack)**: ADIOS2's native format, optimized for parallel I/O
-- **SST (Sustainable Staging Transport)**: real-time streaming between processes
-- **DataMan**: in-memory exchange for tightly coupled workflows
-- **HDF5**: readable/writable through ADIOS2's HDF5 engine
+- **Open the Stream ONCE, outside the step loop.** Reopening per step re-runs the
+  SST rendezvous each time. One `with` around the loop.
+- **Read with `for _ in s.steps():`**, not hand-written `begin_step`/`end_step`
+  pairs that can end unbalanced and stall the writer. On the write side, keep one
+  balanced `begin_step`/`end_step` per loop iteration.
+- **One distinct stream name per pair or hop.** Two pairs sharing a name
+  rendezvous with the wrong peer.
+- **Do not clear `.sst` yourself.** The server removes stale `*.sst` directories
+  under the work directory before every launch (`stale_sst_cleared`). Keep
+  stream names inside the work directory so they are covered.
+- **`check_package("adios2")` first**, and `check_package("mpi4py")` under MPMD.
+  If adios2 does not import, say so and stop: there is no numpy fallback, and a
+  pipeline that swaps streams for `.npy` is not the workflow asked for.
+- **Set `matplotlib.use("Agg")`** in any stage that draws; nodes are headless.
+- **Evidence the engine was used:** reader stdout reports steps and shapes.
+  `"engine": "adios"` in a response names the server, not proof of I/O.
 
----
-
-## Key Differences from Parsl/PyCOMPSs
-
-| Feature | Parsl | PyCOMPSs | ADIOS2 |
-|---|---|---|---|
-| Primary role | Task scheduling | Task scheduling | Data I/O & transport |
-| Unit of work | `@python_app` / `@bash_app` | `@task` / `@binary` / `@mpi` | A plain stage function |
-| CLI steps | `@bash_app` command string | `@binary`/`@mpi` decorator | `subprocess` inside a stage |
-| Inter-stage data | Files / futures | Files / task parameters | BP files, SST streams |
-| Streaming | No | No | Yes (SST, DataMan) |
-| In-situ analysis | No | No | Yes |
-
----
-
-## Was ADIOS2 Actually Used?
-
-Every response reports `"engine": "adios"` — that is which server handled the
-call, not evidence that any ADIOS2 I/O happened. The server holds no adios2 code
-and cannot tell you. Two things can:
-
-1. **The `warnings` on `write_file`.** No import, no `.write(`, no `.read(`
-   means the file cannot have moved data through ADIOS2. This is the
-   "imported but never used" failure mode, and it is caught here or not at all.
-2. **The outputs.** A BP dataset is a *directory* (`<name>.bp/` holding
-   `data.0`, `md.0`, ...). `list_files` showing no `.bp` tree, or one that is
-   empty, means the round trip did not happen whatever the exit code said.
-
-`check_package("adios2")` before you write anything tells you whether the
-bindings are importable at all. If they are not, say so and stop — there is no
-numpy fallback any more, and a pipeline that quietly swaps BP for `.npy` is not
-the workflow that was asked for.
-
----
-
-## Common Pitfalls
+# Common Pitfalls
 
 | Pitfall | Rule |
 |---|---|
-| `subprocess` at module top level | Rejected. Put the CLI call inside a stage function |
-| `subprocess` to run another *Python* stage | Never. Python stages live in this file and talk over ADIOS2 |
-| Flat script with no functions | Rejected. Named stages, driven by `main()` |
-| Writing to BP but never reading back | Rejected. The consumer must `stream.read(...)` it |
-| Passing a big array stage-to-stage in memory | Defeats the point of this engine — route it through BP |
-| Putting the PNG or summary into BP | BP is for inter-stage numerical arrays; deliverables stay plain files |
-| Rendering without `matplotlib.use("Agg")` | Headless nodes have no display |
-| Assuming ADIOS2 schedules anything | It does not. It is I/O only; ordering comes from `main()` |
-
----
-
-## Running with ADIOS2
-
-```bash
-python academy_agents.py --engine adios --paper 1 --goal "..."
-```
-
-`adios_sst.py / adios_mpmd.py` sets the needed env vars itself, so no module loading is
-required before running the agent.
-
-### The MPI build (required for MPMD)
-
-**The PyPI `adios2` wheel is a SERIAL build** — `bindings.is_built_with_mpi` is
-`False`, `Adios(comm)` raises, and SST cannot stream between ranks. MPMD mode
-needs an MPI-enabled build. On Improv this was built by hand:
-
-```bash
-module load gcc/14.2.0 openmpi/5.0.7/gcc/14.2.0 cmake/3.27.4
-
-# mpi4py must be built against the SAME MPI, not the PyPI wheel
-MPICC=$(which mpicc) pip install --no-binary=mpi4py --force-reinstall --no-cache-dir mpi4py
-
-curl -LO https://github.com/ornladios/ADIOS2/archive/refs/tags/v2.10.2.tar.gz
-tar xzf v2.10.2.tar.gz && cd ADIOS2-2.10.2 && mkdir build && cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=$HOME/.local/adios2-mpi \
-  -DCMAKE_BUILD_TYPE=Release -DADIOS2_USE_MPI=ON -DADIOS2_USE_Python=ON \
-  -DPython_EXECUTABLE=<repo>/venv3/bin/python \
-  -DADIOS2_USE_Fortran=OFF -DADIOS2_USE_HDF5=OFF -DBUILD_TESTING=OFF \
-  -DCMAKE_C_COMPILER=$(which mpicc) -DCMAKE_CXX_COMPILER=$(which mpicxx)
-make -j32 && make install
-```
-
-Then copy the built package over the wheel's in site-packages. Verify with:
-
-```python
-from adios2 import bindings; print(bindings.is_built_with_mpi)   # must be True
-```
-
-Two environment traps. **The server no longer handles either of them** — it
-hardcodes no library paths at all, and inherits whatever the setup script
-sourced before the run exported. If `check_package("adios2")` fails, one of
-these is why, and the setup script is where to fix it:
-
-- **`LD_LIBRARY_PATH`** must include `$ADIOS2_HOME/lib64`, or the import fails
-  with `libadios2_cxx11_mpi.so.2.10: cannot open shared object file`.
-- **`LD_PRELOAD`** must pin gcc-14's `libstdc++.so.6`. `numpy` loads a spack
-  gcc-8.5 `libstdc++` first, and whichever lands in the process wins — so
-  importing numpy before adios2 fails with
-  `version 'GLIBCXX_3.4.32' not found`.
-
-Report either as an environment gap. Do not try to work around it from inside a
-workflow file — the loader's search path is fixed before the interpreter starts.
-
-Without the MPI build, serial pipelines still work normally; only `ranks`
-MPMD mode is unavailable.
-
----
-
-## Common Use Cases
-
-- Reading large MD trajectory files in BP format
-- Streaming simulation output for in-situ analysis
-- Coupled simulations (simulation + analytics pipeline)
-- High-performance parallel I/O on HPC file systems
-- Paired with LAMMPS via `dump adios` in the LAMMPS input script
+| Writing one `workflow.py` with stage functions called by `main()` | Wrong for BOTH variants. One file per stage; launch with `run_pipeline` (serial) or `run_mpmd` (mpi) |
+| Calling `run_mpmd` or `write_stage` on the serial server (or `run_pipeline`/`write_bp`/`read_bp` on mpi) | Not registered there. Read `adios2_build` from `get_resources` first |
+| Assuming the mpi variant | Serial is the default and the fallback for an unset or unrecognised `MAW_ADIOS` |
+| `run_workflow` on a lone writer | Serial: completes, leaves `<name>.sst`, a later reader "streams" it. Nothing was live. Use `run_pipeline` |
+| One stage passed to `run_pipeline` / `run_mpmd` | Refused: at least two. One stage streams to nothing |
+| `Stream(path, mode)` between stages | That is BP: a reader opens a file the writer has not closed and silently reads whatever is there. Select SST via `io.set_engine("SST")` in EVERY stage |
+| Writer and reader using different stream names | No rendezvous. Same string on both ends; build it from one constant |
+| Reusing the in-memory array instead of reading it back | A pipeline that never used the engine. The consumer must `stream.read` in its own process |
+| mpi4py, `comm=` or `MPI.COMM_WORLD` in a serial stage | Forbidden: `Cannot use MPI since ADIOS2 was built without MPI support`. `write_file` warns on it |
+| A decomposed write (shape/start/count) from several serial processes into one `.bp` | They race on the metadata index and can exit 0 with wrong output. One `.bp` per process, or gather to one writer. `write_file` warns on `.write(` with shape and start; on a single writer the warning is benign |
+| `ranks` on `run_workflow` / `run_pipeline` in the serial build | Ignored. Concurrency is more stage files |
+| Passing `COMM_WORLD` to ADIOS2 in an MPMD stage | The stage then writes for every block's ranks. Split on `ADIOS2_STAGE_COLOR` and pass the split communicator |
+| A stage that ignores `ADIOS2_STAGE_COLOR` | `run_mpmd` rejects the layout. Hardcoded colours also collide |
+| Block ranks summing to more than the allocation | `mpirun` fails with "not enough slots available". Sum them against `nnodes x ranks_per_node` yourself; the server does not |
+| `delay` assumed to be absolute from launch | It is slept before THAT stage starts, so delays add up down the list |
+| Reopening the Stream every step | Each open re-runs the SST rendezvous. Open once outside the loop |
+| `define_variable` inside the step loop (lower-level API) | Raises "already defined". Define once outside the loop, or just use `s.write` |
+| `write_bp` with `import adios2` or `adios2.Stream(` in the code | Rejected: the server already opened the stream as `stream` |
+| `write_bp` code that never calls `stream.write` | Empty `.bp`, exit 0. Check `stream_used` in the result |
+| `read_bp` / `write_bp` used to link two stages | They run to completion; nothing can read while they write. Use `run_pipeline` |
+| A hung stage with the default 7200 s timeout | A stage whose peer failed waits for the shared deadline. Size `timeout` for the real run and read each stage's `.err` |
+| Reader reports steps while the writer exited non-zero | The reader read a stale `.sst` from an earlier run. Fix the writer and re-run |
+| SST between two threads of one process | Deadlocks. Stages are separate processes or rank blocks |
+| `adios2` fails to import | Report an environment gap and stop. Do not swap in `.npy` or work around the loader from inside a stage |
+| mpi variant: `Cannot use MPI since ADIOS2 was built without MPI support` | The stage got the serial wheel: the +mpi module was not loaded. `run_mpmd` loads it; a stage launched another way will not have it |
+| mpi variant: a domain whose tools use a different MPI | This build is bound to ONE MPI; that domain cannot use this engine |

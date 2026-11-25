@@ -24,8 +24,8 @@ configures no MPI: a task loads the module its own tool needs.
 
     --env multi-node  Orchestrator, Planner and Installer in this process;
                       the Explorer on the first node of a <nodes>-node PBS job
-                      this script submits. That node's worker_init sources the
-                      same setup_hpc.sh.
+                      this script submits. That node's worker_init activates the
+                      same Spack environment.
 
 All output appears in the terminal you ran this from, in every mode. Under
 local and hpc the Explorer prints there directly. Under multi-node it is in
@@ -79,11 +79,11 @@ Usage:
     python academy_agents.py --paper 1 --combination b --env local --goal "..."
 
     # inside `qsub -I ...`
-    source setup_hpc.sh
+    spack env activate .
     python academy_agents.py --paper 1 --combination b --env hpc --goal "..."
 
     # from a login node; submits the Explorer's job itself
-    source setup_hpc.sh
+    spack env activate .
     python academy_agents.py --paper 1 --combination b --env multi-node \\
         --nodes 2 --ranks 4 --goal "..."
 """
@@ -94,7 +94,6 @@ import contextlib
 import os
 import re
 import shutil
-import subprocess
 import sys
 from datetime import datetime
 
@@ -429,14 +428,10 @@ def make_worker_init(run_dir: Path, engine: str = "parsl") -> str:
         f"cd {run_dir}",
         f"export PYTHONPATH={PROJECT_DIR}:{SRC_DIR}:$PYTHONPATH",
         # Where the MCP server writes and runs. Exported here rather than left
-        # to setup_hpc.sh because run_dir is a per-run decision made in THIS
-        # process (work/run0, possibly rotated aside first) -- the setup script
-        # cannot know it, and the Explorer's node never saw the shell that did.
-        # Everything else the servers need (JAVA_HOME, LD_LIBRARY_PATH, the
-        # headless rendering variables) is site knowledge and belongs in that
-        # script. It exports no MPI launcher and no LD_LIBRARY_PATH. PyCOMPSs needs nothing
-        # beyond the activated venv it was pip-installed into, which the
-        # `source .../activate` two lines up provides.
+        # to the environment because run_dir is a per-run decision made in THIS
+        # process (work/run0, possibly rotated aside first). Everything else the
+        # servers need comes from maw.env on activation, which exports no MPI
+        # launcher: a task loads its own.
         f"export MAW_REPO_ROOT={PROJECT_DIR}",
         f"export MAW_WORK_DIR={run_dir}",
         f"export MAW_DATA_DIR={DATA_PATH}",

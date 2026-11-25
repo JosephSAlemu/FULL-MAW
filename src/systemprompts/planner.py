@@ -3,7 +3,13 @@ Your agent skill file contains your full operating instructions. Follow them.
 
 Return ONLY a valid JSON object with exactly these keys:
 - literature_findings: list[str] -- specific, quantitative facts extracted from the paper
-- stack_decision:      list[str] -- packages to install into the local venv
+- stack_decision:      list[str] -- pip packages to install into the local venv
+- modules:             list[str] -- environment modules this run's tools need, by
+                       NAME only, e.g. ["lammps"]. No `module load` prefix and no
+                       invented versions. Take them from the domain skill; [] when
+                       it names none. The installer builds compiled packages under
+                       these, and each task loads them in its own command string,
+                       so a module omitted here is one nothing will load.
 - tasks:               list[str] -- ordered, Python-API-level implementation steps
 - skill_requests:      list[str] -- skill paths to load (first call only; empty on subsequent calls)
 
@@ -22,7 +28,10 @@ IMPORTANT CONSTRAINTS ON TASKS:
   what parallelism, MPI, and job launcher commands are appropriate.
 
 HANDLING ORCHESTRATOR FEEDBACK:
-If the input ends with "Orchestrator feedback", fix every issue raised before returning.\
+If the input ends with "Orchestrator feedback", that is the orchestrator sending
+this plan back for ONE revision. Fix every issue it raises and return the whole
+schema again, keeping what was already right. There is no second revision, so
+do not defer anything.\
 """
 
 # condition A version of the planner prompt, same deal as the orchestrator one above
@@ -42,8 +51,8 @@ subprocess directly -- all command-line work is handed to the workflow engine as
 
 ## Software Available
 
-Depending on the workflow, packages such as LAMMPS, OVITO, Parsl, PyCOMPSs, ADIOS2, numpy, and
-matplotlib may be installed or installable into the local venv. Only request packages that are
+Depending on the workflow, packages such as LAMMPS, OVITO, Parsl, PyCOMPSs, ADIOS2, Wilkins,
+numpy and matplotlib may be installed or installable into the local venv. Only request packages that are
 actually needed for this paper's workflow -- never invent packages.
 
 Return ONLY a valid JSON object with exactly these keys:
@@ -67,5 +76,8 @@ IMPORTANT CONSTRAINTS ON TASKS:
   what parallelism, MPI, and job launcher commands are appropriate.
 
 HANDLING ORCHESTRATOR FEEDBACK:
-If the input ends with "Orchestrator feedback", fix every issue raised before returning.\
+If the input ends with "Orchestrator feedback", that is the orchestrator sending
+this plan back for ONE revision. Fix every issue it raises and return the whole
+schema again, keeping what was already right. There is no second revision, so
+do not defer anything.\
 """

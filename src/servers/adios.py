@@ -843,17 +843,18 @@ VARIANTS = {"serial": AdiosSstServer, "mpi": AdiosMpmdServer}
 
 
 def main() -> None:
-    """Start the variant MAW_ADIOS names.
+    """Start the variant MAW_ADIOS names. Default and fallback: serial.
 
-    An unrecognised value falls back to serial with a warning rather than
-    refusing to start: the serial server is the one that works for every
-    domain whatever MPI it names, so it is the safer thing to be wrong about.
+    mcp_explorer normally exports the canonical word already; this is the
+    backstop for a server started by hand. The warning goes to stderr because
+    stdout is the JSON-RPC channel.
     """
     import sys
 
-    choice = os.environ.get("MAW_ADIOS", "serial").strip().lower()
+    raw = os.environ.get("MAW_ADIOS", "")
+    choice = (raw or "").strip().lower()
     if choice not in VARIANTS:
-        print(f"[adios] MAW_ADIOS={choice!r} is not 'serial' or 'mpi'; "
+        print(f"[adios] MAW_ADIOS={raw!r} is not 'serial' or 'mpi'; "
               f"starting the serial server.", file=sys.stderr)
         choice = "serial"
     VARIANTS[choice].main()

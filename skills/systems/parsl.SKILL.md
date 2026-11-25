@@ -1,106 +1,74 @@
 ---
 name: systems/parsl
 description: >
-  Parsl parallel scripting library reference for MAW workflows. Covers the generated-file
-  execution model (write_file/run_workflow), @python_app/@bash_app rules,
-  HighThroughputExecutor config, reading a failed run, worker sizing, common pitfalls,
-  and the exact config skeleton used here.
+  Writing a Parsl workflow file for MAW: the execution contract, the four rank
+  layouts (one/many nodes x serial/parallel), executor and worker sizing, file
+  passing, and the pitfalls table. Load for every --engine parsl run; the API
+  manual is knowledge/PARSL.
 ---
 
 # Parsl — System Skill
 
-Parsl orchestrates workflow steps as asynchronous Python functions. In MAW it runs
-every step of a workflow — simulation binaries and Python analysis alike — as apps
-scheduled by a Parsl DataFlowKernel. 
+Parsl runs every step of a workflow — simulation binaries and Python analysis
+alike — as apps scheduled by a DataFlowKernel inside the one file you generate.
+Load for every `--engine parsl` run; the API manual is `knowledge/PARSL`.
 
----
-
-## When to Use This Skill
-
-Load when generating or debugging Parsl workflow code. Covers the exact config and API patterns used in this project.
-
-**IF YOU USE THIS SKILL, DO NOT IMPORT, USE, OR REFERENCE ANYTHING RELATED TO PYCOMPSS OR ADIOS**
-
----
+**This run's engine is Parsl. Do not import, use or reference PyCOMPSs, ADIOS2
+or Wilkins.**
 
 # Rules
 
 ## Main tools
 
-You have multiple tools derived from `/home/jalemu/FULL-MAW/servers/server.py`. Your main tools for creating and executing a file are:
-
 | Tool | What it does |
 |---|---|
-| `write_file(path, content)` | Writes a file under `/app/work/run0/`. The ONE standalone Parsl driver file goes through here, and so does anything that file reads |
+| `write_file(path, content)` | Writes a file under `/app/work/run0/`. The ONE Parsl driver goes through here, and so does anything that driver reads |
 | `run_workflow(filename)` | The server launches that driver as `<python> workflow.py` |
 
-These are the only execution tools this server has. There is no tool that takes
-a code string or a command string and runs it for you.
+These are the only execution tools. Nothing takes a code string or a command
+string and runs it for you, and `ranks` on `run_workflow` does nothing here --
+rank counts live in the `@bash_app` command string.
 
-## Parsl scoping rules
+## ONE file, and Parsl runs everything in it
 
-All modules and constants must be put in the body of the method you want to use them in. There is no such thing as a "global" in parsl.
+Generate exactly one `workflow.py` holding the whole workflow as Parsl apps. A
+simulation plus its visualization is one file with one `@bash_app` and one
+`@python_app` -- not two files and not two `run_workflow` calls.
 
-## You Write One Parsl File, Parsl Runs Everything
+Never execute anything yourself: no `subprocess`, no CLI call, no bash or PBS
+script, no `mpirun` typed by you. Shell work is a `@bash_app` whose body
+**returns the command string**; Python work is a `@python_app`.
 
-**REMEMBER ONLY CREATE ONE PYTHON FILE**
-There should only be one python file generated: workflow.py using the write_file method. It should have the entire workflow as parsl methods.
+## Scope matters: there are no globals
 
-For example: A simulation plus its visualization is one file
-containing one `@bash_app` and one `@python_app` — not two files, not two tool calls.
+**Every import and every constant an app uses must be inside that app's own
+body, or passed in as a parameter.** The worker is a separate process that never
+imported your file, so a module-level name used in a body is a `NameError` on
+the worker -- the single most common way a file that looks right fails at run
+time.
 
-## Don't use other tools
-
-**Don't ever execute the code as an agent**
- - No subprocess
- - No direct CLI call 
- - No bash
- - no PBS script, no `mpirun` typed by you.
-
-When it comes to code, you should generate parsl code. 
-If you need to use the shell or an external tool, use a @bash_app
-If you need to create a parallel python program, you annotate a method with @python_app
-
-## Always match PbsPro walltime for any bash_app
-
-**FOR ANY GENERATED FILE WITH A @BASH_APP ANNOTATION, THE ANNOTATION'S WALLTIME PARAMETER SHOULD MATCH THE PBS PRO'S WALLTIME.**
-
-For example, our default walltime is usually an hour, so we would write the following for all bash_app annotations:
-```py
-@bash_app
-def blah(walltime=3600):
-    ...
-```
-## Scope Matters!
-**!!!!!!ALL IMPORTS, CONSTANTS, ETCS. FOR PARSL ARE LOCAL TO THE METHODS THEMSELVES. YOU MUST IMPORT IN THE METHODS TO USE IN THE METHOD!!!!!!!!!!!!!!!**
-
-#### WRONG
 ```python
-import os
-WORD = "hello"
-@python_app
-def a():
-    os.mkdir() # YOU CAN'T USE OS IN THE METHOD. IT'S NOT A GLOBAL IMPORT
-    print(WORD) # YOU CAN'T USE A CONSTANT IN THE BODY. CONSTANTS AREN'T GLOBAL
+# WRONG                                   # RIGHT
+import os                                 @python_app
+WORD = "hello"                            def a(word):
+@python_app                                   import os
+def a():                                      os.makedirs("d", exist_ok=True)
+    os.makedirs("d")   # NameError            print(word)
+    print(WORD)        # NameError
 ```
-#### RIGHT
-```python
-@python_app
-def a():
-    import os
-    WORD = "hello"
-    os.mkdir() # Now that the import is local, it can create the directory.
-    print(WORD) # Now that the constant is local (or pass as an argument), you can use it.
 
-```
----
+A constant in a DEFAULT argument is fine; one read in the body is not. The same
+applies to module-level helper functions -- inline it or make it its own app.
 
-# Code Examples
+## Match the allocation's walltime on every `@bash_app`
+
+`walltime` is in SECONDS and defaults to none. Set it to the allocation's, so an
+app cannot outlive the job holding it: `def sim(..., walltime=3600)` for a
+`01:00:00` allocation.
 
 ## Resources come from `get_resources`, not from the file
 
-Call `get_resources` **before** writing a workflow that asks for ranks. It
-reports what this server can actually see:
+Call `get_resources` **before** writing anything that asks for ranks:
 
 | Field | Meaning |
 |---|---|
@@ -122,31 +90,23 @@ RANKS_PER_NODE = 8
 LAUNCHER = "mpirun"
 ```
 
-Two consequences worth stating:
-
 **Totals must fit.** `tasks x ranks_per_task` may not exceed
-`nnodes x ranks_per_node`. Check that in `main()` against the constants and
-fail with the numbers, rather than letting the launcher report "not enough
-slots available" from inside a worker.
+`nnodes x ranks_per_node`. Check that in `main()` and fail with the numbers,
+rather than letting the launcher report "not enough slots available" from inside
+a worker.
 
-**The launcher is a parameter, not a literal.** Which launcher to call, and
-with which flags, comes from `get_resources` and from the domain skill file.
-Pass it into every app that launches ranks so the file has one place to
-change. A bare `mpirun` resolves to whatever is first on PATH, and on a
-program built against a different MPI it produces N independent one-rank jobs
-that overwrite each other's output and exit 0.
-
----
+**The launcher is a parameter, not a literal.** Pass it into every app that
+launches ranks. A bare `mpirun` resolves to whatever is first on PATH, and
+against a program built for a different MPI it silently produces N independent
+one-rank jobs that overwrite each other's output and exit 0.
 
 ## 1. One node, multiple ranks, one task
 
-The simplest shape: a single multi-rank program on one node.
+A single multi-rank program on one node. Resources: 1 node, 8 rank slots, one
+task using all 8.
 
-Resources: 1 node, 8 rank slots. One task using all 8.
-
-`max_workers_per_node=1`, because the `@bash_app` that calls the launcher
-occupies **one worker slot** and the ranks are not worker slots — the launcher
-places them itself.
+`max_workers_per_node=1`: the `@bash_app` calling the launcher occupies **one
+worker slot**, and the ranks are not worker slots — the launcher places them.
 
 ```python
 import os
@@ -167,16 +127,12 @@ LAUNCHER = "mpirun"
 
 NRANKS = NODES * RANKS_PER_NODE
 
-
 @bash_app
 def simulate(exe, paramfile, nranks, rundir, launcher,
              inputs=(), outputs=(),
              stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
-    """Return the COMMAND STRING. Parsl runs it; the driver never does.
-
-    cd into the run directory: a program that writes relative to its cwd must
-    start in the directory this run owns and can write to.
-    """
+    """Return the COMMAND STRING; Parsl runs it. cd into the run directory --
+    a program writing relative to its cwd must start where this run can write."""
     product = outputs[0].filepath
     return (
         f"set -eo pipefail && "
@@ -185,27 +141,22 @@ def simulate(exe, paramfile, nranks, rundir, launcher,
         f"test -s {product}"
     )
 
-
 @python_app
 def summarize(outdir, inputs=()):
     """All imports inside the body -- the worker never imported this file."""
     import os
-
     product = inputs[0].filepath          # Parsl guarantees it exists here
-    os.makedirs(outdir, exist_ok=True)
     report = os.path.join(outdir, "summary.txt")
     with open(report, "w") as f:
         f.write(f"bytes: {os.path.getsize(product)}\n")
     return report
-
 
 def main():
     config = Config(
         executors=[
             HighThroughputExecutor(
                 label="htex",
-                # ONE worker: it is the thing that runs the launcher.
-                max_workers_per_node=1,
+                max_workers_per_node=1,    # ONE worker: it runs the launcher
                 provider=LocalProvider(init_blocks=1, min_blocks=1, max_blocks=1),
             )
         ],
@@ -216,80 +167,46 @@ def main():
     parsl.load(config)
     try:
         os.makedirs(WORK, exist_ok=True)
-
         sim = simulate(
-            exe="/abs/path/to/binary",
-            paramfile="/abs/path/to/params",
-            nranks=NRANKS,
-            rundir=WORK,
-            launcher=LAUNCHER,
+            exe="/abs/path/to/binary", paramfile="/abs/path/to/params",
+            nranks=NRANKS, rundir=WORK, launcher=LAUNCHER,
             outputs=[File(os.path.join(WORK, "result.dat"))],
         )
-
         # Wired by the DataFuture, not by a .result() call.
         report = summarize(WORK, inputs=sim.outputs)
-
-        print(report.result())        # the ONLY .result()
+        print(report.result())            # the ONLY .result()
     finally:
         parsl.clear()
-
 
 if __name__ == "__main__":
     main()
 ```
 
----
-
 ## 2. One node, multiple ranks, parallel tasks
 
-Several multi-rank programs at once, sharing one node. Each gets a slice of
-the ranks.
+Several multi-rank programs at once, sharing one node. Resources: 1 node, 8 rank
+slots, two tasks of 4 ranks each. Two things change from example 1:
 
-Resources: 1 node, 8 rank slots. Two tasks of 4 ranks each.
+**`max_workers_per_node` becomes the task count** — each concurrent launcher
+needs its own worker slot, from the same variable the DAG loops over. A
+hardcoded number silently serializes the run.
 
-Two things change from example 1:
-
-**`max_workers_per_node` is the task count.** Each concurrent launcher needs
-its own worker slot.
-
-**Each task needs a disjoint core range.** Concurrent launchers started from
-the same place all claim rank slots from the front of whatever list the
-launcher consults, so without pinning both tasks land on cores 0-3 and half
-the node sits idle. `taskset -c` restricts a launcher and every rank it starts
-to a core set, and works the same way for any launcher — a launcher's own
+**Each task needs a disjoint core range.** Concurrent launchers all claim slots
+from the front of whatever list the launcher consults, so without pinning both
+tasks land on cores 0-3 and half the node idles. `taskset -c` restricts a
+launcher and every rank it starts, and works for any launcher — a launcher's own
 pinning flags do not.
 
 ```python
-import os
-
-import parsl
-from parsl import bash_app
-from parsl.config import Config
-from parsl.data_provider.files import File
-from parsl.executors import HighThroughputExecutor
-from parsl.providers import LocalProvider
-
-WORK = "/app/work/run0"
-
-# From get_resources().
-NODES = 1
-RANKS_PER_NODE = 8
-LAUNCHER = "mpirun"
-
 # From the goal.
 NTASKS = 2
 RANKS_PER_TASK = 4
-
 
 @bash_app
 def simulate(exe, paramfile, nranks, cores, rundir, launcher,
              inputs=(), outputs=(),
              stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
-    """One instance, pinned to `cores`.
-
-    The ranges are disjoint across instances, so two instances cannot land on
-    the same cores however the launcher assigns its slots.
-    """
+    """Pinned to `cores`; the ranges are disjoint across instances."""
     product = outputs[0].filepath
     return (
         f"set -eo pipefail && "
@@ -298,129 +215,62 @@ def simulate(exe, paramfile, nranks, cores, rundir, launcher,
         f"test -s {product}"
     )
 
+# In main(): config as example 1 but max_workers_per_node=NTASKS and
+# cpu_affinity="none". Check the budget before submitting anything.
+if NTASKS * RANKS_PER_TASK > NODES * RANKS_PER_NODE:
+    raise SystemExit(f"need {NTASKS * RANKS_PER_TASK} rank slots")
 
-def main():
-    slots = NODES * RANKS_PER_NODE
-    if NTASKS * RANKS_PER_TASK > slots:
-        raise SystemExit(
-            f"need {NTASKS * RANKS_PER_TASK} rank slots, "
-            f"have {slots} ({NODES} node(s) x {RANKS_PER_NODE})"
-        )
+futures = []
+for i in range(NTASKS):
+    rundir = os.path.join(WORK, f"task{i}")
+    os.makedirs(rundir, exist_ok=True)
+    first = i * RANKS_PER_TASK
+    futures.append(simulate(
+        exe=EXE, paramfile=f"/abs/path/to/params_{i}",
+        nranks=RANKS_PER_TASK,
+        cores=f"{first}-{first + RANKS_PER_TASK - 1}",
+        rundir=rundir, launcher=LAUNCHER,
+        outputs=[File(os.path.join(rundir, "result.dat"))],
+    ))
 
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="htex",
-                # One worker per concurrent instance, from the same variable
-                # the DAG loops over. A hardcoded number silently serializes.
-                max_workers_per_node=NTASKS,
-                cpu_affinity="none",        # taskset does the pinning
-                provider=LocalProvider(init_blocks=1, min_blocks=1, max_blocks=1),
-            )
-        ],
-        run_dir=os.path.join(WORK, "runinfo"),
-        strategy="none",
-        initialize_logging=False,
-    )
-    parsl.load(config)
-    try:
-        futures = []
-        for i in range(NTASKS):
-            rundir = os.path.join(WORK, f"task{i}")
-            os.makedirs(rundir, exist_ok=True)
-
-            first = i * RANKS_PER_TASK
-            cores = f"{first}-{first + RANKS_PER_TASK - 1}"
-
-            futures.append(
-                simulate(
-                    exe="/abs/path/to/binary",
-                    paramfile=f"/abs/path/to/params_{i}",
-                    nranks=RANKS_PER_TASK,
-                    cores=cores,
-                    rundir=rundir,
-                    launcher=LAUNCHER,
-                    outputs=[File(os.path.join(rundir, "result.dat"))],
-                )
-            )
-
-        # Everything was submitted before this loop, so the instances overlap;
-        # the loop only fixes the printing order. exception() first, so one
-        # failure does not hide the other instances' results.
-        failed = []
-        for i, fut in enumerate(futures):
-            err = fut.exception()
-            if err is None:
-                print(f"task{i} ok")
-            else:
-                failed.append(i)
-                print(f"task{i} FAILED: {err}")
-        if failed:
-            raise SystemExit(f"failed: {failed}")
-    finally:
-        parsl.clear()
-
-
-if __name__ == "__main__":
-    main()
+# Everything was submitted before this loop, so the instances overlap; the loop
+# only fixes the printing order. exception() first, so one failure does not hide
+# the other instances' results.
+failed = [i for i, f in enumerate(futures) if f.exception() is not None]
+if failed:
+    raise SystemExit(f"failed: {failed}")
 ```
-
----
 
 ## 3. Multiple nodes, multiple ranks, one task
 
-One program whose rank count is more than a single node provides. The launcher
-spreads its ranks across every available node.
+One program whose rank count exceeds a single node. Resources: 2 nodes, 4 rank
+slots each, one task using all 8.
 
-Resources: 2 nodes, 4 rank slots each. One task using all 8.
+Still **one worker**, as in example 1: the pool sits on one node and runs the
+launcher, which reaches the others itself. Parsl places nothing on them, so the
+program owns them as one MPI world.
 
-Still **one worker**. The worker pool sits on one node and runs the launcher;
-the launcher reaches the others itself. Parsl places nothing on them, so the
-program owns them outright as one MPI world.
+The layout flag must agree with `ranks_per_node`. `--map-by ppr:4:node` against
+4 slots per node is right; the same flag where there are 8 reports "not enough
+slots available". 1x8 and 2x4 are both 8 ranks and are not interchangeable.
 
-The layout flag must agree with `ranks_per_node`. `--map-by ppr:4:node`
-against 4 slots per node is right; the same flag where there are 8 reports
-"not enough slots available". 1x8 and 2x4 are both 8 ranks and are not
-interchangeable, which is why the number comes from `get_resources` rather
-than being written from memory.
+Only the app body changes from example 1:
 
 ```python
-import os
-
-import parsl
-from parsl import bash_app
-from parsl.config import Config
-from parsl.data_provider.files import File
-from parsl.executors import HighThroughputExecutor
-from parsl.providers import LocalProvider
-
-WORK = "/app/work/run0"
-
-# From get_resources().
 NODES = 2
 RANKS_PER_NODE = 4
-LAUNCHER = "mpirun"
-
 NRANKS = NODES * RANKS_PER_NODE
 NTHREADS = 1          # threads per rank; see the note in the app body
-
 
 @bash_app
 def simulate(exe, paramfile, nranks, ranks_per_node, nthreads, rundir, launcher,
              inputs=(), outputs=(),
              stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
-    """One program across every available node.
-
-    ranks_per_node is what the layout flag is built from, so the layout the
-    launcher is asked for is the layout that actually exists.
-
-    OMP_NUM_THREADS is set for the ranks: without it a threaded program starts
-    one thread per core in every rank and they contend. 1 is right when all
-    the parallelism is in the ranks; raise it only for a program that is
-    genuinely hybrid, and then lower the rank count to match.
-
-    The layout flag spelling is MPI-specific -- take it from the domain skill.
-    """
+    """One program across every available node. ranks_per_node builds the
+    layout flag, so the layout asked for is the one that exists. Without
+    OMP_NUM_THREADS a threaded program starts one thread per core in every rank
+    and they contend; 1 is right when all the parallelism is in the ranks. The
+    layout flag spelling is MPI-specific -- take it from the domain skill."""
     product = outputs[0].filepath
     return (
         f"set -eo pipefail && "
@@ -431,129 +281,56 @@ def simulate(exe, paramfile, nranks, ranks_per_node, nthreads, rundir, launcher,
         f"{exe} {paramfile} && "
         f"test -s {product}"
     )
-
-
-def main():
-    print(f"{NODES} node(s) x {RANKS_PER_NODE} ranks = {NRANKS}")
-
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="htex",
-                # ONE worker. It runs the launcher; the launcher reaches the
-                # other nodes. Parsl puts nothing on them.
-                max_workers_per_node=1,
-                provider=LocalProvider(init_blocks=1, min_blocks=1, max_blocks=1),
-            )
-        ],
-        run_dir=os.path.join(WORK, "runinfo"),
-        strategy="none",
-        initialize_logging=False,
-    )
-    parsl.load(config)
-    try:
-        os.makedirs(WORK, exist_ok=True)
-
-        sim = simulate(
-            exe="/abs/path/to/binary",
-            paramfile="/abs/path/to/params",
-            nranks=NRANKS,
-            ranks_per_node=RANKS_PER_NODE,
-            nthreads=NTHREADS,
-            rundir=WORK,
-            launcher=LAUNCHER,
-            outputs=[File(os.path.join(WORK, "result.dat"))],
-        )
-        print(sim.result())
-    finally:
-        parsl.clear()
-
-
-if __name__ == "__main__":
-    main()
 ```
-
----
 
 ## 4. Multiple nodes, multiple ranks, parallel tasks
 
-More instances than one node can hold. Each instance gets its own nodes, so
-the instances cannot contend at all.
+More instances than one node can hold; each gets its own nodes, so they cannot
+contend. Resources: 4 nodes, 4 rank slots each, four tasks of 4 ranks.
 
-Resources: 4 nodes, 4 rank slots each. Four tasks of 4 ranks, one node each.
-
-`taskset` is the wrong tool here: it pins within the node a launcher starts on
-and says nothing about which nodes the launcher picks. Give each instance a
-**host file** naming only its own nodes instead.
-
-`NODELIST` comes from `get_resources`. A `@python_app` slices it and declares
-one `File` per instance; each `@bash_app` takes its own as `inputs`, so Parsl
-will not start an instance until its host file exists.
+`taskset` is the wrong tool here — it pins within the node a launcher starts on
+and says nothing about which nodes it picks. Give each instance a **host file**
+naming only its own nodes. A `@python_app` slices `NODELIST` and declares one
+`File` per instance; each `@bash_app` takes its own as `inputs`, so Parsl will
+not start an instance until its host file exists. `max_workers_per_node` is
+`NTASKS`, as in example 2.
 
 ```python
-import os
-
-import parsl
-from parsl import bash_app, python_app
-from parsl.config import Config
-from parsl.data_provider.files import File
-from parsl.executors import HighThroughputExecutor
-from parsl.providers import LocalProvider
-
-WORK = "/app/work/run0"
-
 # From get_resources(). nodelist comes back comma-separated; split it here so
 # the file never has to parse anything at run time.
 NODELIST = ["node001", "node002", "node003", "node004"]
 RANKS_PER_NODE = 4
-LAUNCHER = "mpirun"
 
 # From the goal.
 NTASKS = 4
 NODES_PER_TASK = 1
-
 RANKS_PER_TASK = NODES_PER_TASK * RANKS_PER_NODE
-
 
 @python_app
 def write_hostfiles(nodelist, nodes_per_task, ranks_per_node, outputs=()):
-    """One host file per instance, each naming only that instance's nodes.
-
-    One output File per instance rather than one for the lot, so a consumer
-    depends on exactly its own file instead of on "the splitting finished".
-    """
+    """One host file per instance. One output File each, not one for the lot,
+    so a consumer depends on its own file rather than on "splitting finished"."""
     import os
-
-    written = []
     for i, out in enumerate(outputs):
         mine = nodelist[i * nodes_per_task:(i + 1) * nodes_per_task]
         if len(mine) < nodes_per_task:
-            raise RuntimeError(
-                f"instance {i} wanted {nodes_per_task} node(s), "
-                f"only {len(mine)} left of {len(nodelist)}"
-            )
+            raise RuntimeError(f"instance {i} wanted {nodes_per_task} node(s), "
+                               f"only {len(mine)} left of {len(nodelist)}")
         os.makedirs(os.path.dirname(out.filepath), exist_ok=True)
         with open(out.filepath, "w") as f:
             for host in mine:
                 # "<host> slots=<n>" is one spelling; others want "<host>:<n>".
                 # Take the format from the domain skill file.
                 f.write(f"{host} slots={ranks_per_node}\n")
-        written.append(out.filepath)
-    return written
-
 
 @bash_app
 def simulate(exe, paramfile, nranks, rundir, launcher,
              inputs=(), outputs=(),
              stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
-    """One instance on its own nodes.
-
-    inputs[0] is this instance's host file -- a DataFuture, so Parsl will not
-    start this app until write_hostfiles has produced it.
-
-    The host file flag is MPI-specific (--hostfile, -f, -machinefile). Take the
-    spelling from the domain skill file.
-    """
+    """inputs[0] is this instance's host file -- a DataFuture, so Parsl will
+    not start this app until write_hostfiles has produced it. The host file flag
+    is MPI-specific (--hostfile, -f, -machinefile); take it from the domain
+    skill."""
     hostfile = inputs[0].filepath
     product = outputs[0].filepath
     return (
@@ -563,271 +340,117 @@ def simulate(exe, paramfile, nranks, rundir, launcher,
         f"test -s {product}"
     )
 
-
-def main():
-    if NTASKS * NODES_PER_TASK > len(NODELIST):
-        raise SystemExit(
-            f"need {NTASKS * NODES_PER_TASK} node(s), have {len(NODELIST)}"
-        )
-
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="htex",
-                # One worker per concurrent instance. They all sit together --
-                # they only run launchers, and the host files decide where the
-                # ranks go.
-                max_workers_per_node=NTASKS,
-                provider=LocalProvider(init_blocks=1, min_blocks=1, max_blocks=1),
-            )
-        ],
-        run_dir=os.path.join(WORK, "runinfo"),
-        strategy="none",
-        initialize_logging=False,
-    )
-    parsl.load(config)
-    try:
-        hostfiles = [
-            File(os.path.join(WORK, f"task{i}", "hostfile"))
-            for i in range(NTASKS)
-        ]
-        split = write_hostfiles(
-            NODELIST, NODES_PER_TASK, RANKS_PER_NODE, outputs=hostfiles,
-        )
-
-        futures = []
-        for i in range(NTASKS):
-            rundir = os.path.join(WORK, f"task{i}")
-            os.makedirs(rundir, exist_ok=True)
-            futures.append(
-                simulate(
-                    exe="/abs/path/to/binary",
-                    paramfile=f"/abs/path/to/params_{i}",
-                    nranks=RANKS_PER_TASK,
-                    rundir=rundir,
-                    launcher=LAUNCHER,
-                    inputs=[split.outputs[i]],      # this instance's host file
-                    outputs=[File(os.path.join(rundir, "result.dat"))],
-                )
-            )
-
-        failed = []
-        for i, fut in enumerate(futures):
-            err = fut.exception()
-            if err is None:
-                print(f"task{i} ok")
-            else:
-                failed.append(i)
-                print(f"task{i} FAILED: {err}")
-        if failed:
-            raise SystemExit(f"failed: {failed}")
-    finally:
-        parsl.clear()
-
-
-if __name__ == "__main__":
-    main()
+# In main(), after parsl.load():
+hosts = write_hostfiles(
+    NODELIST, NODES_PER_TASK, RANKS_PER_NODE,
+    outputs=[File(os.path.join(WORK, f"task{i}", "hosts")) for i in range(NTASKS)],
+)
+futures = [
+    simulate(exe=EXE, paramfile=f"/abs/path/to/params_{i}",
+             nranks=RANKS_PER_TASK, rundir=os.path.join(WORK, f"task{i}"),
+             launcher=LAUNCHER, inputs=[hosts.outputs[i]],
+             outputs=[File(os.path.join(WORK, f"task{i}", "result.dat"))])
+    for i in range(NTASKS)
+]
 ```
-
----
 
 # Configuring Parsl
 
 ## The driver never asks for resources
 
-The resources already exist when the driver starts; `get_resources` is how you
-find out what they are, and the numbers go into the file as constants. Use
-`LocalProvider` with one fixed block and let the launcher inside a
-`@bash_app` reach any other nodes itself.
-
-```python
-provider=LocalProvider(init_blocks=1, min_blocks=1, max_blocks=1)
-```
-
-Fixed topology: `strategy="none"` plus equal `min`/`max`/`init` blocks means
-no scaling in or out, which is what a run of known shape wants. Do not use a
-scheduler provider in a generated workflow, and do not write a submit script.
+They already exist when the driver starts; `get_resources` is how you learn
+their shape and the numbers go in as constants. Use `LocalProvider` with one
+fixed block and let the launcher inside a `@bash_app` reach other nodes itself.
+Never use a scheduler provider in a generated workflow, and never write a submit
+script.
 
 ## `max_workers_per_node` is the concurrency knob
 
-It is the number of apps that may run at once. Three situations, three
-answers:
+It is how many apps may run at once.
 
 | Situation | Value |
 |---|---|
 | One app that launches its own ranks | `1` |
-| K launcher apps running at once | `K`, plus disjoint cores (one node) or host files (many) |
-| K independent single-process chains | the DAG's peak concurrency, not necessarily K |
+| K launcher apps at once | `K`, plus disjoint `taskset` ranges (one node) or host files (many) |
+| K independent single-process chains | the DAG's PEAK concurrency, not necessarily K |
 
-For the third, count the DAG's real peak: a stage that fans out to two
-consumers of the same future makes one chain want two slots at once. Running
-under the peak only queues, but a cheap deliverable queueing behind an
-expensive one is the usual reason to raise it.
+Size it from the same variable the DAG loops over. For the third row count the
+real peak: a stage fanning out to two consumers of one future wants two slots.
 
-**Size from a variable.** When the instance count comes from the goal,
-`max_workers_per_node` comes from the same variable. A hardcoded `2` silently
-serializes a ten-instance run.
-
-## `cores_per_worker` is not a reservation
-
-It is a **divisor** for the worker count, not cores handed to an app. On 128
-visible cores `cores_per_worker=8` gives 16 workers. Set above the visible
-core count it gives **zero** workers and the DAG hangs with no error. To size
-concurrency use `max_workers_per_node`; to give an app a core range use
-`taskset` in the command string.
-
-Set `cpu_affinity="none"` when `taskset` or the launcher does the pinning, so
-Parsl's own affinity does not fight it.
+`cores_per_worker` is **not** a reservation -- it is a DIVISOR for the worker
+count. On 128 cores `cores_per_worker=8` gives 16 workers; set above the visible
+core count it gives **zero** workers and the DAG hangs with no error. Use
+`max_workers_per_node` for concurrency and `taskset` in the command string to
+give an app a core range, with `cpu_affinity="none"` so Parsl's own affinity
+does not fight it.
 
 ## Keep the executor process-based
 
-Do not swap `HighThroughputExecutor` for `ThreadPoolExecutor` to save startup
-cost when apps touch **global library state**. A library with a module-level
-scene, context or registry — most visualization packages — cannot have two
-instances manipulating it in one interpreter. Separate worker processes keep
-concurrent instances independent; threads share the interpreter and corrupt
-each other. Threads are fine for apps that are pure functions over their
-arguments.
-
-## Pin `run_dir`
-
-```python
-run_dir=os.path.join(WORK, "runinfo")
-```
-
-Left at its default, the per-app logs land in `runinfo/` relative to the
-process CWD — a different tree from the server's, so the first place to look
-after a failure is then missing.
+Do not swap `HighThroughputExecutor` for `ThreadPoolExecutor` when apps touch
+**global library state** -- a module-level scene, context or registry, as most
+visualization packages have. Separate worker processes keep concurrent instances
+independent; threads share one interpreter and corrupt each other. Unregister
+global state in a `finally` so the next task on that worker does not inherit it.
 
 ## `initialize_logging=False`
 
-The default is `True`, which writes a DEBUG-level `parsl.log` including the
-scaling strategy every 5 seconds — thousands of lines of `more slots than
-tasks` in a long run. That belongs to development, not to a run whose output
-is a scientific artifact.
+The default `True` writes a DEBUG `parsl.log` including the scaling strategy
+every 5 seconds -- thousands of lines of `more slots than tasks` -- into the
+directory whose contents are the run's scientific output.
 
-**Turn it back on for one run when a DAG hangs or fails in a way the result
-does not explain.** `parsl.log` is the only record of task submission and
-dependency resolution: whether an app was ever submitted, which executor it
-went to, what it was waiting on, and the full traceback of a failed app body.
-Remove the line, reproduce, read the log, put the line back.
-
-A middle setting keeps the submission trail and every failure while dropping
-the polling noise:
+**Turn it back on for one run when a DAG hangs or fails in a way the result does
+not explain.** `parsl.log` is the only record of submission and dependency
+resolution: whether an app was submitted at all, which executor took it, what it
+waited on, and the full traceback of a failed app body. Or keep the trail and
+drop the polling noise:
 
 ```python
-import logging
-parsl.load(config)
-logging.getLogger("parsl").setLevel(logging.INFO)
+parsl.load(config); logging.getLogger("parsl").setLevel(logging.INFO)
 ```
 
-## Lifecycle
+## The skeleton
 
-```python
-parsl.load(config)          # once, at the top of main()
-...                         # submit every app
-final.result()              # resolve
-parsl.clear()               # in a finally, to release the workers
-```
-
-`parsl.load()` twice without `parsl.clear()` raises `NoDataFlowKernelError`.
-
-## The full skeleton
-
-```python
-config = Config(
-    executors=[
-        HighThroughputExecutor(
-            label="htex",
-            max_workers_per_node=NTASKS,     # same variable as the DAG
-            cpu_affinity="none",             # when taskset does the pinning
-            provider=LocalProvider(init_blocks=1, min_blocks=1, max_blocks=1),
-        )
-    ],
-    run_dir=os.path.join(WORK, "runinfo"),
-    strategy="none",
-    initialize_logging=False,
-)
-```
-
-Do not add keyword arguments beyond these — an unrecognized one is a
-`TypeError` at load.
-
----
+Example 1's `Config` is the skeleton: `label`, `max_workers_per_node`,
+`provider`, plus `run_dir` (else logs land in the process CWD), `strategy="none"`
+(fixed topology) and `initialize_logging=False`. Add `cpu_affinity="none"` when
+`taskset` does the pinning. Add nothing else -- an unrecognized keyword is a
+`TypeError` at load. Lifecycle is `parsl.load(config)` once at the top of
+`main()`, submit, resolve once, `parsl.clear()` in a `finally`.
 
 # Files Between Apps
 
 ## Declare products, do not name them in strings
-
-A path passed from one app to another as a plain string is invisible to the
-DataFlowKernel: it cannot order the apps, cannot stage the file, and cannot
-tell you that the producer never wrote it. Declare it instead.
-
-**Producer** declares what it writes:
-
-```python
-sim = simulate(..., outputs=[File("/app/work/run0/result.dat")])
-```
-
-Inside the app body, read the path off the `File` object, so the command
-writes exactly what Parsl is tracking:
+A path passed between apps as a plain string is invisible to the DataFlowKernel:
+it cannot order the apps, stage the file, or tell you the producer never wrote
+it. Read the path off the `File` object inside the body, so the command writes
+exactly what Parsl tracks.
 
 ```python
 @bash_app
 def simulate(exe, rundir, outputs=()):
-    product = outputs[0].filepath
-    return f"cd {rundir} && {exe} > {product}"
-```
+    return f"cd {rundir} && {exe} > {outputs[0].filepath}"
 
-**Consumer** depends on it:
-
-```python
-analyze(inputs=sim.outputs)
-```
-
-```python
 @python_app
 def analyze(inputs=()):
-    product = inputs[0].filepath      # guaranteed to exist when this starts
+    import os
+    return os.path.getsize(inputs[0].filepath)   # Parsl guarantees it exists
+
+sim = simulate(EXE, WORK, outputs=[File(os.path.join(WORK, "result.dat"))])
+out = analyze(inputs=sim.outputs)                # the edge, not a .result()
 ```
 
-`sim.outputs` is a list of `DataFuture`. Passing it as `inputs` is what creates
-the edge, and it is why the consumer needs no `os.path.exists` check — a
-hand-written existence check is a symptom of string wiring.
+One `File` per product, not one for the lot, so a consumer depends on exactly
+the file it reads.
 
-## Several products, several consumers
-
-One output per consumer lets each depend on only its own file:
-
-```python
-hostfiles = [File(f"{WORK}/task{i}/hostfile") for i in range(NTASKS)]
-split = write_hostfiles(..., outputs=hostfiles)
-
-for i in range(NTASKS):
-    simulate(..., inputs=[split.outputs[i]])
-```
-
-Depending on `split.outputs` as a whole would make every instance wait for
-every file, which is correct but needlessly serial.
-
-## Passing values, not files
-
-A `@python_app`'s return value is an `AppFuture`. Pass the future itself as an
-argument and Parsl resolves it before the consumer runs:
-
-```python
-info = select_params(...)              # returns a dict
-sim = simulate(..., info=info)         # body receives the dict, not the future
-```
-
-The value must be picklable. Return a small dict of numbers and strings, not
-an open file handle or a library object.
+A future passed as an ORDINARY argument arrives in the body as its resolved
+value, so a small picklable dict of numbers and strings needs no `File` at all.
+Do not return an open handle or a library object.
 
 ## Build the DAG for N, resolve once
 
 ```python
 def build_instance(i, ranks):
-    ...                       # this instance's apps, wired to each other
+    ...                        # this instance's apps, wired to each other
     return terminal_future     # module-level helper, called from main()
 
 finals = [build_instance(i, RANKS_PER_TASK) for i in range(NTASKS)]
@@ -835,18 +458,11 @@ for f in finals:
     print(f.result())
 ```
 
-Everything that differs between instances — its directory, its input file, its
-core range, its host file — is derived from the index inside that function.
-Resolving in a loop at the end still submits everything up front, so the
-instances overlap; the loop only fixes the printing order.
-
-Where the instance count exceeds what can run at once, keep the DAG the same
-and let the worker count throttle it. Parsl queues the excess. Do not
-hand-write batches unless the goal asks for it.
-
----
-
-# Common Pitfalls
+Everything that differs between instances -- directory, input file, core range,
+host file -- is derived from the index inside that function. Resolving in a loop
+still submits everything up front, so the instances overlap. Where the instance
+count exceeds what can run at once, keep the DAG and let the worker count
+throttle it.
 
 | Pitfall | Rule |
 |---|---|
@@ -855,44 +471,29 @@ hand-write batches unless the goal asks for it.
 | Writing a shell or submit script to run the work | Never. The command belongs in a `@bash_app` string |
 | `import subprocess` / `os.system` in the generated file | Takes the work out of Parsl — express it as a `@bash_app` |
 | A launcher call in the driver body instead of inside a `@bash_app` | Parsl never sees the launch — move it into the app body |
-| A launcher name in a docstring or module string | Scanned as a string constant and rejected outside a `@bash_app`. Put it in a `#` comment |
 | The workflow file discovering its own resources | It cannot see them reliably and does not need to. Call `get_resources` first and write the numbers in as constants |
-| Imports at module level used inside an app body | `NameError` on the worker — it never imported your file. Import inside the body |
-| A module-level constant read in an app body | Same `NameError`. Pass it as a parameter. A constant in a DEFAULT argument is fine; one read in the body is not |
-| A module-level helper called from an app body | Same `NameError`. Inline it or make it its own app, even if that duplicates code |
-| Calling `.result()` inside an app | Deadlocks the worker — only call it in `main()` |
-| `.result()` between submissions to force ordering | Serializes the driver and hides the DAG. Submit everything, then resolve once |
-| Passing file paths between apps as plain strings | Invisible to the DFK. `outputs=[File(p)]` on the producer, `inputs=producer.outputs` on the consumer |
-| `os.path.exists` checks on another app's output | A symptom of string wiring — with `File`/`DataFuture` deps Parsl guarantees the file first |
+| A module-level import, constant or helper used in an app body | `NameError` on the worker — it never imported your file. Import inside the body, pass constants as parameters (a DEFAULT argument is fine), and inline or app-ify the helper |
+| `.result()` inside an app, or between submissions | Inside an app it deadlocks the worker; between submissions it serializes the driver and hides the DAG. Submit everything, resolve once, in `main()` |
+| Passing file paths between apps as plain strings | Invisible to the DFK. `outputs=[File(p)]` on the producer, `inputs=producer.outputs` on the consumer. An `os.path.exists` check on another app's output is the symptom |
 | Debugging the app named in `DependencyError` | That app never ran. Read the chain back to its root and debug the app in the FIRST traceback |
-| Trusting a `BashExitFailure` exit code at face value | It is the last command's code, and MPI aborts are truncated mod 256. Read the app's stderr file |
+| Trusting a `BashExitFailure` exit code at face value | It is the LAST command's code, and MPI aborts are truncated mod 256. Read the app's stderr file |
 | Omitting `stdout=`/`stderr=` on a `@bash_app` | The output is discarded and a failure has no explanation at all. Pass `parsl.AUTO_LOGNAME` for both |
 | Leaving `run_dir` at its default | Per-app logs land relative to the process CWD, a different tree from the server's. Pin it under the work directory |
-| Chaining a pipe under plain `set -e` | `set -e` ignores failure on the LEFT of a pipe, so a dead reader still exits 0. Use `set -eo pipefail` |
-| Relying on `set -e` to catch an unset variable | It does not. Add `set -u`, or guard the variable and exit with a distinct code |
+| Relying on plain `set -e` | It ignores failure on the LEFT of a pipe (use `set -eo pipefail`) and does not catch an unset variable (add `set -u`) |
 | `except OSError: pass` around setup inside an app | Hides the real failure and returns the downstream symptom from somewhere unrelated. Setup must fail loudly |
-| `cores_per_worker=N` to "size a slot for N ranks" | It is a DIVISOR for the worker count. Above the visible core count it gives ZERO workers and the DAG hangs silently. Use `max_workers_per_node` |
-| `max_workers_per_node=1` for K independent chains | They run one at a time however the DAG is wired. Size workers to the DAG's peak concurrency |
-| Two or more launcher apps at once without separation | They all claim rank slots from the front of the same list and overlap. Disjoint `taskset` ranges on one node, per-instance host files across nodes |
-| `taskset` to separate instances across nodes | It pins within one node and says nothing about which nodes the launcher picks. Use host files |
+| `cores_per_worker=N` to "size a slot for N ranks", or `max_workers_per_node=1` for K chains | `cores_per_worker` is a DIVISOR — above the visible core count it gives ZERO workers and the DAG hangs silently. Size `max_workers_per_node` to the DAG's peak concurrency |
+| Two or more launcher apps at once without separation | They all claim slots from the front of the same list and overlap. Disjoint `taskset` ranges on ONE node; per-instance host files ACROSS nodes — `taskset` cannot pick nodes |
 | A hardcoded instance count or rank count | Both come from the goal and from `get_resources`. Derive the worker count from the same variable |
 | `--map-by ppr:N:node` with N != the available ranks per node | "not enough slots available". 1x8 and 2x4 are both 8 ranks and are not interchangeable |
 | Instances x ranks greater than the available slots | Check it in `main()` against the constants and fail with the numbers, rather than letting the launcher report it from inside a worker |
 | Many workers with `OMP_NUM_THREADS` unset | Each rank starts one thread per core and they contend. Set it explicitly |
 | Using whatever launcher is on `PATH` for a program built against another MPI | That launcher belongs to a different MPI. Ranks then run as N separate one-rank jobs and exit 0. Use the launcher `get_resources` and the domain skill name, and verify the rank count from the program's own output |
-| Inferring "am I a rank?" from launcher-set environment variables | They appear in processes never launched by a launcher and can be missing in ones that were. Use an explicit `--mpi` flag |
-| Re-invoking the file without a flag guard | The child re-enters `main()` and forks again, without limit. Check the flag first in `__main__` |
-| A module-level import of an MPI-linked library in a re-invoking file | The driver becomes an MPI process and the launcher a nested one. Import inside the rank function |
-| `parse_args` in a file a launcher re-invokes | Some launchers append arguments of their own. Use `parse_known_args` |
+| A file that re-invokes itself as its own ranks | Guard on an explicit `--mpi` flag checked first in `__main__` (launcher env vars are unreliable both ways), import MPI-linked libraries inside the rank function, and use `parse_known_args` — some launchers append arguments |
 | A `@python_app` that assigns a library-path variable then imports the library | No effect — the loader fixed its search path when the worker started. Use a `@bash_app` that exports then launches |
-| `ThreadPoolExecutor` for apps that touch global library state | They share one interpreter and corrupt each other. Use process-based HTEX |
-| Leaving a library's global state registered after an app fails | The next task on that worker inherits it. Unregister in a `finally` |
+| `ThreadPoolExecutor` for apps touching global library state | They share one interpreter and corrupt each other. Use process-based HTEX, and unregister global state in a `finally` so the next task does not inherit it |
 | One app producing both a cheap and an expensive deliverable | A failure in the expensive half takes the cheap one with it. Split them |
-| Rendering without `matplotlib.use("Agg")` | Headless nodes have no display; set the backend inside the `@python_app` |
+| Rendering without `matplotlib.use("Agg")` | Headless nodes have no display; set it INSIDE the `@python_app` |
 | `rm -rf` on a directory the app also reads or writes | A retry wipes the previous attempt's output before you can read it. `mkdir -p`, and remove only the subdirectory being replaced |
 | Simulation app invoked more than once per run | Call it exactly once per workflow invocation — re-invoking on replan silently produces duplicate runs instead of reusing the result |
-| Extra kwargs in `HighThroughputExecutor` | `TypeError` at load — copy the config skeleton exactly |
-| `strategy` not set to `"none"` | Auto-scaling fights a fixed set of resources |
-| Leaving `initialize_logging` at its default | Writes a DEBUG `parsl.log` with 5-second scaling chatter into the run directory. Set `False`; turn it on only to diagnose a hang |
-| `parsl.load()` twice without `parsl.clear()` | Raises `NoDataFlowKernelError` |
+| Deviating from the config skeleton | An extra kwarg is a `TypeError` at load; `strategy` other than `"none"` makes auto-scaling fight fixed resources; `initialize_logging` left at its default floods the run directory. `parsl.load()` twice without `parsl.clear()` raises `NoDataFlowKernelError` |
 | `WorkerLost` | The worker process crashed — read stderr for the actual exception |

@@ -1,63 +1,60 @@
 ---
 name: agents/installer
 description: >
-  Base skill for the installer agent. Documents the two-phase venv setup process:
-  Phase 1 reads/generates a requirements.txt, Phase 2 pip-installs into the local venv.
-  Covers the dependency-reuse skip logic and orchestrator approval flow.
+  Operating manual for the installer agent. Two phases: write requirements.txt
+  from the planner's stack, stop for the orchestrator, then pip install what the
+  orchestrator approved. Covers what the approval gate can and cannot change.
 ---
 
 # Installer Agent — Base Skill
 
-Manages the local venv environment. Phase 1 produces a requirements.txt for orchestrator review; Phase 2 pip-installs into the venv (skipped if all packages already present).
+Prepares the venv for this run. Two phases, with the orchestrator between them.
 
----
+**You have no language model.** You write a list to disk and run pip. Nothing in
+this skill asks you to decide anything, and nothing you are told between the two
+phases can change what you produce — see the gate below.
 
-## When to Use This Skill
+## Phase 1: write the list, then stop
 
-Loaded on every installer() call. Provides the general installer mechanics.
+Write `work/builds/requirements.txt` from the planner's `stack_decision`,
+report `installer_requirements_pending_approval`, and stop.
 
-Pair with the use-case installer skill for domain-specific package requirements.
+**Always regenerate the file.** A `requirements.txt` already on disk is from a
+previous run, possibly a different engine or domain, and reusing it is how a
+stale package reaches the venv.
 
----
+## Phase 2: install what was approved
 
-## Overview
+Entered when `requirements_approved` is set. `requirements_override` wins over
+`stack_decision` — it is the orchestrator's corrected list, and if one is present
+the file on disk is stale, so rewrite it before reading it back.
 
-The installer is a two-phase agent:
-- **Phase 1:** Returns a requirements.txt to the orchestrator for review. Sets `current_step="installer_requirements_pending_approval"`.
-- **Phase 2:** Runs `pip install -r requirements.txt` only after the orchestrator sets `requirements_approved=True` or after the `requirements_override=[...]` with the orchestrators list of dependencies. If a 
+Read the list back **from the file**, not from `stack_decision`: the orchestrator
+approved the file, and rebuilding from state would install something it never saw.
 
----
+Then `pip install` into the interpreter this process is running in. If
+`state["modules"]` is non-empty, run pip under those modules in a login shell,
+after a `module purge` — a compiled package (`mpi4py`, anything with MPI-linked
+extensions) otherwise builds against whatever the launching shell happened to
+have, which is not the MPI the tasks will load.
 
-## Step-by-Step Workflow
+A pip failure is **reported, not raised**. The explorer has `check_package` and
+can report what is actually importable, which is better evidence than pip's exit
+code.
 
-### Step 1 (Phase 1): Read or generate requirements.txt
+## What the approval gate can and cannot do
 
-Reads `work/builds/requirements.txt` from disk if it exists, otherwise generates one from `stack_decision`.
+The gate buys one thing: the orchestrator sees the package list **before**
+anything is installed.
 
-Returns:
-```python
-{"requirements": requirements_content, "current_step": "installer_requirements_pending_approval"}
-```
+It cannot buy a different list out of you. You have no model, so re-entering
+phase 1 regenerates a byte-identical file. The only thing that changes the
+outcome is the orchestrator supplying `requirements_override`, which it does
+itself — it never sends the work back here for a rewrite, because there is
+nothing here to rewrite it with.
 
-### Step 2: Orchestrator reviews and approves
+## Constraints
 
-The orchestrator checks the requirements and sets `requirements_approved=True` or gives you a modified list of dependencies `requirements_override=[...]`. Installer is called again.
-
-### Step 3 (Phase 2): Install packages (or skip)
-
-Check if all packages are already installed before running pip:
-```bash
-pip show <package>
-```
-If all present → skip install, return immediately. Give `INSTALLER_COMPLETE` to the orchestrator, not the requirements.
-If any missing → run `pip install -r builds/requirements.txt`.
-
----
-
-## Key Rules and Constraints
-
-- Never proceed to Phase 2 without `requirements_approved=True` or `requirements_override=[...]`in state.
-- Always check for existing packages before installing — avoids unnecessary network calls.
-- The installer only manages requirements.txt and pip installs into the venv -- no other build/runtime state is tracked
-
----
+- Never install in phase 1, and never install without an approval in state.
+- Only pip packages. Environment modules are loaded per task, not installed.
+- Nothing else is tracked: no build state, no runtime state, no other file.

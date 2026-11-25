@@ -132,7 +132,7 @@ _SKILLS_ROOT = os.path.join(
 # no longer applies -- src/utility.py already reads it from here, and a second
 # copy drifting from the first is how condition A ends up describing a different
 # machine to different agents.
-from common.consts import USE_CASE_SKILL_REDIRECTS, ENV_NOTES
+from common.consts import USE_CASE_SKILL_REDIRECTS, ENV_NOTES, adios_variant
 
 # Prompts and text constants. Kept in their own module: they are the part that
 # gets edited most often, and this file is the loop that consumes them.
@@ -254,12 +254,17 @@ def run_workflow(filename: str = "workflow.py", args: Optional[list] = None,
 
 @tool
 def write_xml(kind: str, content: str) -> str:
-    """Write COMPSs's project.xml or resources.xml. PyCOMPSs runs only.
+    """Override COMPSs's project.xml or resources.xml. YOU NORMALLY DO NOT NEED THIS.
 
-    Both are required before run_workflow: they describe the machine COMPSs
-    will run on, and its runtime will not come up without them. Call
-    get_resources first so the hosts and slots you declare match the allocation
-    that actually exists.
+    The server generates both from the real allocation before every run,
+    including the SSH check that decides whether each host can actually start a
+    worker. Call get_resources and read `compss_topology` instead of writing
+    these by hand.
+
+    Use this only to correct a generated topology that is demonstrably wrong,
+    and say why in your summary. A kind you write here is yours for the rest of
+    the session -- the server stops regenerating it, so it can no longer be
+    corrected when the allocation turns out to differ.
 
     Args:
         kind: "project" or "resources"
@@ -397,9 +402,10 @@ def write_config(content: str, filename: str = "") -> str:
     Per dataset: `metadata: 1` transports it in memory over MPI, `passthru: 1`
     writes it through to a real HDF5 file. Both 0 means it goes nowhere.
 
-    The launcher's rank count is the SUM of every task's nprocs, and the server
-    reads it from this file -- so state nprocs on every task and pass ranks=0
-    to run_workflow.
+    The launcher's rank count is the SUM over tasks of taskCount x nprocs, and
+    the server reads it from this file -- so state nprocs on every task and pass
+    ranks=0 to run_workflow. Launching short does not run a smaller workflow; it
+    starves the tasks at the tail.
 
     Args:
         content: the full YAML document
@@ -537,13 +543,12 @@ def _dedupe_skills(contents: list[str]) -> list[str]:
     iteration of the ReAct loop -- so anything in there twice is paid for up to
     max_iterations times.
 
-    Two files can be the same skill: knowledge/PARSL.SKILL.md declares
-    `name: systems/parsl` in its own front matter, because it was copied from
-    systems/parsl.SKILL.md and never re-headed. Matching on that declared name
-    is what identifies the duplicate -- not a guess from how similar the text
-    looks -- and a byte-identical fallback catches a copy with no front matter
-    at all. Genuinely distinct references (adios, pycompss) declare different
-    names or none, and are both kept.
+    Two files can be the same skill when one was copied from the other and its
+    front matter never re-headed: the declared `name:` is what identifies that,
+    not a guess from how similar the text looks, and a byte-identical fallback
+    catches a copy with no front matter at all. Every knowledge/* file currently
+    declares its own name, so nothing is dropped today -- this guards against
+    the next copy.
     """
     kept: list[str] = []
     seen_names: set[str] = set()
@@ -644,17 +649,17 @@ def _adios_only_tools() -> list:
 
     An earlier version bound run_mpmd unconditionally, so a MAW_ADIOS=serial
     run was offered MPMD and never offered run_pipeline, write_bp or read_bp
-    at all.
+    at all. Default: serial.
     """
-    if os.environ.get("MAW_ADIOS", "serial").strip().lower() == "mpi":
+    if adios_variant() == "mpi":
         return [run_mpmd, write_stage]
     return [run_pipeline, write_bp, read_bp]
 
 
 # Tools that exist for one engine only, bound just for that engine so the model
-# is never offered a tool the server does not implement. PyCOMPSs needs its XML
-# topology written before the runtime can start; Wilkins needs its YAML and the
-# LowFive check; ADIOS depends on the build (see above); parsl needs nothing.
+# is never offered a tool the server does not implement. PyCOMPSs's write_xml is
+# an OVERRIDE -- the server generates the topology itself; Wilkins needs its YAML
+# and the LowFive check; ADIOS depends on the build; parsl needs nothing.
 _ENGINE_ONLY_TOOLS = {
     "pycompss": [write_xml],
     "wilkins":  [write_config, check_lowfive],
@@ -1175,6 +1180,8 @@ async def _explorer_async(state: dict, engine: str) -> dict:
         "MAW_REPO_ROOT",
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
+    # MAW_ADIOS is normalised here and passed on canonical, so the server's class
+    # cannot disagree with the tools _adios_only_tools just bound.
     server_params = StdioServerParameters(
         command=sys.executable,
         args=[server_path],
@@ -1187,6 +1194,7 @@ async def _explorer_async(state: dict, engine: str) -> dict:
             "MAW_DATA_DIR": os.environ.get(
                 "MAW_DATA_DIR", os.path.join(repo_root, "inputs", "data")
             ),
+            "MAW_ADIOS": adios_variant(),
         },
     )
 
@@ -1434,11 +1442,19 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                     ))
                     continue
 
-                # Call MCP tool with timeout protection
+                # Wait at least as long as we asked the SERVER to wait, plus
+                # slack. A flat 30 min meant a run_workflow(timeout=7200) was
+                # abandoned here while the server stayed inside proc.wait for
+                # another 90 minutes, holding the session and the engine's
+                # process group.
+                _server_timeout = tool_args.get("timeout")
+                _call_timeout = 1800
+                if isinstance(_server_timeout, (int, float)) and _server_timeout > 0:
+                    _call_timeout = max(_call_timeout, int(_server_timeout) + 120)
                 try:
                     mcp_result = await asyncio.wait_for(
                         session.call_tool(tool_name, tool_args),
-                        timeout=1800,  # 30 min max per tool call
+                        timeout=_call_timeout,
                     )
                     if mcp_result.content:
                         texts = [block.text for block in mcp_result.content if hasattr(block, "text")]
@@ -1447,10 +1463,11 @@ async def _explorer_async(state: dict, engine: str) -> dict:
                         tool_result = "{}"
                 except asyncio.TimeoutError:
                     tool_result = json.dumps({
-                        "error": f"Tool call timed out after 1800s",
+                        "error": f"Tool call timed out after {_call_timeout}s",
                         "status": "timeout",
                     })
-                    console.print(f"[bold red][explorer] {tool_name} timed out -- skipping[/bold red]")
+                    console.print(f"[bold red][explorer] {tool_name} timed out "
+                                  f"after {_call_timeout}s -- skipping[/bold red]")
                 except (BrokenPipeError, ConnectionError, EOFError) as e:
                     tool_result = json.dumps({
                         "error": f"MCP connection lost: {e}",

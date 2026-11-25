@@ -50,19 +50,14 @@ KNOWLEDGE_SKILLS = {
 EXEC_PROMPT_HEAD = """\
 ## How You Execute Work
 
-You have exactly two execution tools: `write_file` and `run_workflow`. No tool
-takes a code string or a command string and runs it for you, and you never run
-anything yourself.
+No tool takes a code string or a command string and runs it for you, and you
+never run anything yourself. You write files and the server launches them.
 
-1. `write_file(path=..., content=...)` -- write every file the run needs.
-   Write the configuration files FIRST, then the workflow file that reads them.
-   One call per file.
-2. `run_workflow(filename="workflow.py")` -- the server launches the workflow
-   file under this engine. One call, once everything is written.
-
-The workflow is ONE file containing EVERY step of the work. A simulation plus
-its visualization is one file with two steps in it, not two workflow files and
-not two run_workflow calls.
+1. `write_file(path=..., content=...)` -- write every file the run needs, one
+   call per file, CONFIGURATION FIRST and then whatever reads it.
+2. A launch tool -- `run_workflow` on most engines. **How many files this engine
+   wants, and which launch tool it binds, are stated in the engine section
+   below; it is not the same for all four.** Read that before writing anything.
 
 `write_file` returns `warnings` when the file does not look like it uses this
 engine. Those are about whether the engine is doing the work at all, so read
@@ -70,15 +65,20 @@ them and fix the file before running it. A `rejected` status means the file was
 not written -- fix the error and call `write_file` again rather than routing
 around it with another tool.
 
-If `run_workflow` fails, the error you need is usually in `stderr` or in the
-`logs` the result carries. `get_status(run_id)` has the untruncated output.
-Fix the file, write it again, run it again -- at most three times for the same
-problem, then move on.
+If the launch fails, the error you need is usually in `stderr` or in the `logs`
+the result carries. `get_status(run_id)` has the untruncated output. Fix the
+file, write it again, run it again -- at most three times for the same problem,
+then move on.
 """
 
 ENGINE_EXEC_PROMPTS = {
     "parsl": EXEC_PROMPT_HEAD + """
-### What the workflow file must contain (Parsl)
+### ONE file, run with `run_workflow` (Parsl)
+
+A simulation plus its visualization is one `workflow.py` with two apps in it --
+not two files and not two `run_workflow` calls.
+
+### What that file must contain (Parsl)
 
 Every unit of work is a decorated function:
 
@@ -100,26 +100,35 @@ command string.
 """,
 
     "pycompss": EXEC_PROMPT_HEAD + """
-### Write the XML topology first (PyCOMPSs)
+### DO NOT write the XML topology (PyCOMPSs)
 
-PyCOMPSs is the one engine that needs configuration before the workflow. COMPSs
-reads the machine it runs on from two XML files, and its runtime will not start
-without them. Use `write_xml`, not `write_file`, so they land where the
-launcher looks:
+COMPSs reads the machine it runs on from project.xml and resources.xml, and
+**the server generates both from the real allocation before every run**. You do
+not write them, and you should not need `write_xml` at all.
 
-1. `write_xml(kind="project", content=...)` -- which hosts take work, the
-   COMPSs install directory and working directory on each, the task limit.
-2. `write_xml(kind="resources", content=...)` -- how to reach each host: its
-   processors and computing units, the communication adaptor and its port
-   range, any shared disks.
+Call `get_resources` first and read `compss_topology`:
 
-Call `get_resources` first and declare what is actually there. Off a scheduler
-(`in_pbs` false) there is one host: declare the master node's own computing
-units in project.xml and leave `<ResourcesList>` empty -- COMPSs then schedules
-tasks into the master's own slots, which is its documented single-process
-configuration.
+- `mode` is `master_only` (one node: the master runs the tasks itself, no ssh)
+  or `multi_node` (each host is a worker reached over ssh).
+- `total_slots` is the CEILING for `@mpi(processes=N)`. A larger N fails with
+  "not enough slots available", and setting an oversubscribe flag to silence
+  that stacks ranks onto slots they do not have and wastes the allocation.
+- `units_per_host` is what `processes_per_node` must be.
+- `total_slots` of 0 means no host can start a worker. The run is refused;
+  report it as an environment gap rather than working around it.
 
-### What the workflow file must contain (PyCOMPSs)
+`write_xml` exists only to correct a generated topology that is demonstrably
+wrong. Using it takes that file over for the rest of the session and the server
+stops regenerating it. Note that a **bare** `<MasterNode/>` with no `<Processor>`
+contributes no resources at all: COMPSs starts, schedules nothing, and hangs
+with no error.
+
+### ONE file, run with `run_workflow` (PyCOMPSs)
+
+The whole application is one `workflow.py`. You write no other file except a
+configuration file a task genuinely reads -- and never the XML.
+
+### What that file must contain (PyCOMPSs)
 
 Every unit of work is a decorated function:
 
@@ -128,58 +137,107 @@ Every unit of work is a decorated function:
   The body is `pass`. Arguments come from the function signature plus `@task`
   parameter types (`FILE_IN`, `FILE_OUT`, `FILE_IN_STDIN`, `FILE_OUT_STDOUT`,
   `Prefix`), or from an `args` string with `{{name}}` placeholders.
-- `@mpi(binary="...", runner="mpirun", processes=N)` stacked above `@task` for
-  an MPI program on N ranks. Body is `pass`. This is how rank count is
-  expressed -- you never type `mpirun` yourself, and `ranks` on run_workflow is
-  not how you ask for ranks here.
+- `@mpi(binary="...", runner=RUNNER, processes=N, processes_per_node=M)`
+  stacked above `@task` for an MPI program. Body is `pass`. This is how rank
+  count is expressed -- you never type `mpirun` yourself, and `ranks` on
+  run_workflow is not how you ask for ranks here.
+  **`processes_per_node` is not optional.** It defaults to 1, and `processes` is
+  then read as a number of NODES, so `@mpi(processes=8)` alone asks for eight
+  nodes at one rank each and fails with "not enough slots available". Set it
+  from `compss_topology.units_per_host`. `runner` must be an ABSOLUTE path:
+  take it from `get_resources`'s `mpi_runner`, or read `COMPSS_MPIRUN` in the
+  file. A bare `"mpirun"` resolves off the worker's PATH and exits 127.
 
 Dependencies come from passing values between tasks and from FILE_IN/FILE_OUT
 parameters; call `compss_wait_on()` only where the driver needs a real value.
 
-The file is executed as a program by `runcompss`, which owns the runtime
-lifecycle: give it a `main()` and an `if __name__ == "__main__":` guard, and do
-NOT call `compss_start()` or `compss_stop()` yourself.
+The server runs the file as `<python> -m pycompss ... workflow.py`, which owns
+the runtime lifecycle: give it a `main()` and an `if __name__ == "__main__":`
+guard, and do NOT call `compss_start()` or `compss_stop()` yourself. Run as
+plain `python workflow.py` the same file would execute top to bottom with every
+decorator ignored and still exit 0 -- which is why you never launch it yourself.
 
 Do not use `subprocess`, `os.system` or `os.popen`.
 """,
 
     "adios": EXEC_PROMPT_HEAD + """
-### What the workflow file must contain (ADIOS2)
+### ONE FILE PER STAGE, and WHICH VARIANT decides the rest (ADIOS2)
 
-ADIOS2 is an I/O library, not a scheduler -- it has no task decorator and
-nothing to submit to. The file is a **staged pipeline**:
+ADIOS2 is an I/O library, not a scheduler: no task decorator, nothing to submit
+to. A pipeline is several programs that STREAM to each other, so it is never one
+workflow file -- it is one file per stage.
 
-- Each stage is a top-level function; a `main()` calls them in order.
-- Inter-stage numerical data MUST move through ADIOS2: the producing stage
-  writes with `stream.write(...)` on an `adios2.Stream(path, "w")`, and the
-  consuming stage reads it back with `stream.read(...)` from an
-  `adios2.Stream(path, "r")`. Write it and actually read it back -- do not keep
-  using the in-memory copy.
-- Human-facing outputs (PNG, summary text) stay plain files; BP is for the
-  numerical arrays flowing between stages.
+**Call `get_resources` first and read `adios2_build`.** Two server variants
+exist and they bind DIFFERENT tools; only the ones listed are available to you.
 
-Because ADIOS2 cannot launch programs, a CLI step for an external compiled
-binary is a stage function that uses `subprocess` internally. That is allowed
-here, and only here, and only inside a stage body -- never at module top level,
-and never to run another Python stage, because the stages live in this same
-file and talk to each other through ADIOS2.
+`serial (PyPI wheel)` -- the default.
+  - Write each stage with `write_file`, then `run_pipeline(stages=[...])`, which
+    starts them together so the transport is live. `{"file": ..., "delay": N}`;
+    a small delay on a reader lets the writer open first.
+  - `write_bp` / `read_bp` do a one-shot write or read against a Stream the
+    server opens and binds to `stream`. Do not import adios2 or open your own
+    Stream inside them.
+  - **No MPI.** `ranks` is ignored, mpi4py is unavailable, and a `comm=`
+    argument raises "Cannot use MPI since ADIOS2 was built without MPI
+    support". A collective parallel write is impossible: write one .bp per
+    process, or gather to a single writer.
 
-For true in-situ streaming -- producer and consumer running CONCURRENTLY
-rather than one after the other -- pass `ranks=N` to `run_workflow`. The server
-then launches the whole file as `mpirun -n N python workflow.py`, so every rank
-runs this same file and the file must dispatch on rank: split
-`MPI.COMM_WORLD` with `world.Split(color=role, key=rank)`, pass the split
-`comm` to `adios2.Adios(comm)` and `io.open(name, mode, comm)`, and use the SST
-engine. Check `check_package("mpi4py")` and `get_resources` first -- with
-`in_pbs` false, leave `ranks` at 0 and let the stages run in sequence, which is
-fine when they do not need to overlap.
+`MPI (+mpi +python +sst)`
+  - Write each stage with `write_stage(stage=..., content=...)`, then
+    `run_mpmd(blocks=[...])` -- one rank block per program in one mpirun, which
+    is also the only way an external compiled binary can be a stage (`exe`).
+  - **Every stage must split the communicator.** All blocks share one
+    MPI_COMM_WORLD; the server exports `ADIOS2_STAGE_COLOR` per block and each
+    stage must read it, split MPI.COMM_WORLD on it, and pass the SPLIT
+    communicator to ADIOS2. `run_mpmd` refuses a stage that never reads it.
 
-When an external compiled MPI binary has to be one of those concurrent roles,
-`ranks` cannot express it -- it launches N copies of one program. Use
-`run_mpmd(blocks=[...])` instead: one rank block per program, all ranks of a
-single mpirun, with `stage` blocks re-entering this same file as
-`python workflow.py --stage <name>`. The file then dispatches on --stage rather
-than running a sequential main().
+### Rules for both variants
+
+- Inter-stage numerical data MUST do a real round trip: the producer writes to
+  an `adios2.Stream`, the consumer reads it back. Reusing an in-memory copy is a
+  pipeline that never used the engine.
+- **Select the SST engine in every stage.** With BP a reader opens a file the
+  writer has not closed, which does not error -- it reads whatever is there.
+- Stages must be ALIVE AT THE SAME TIME. `run_workflow` runs ONE file to
+  completion, so a writer started that way streams to nobody, and in the serial
+  build it does not even fail: it completes, leaves the .sst directory behind,
+  and a later reader picks that up as though it had been streamed live.
+- Do not use `subprocess` to start another stage. The launch tools do that.
+- Human-facing output (PNG, text) stays a plain file; BP/SST carries the arrays.
+""",
+
+    "wilkins": EXEC_PROMPT_HEAD + """
+### Call `check_lowfive` FIRST (Wilkins)
+
+Wilkins transports data in memory by intercepting the tasks' HDF5 calls through
+LowFive, which is switched on by two ENVIRONMENT VARIABLES, not by the config.
+With them unset, HDF5 uses its native VOL, every task writes a real `.h5` file,
+and the workflow **completes having transported nothing, with no error
+anywhere**. `check_lowfive` is the only way to catch that, so call it before you
+write anything. If it reports `lowfive_active: false`, that is an environment
+gap: report it and stop.
+
+### The config IS the workflow (Wilkins)
+
+Use `write_config`, not `write_file`, for the YAML. The file name must end in
+`yaml`. It is a list of tasks, each naming the program to run (`func`), its rank
+count (`nprocs`), and the datasets it produces (`outports`) and consumes
+(`inports`). Wilkins matches an outport to an inport by filename and dataset
+name, with globs, and builds a channel per match -- **you never declare edges**.
+
+Per dataset, `metadata: 1` transports it in memory over MPI and `passthru: 1`
+writes it through to a real HDF5 file. The defaults are `metadata: 1,
+passthru: 0`. Setting both to 0 is a hard error.
+
+Then write each task's program with `write_file`. A `.py` task is imported as a
+module and **must define `main()`** -- without one it silently does nothing. A
+non-`.py` task must be a Henson-linked shared object named `./<name>.hx`; a
+plain MPI binary cannot be a task.
+
+The launcher's rank count is the SUM over tasks of `taskCount x nprocs`, and the
+server reads it from the config -- so state `nprocs` on every task and pass
+`ranks=0` to `run_workflow`. Launching short does not run a smaller workflow; it
+starves the tasks at the tail.
 """,
 }
 
@@ -191,11 +249,16 @@ ENGINE_SKILLS = {
     "parsl":    ("systems/parsl",    "knowledge/PARSL"),
     "pycompss": ("systems/pycompss", "knowledge/PyCOMPSs"),
     "adios":    ("systems/adios",    "knowledge/ADIOS"),
+    "wilkins":  ("systems/wilkins",  "knowledge/WILKINS"),
 }
 
-# Tool calls whose result says something about whether the engine was really
-# used: the one that commits the workflow file, and the one that runs it.
-ENGINE_RELEVANT_TOOLS = ("write_file", "run_workflow", "run_mpmd")
+# Tool calls whose result says whether the engine was really used: the ones that
+# commit a file, and every launcher. run_pipeline and write_stage were missing,
+# so engine_verified was never computed for the DEFAULT (serial) adios path.
+ENGINE_RELEVANT_TOOLS = (
+    "write_file", "write_stage", "write_config",
+    "run_workflow", "run_mpmd", "run_pipeline",
+)
 
 # __ Artifact filtering _______________________________________________________
 

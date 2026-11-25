@@ -46,8 +46,8 @@ In addition to the variables in src/servers/server.py:
     MAW_COMPSS_PROJECT_XML    project.xml to pass.   Default: <work_dir>/project.xml
     MAW_COMPSS_RESOURCES_XML  resources.xml to pass. Default: <work_dir>/resources.xml
     MAW_COMPSS_FLAGS          extra runcompss flags, space-separated. Optional.
-    MAW_COMPSS_INSTALL_DIR    COMPSs home on the workers. Default: derived from
-                              pycompss.__file__, i.e. the venv's own copy.
+    MAW_COMPSS_INSTALL_DIR    COMPSs home on the workers. Default: located from
+                              the installed pycompss, i.e. the venv's own copy.
     MAW_COMPSS_WORKER_DIR     per-worker scratch. Default: /tmp/COMPSsWorker
     MAW_COMPSS_PORTS          NIO adaptor port range "min-max". Default: 43001-43100
     MAW_COMPSS_AUTO_XML       1 (default) generate the topology before each run;
@@ -56,6 +56,12 @@ In addition to the variables in src/servers/server.py:
     MAW_COMPSS_SSH_PROBE      1 (default) probe SSH before declaring a remote
                               host; 0 trust the allocation and declare every
                               host in PBS_NODEFILE without checking.
+    MAW_COMPSS_ENV_SCRIPT     script COMPSs sources on each worker. Default: a
+                              generated one restating JAVA_HOME.
+    MAW_COMPSS_MPIRUN         absolute launcher path for @mpi(runner=...).
+                              Default: MAW_MPI_LAUNCHER resolved on PATH.
+    COMPSS_MPIRUN_TYPE        MPI dialect COMPSs builds @mpi args for.
+                              Default: "ompi".
 
 There is deliberately no variable for the launcher. `python -m pycompss` is a
 property of the interpreter in MAW_PYTHON, so pointing at a different COMPSs
@@ -65,8 +71,8 @@ than the one pip put in that venv is not something this server will help with.
 import os
 import re
 import shlex
-
-import pycompss
+import shutil
+import time
 
 if __package__:
     from .server import Server
@@ -114,10 +120,6 @@ class PyCompssServer(Server):
             "No main() and no __main__ guard. `python -m pycompss` executes this "
             "file as a program, so give it an entry point.",
         ),
-        (
-            ("oversubscribe",),
-            None,  # see workflow_notes: this one fires when PRESENT, not absent
-        ),
     )
 
     #: Activates the current virtualenv on the worker nodes. The whole premise
@@ -149,15 +151,25 @@ class PyCompssServer(Server):
     def compss_install_dir(self) -> str:
         """COMPSs home as the workers need to see it.
 
-        Derived from the imported package rather than written down: the pip
-        install puts it at <site-packages>/pycompss/COMPSs, and a guessed
-        /opt/COMPSs fails on the worker with nothing useful on the master's
-        stderr. Overridable for an installation the workers mount elsewhere.
+        Located from the installed package (pip puts it at
+        <site-packages>/pycompss/COMPSs) rather than guessed. Resolved LAZILY
+        via find_spec, not by importing pycompss at module scope: that import
+        ran before the MCP handshake, so a missing or broken pycompss killed
+        the server and the explorer saw only a dropped connection.
         """
-        return os.environ.get(
-            "MAW_COMPSS_INSTALL_DIR",
-            os.path.join(os.path.dirname(os.path.abspath(pycompss.__file__)), "COMPSs"),
-        )
+        explicit = os.environ.get("MAW_COMPSS_INSTALL_DIR", "")
+        if explicit:
+            return explicit
+
+        from importlib.util import find_spec
+        try:
+            spec = find_spec("pycompss")
+        except (ImportError, ValueError):
+            spec = None
+        origin = getattr(spec, "origin", None) if spec else None
+        if not origin:
+            return ""
+        return os.path.join(os.path.dirname(os.path.abspath(origin)), "COMPSs")
 
     @staticmethod
     def fqdn(host: str) -> str:
@@ -267,7 +279,8 @@ class PyCompssServer(Server):
 
         result = self._run(
             [
-                "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                "ssh", "-n", "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ConnectTimeout=10", host, probe,
             ],
             timeout=30,
@@ -288,24 +301,53 @@ class PyCompssServer(Server):
         self._ssh_cache[host] = (ok, reason)
         return self._ssh_cache[host]
 
+    #: Wall-clock ceiling for the whole SSH probe, however many hosts.
+    PROBE_BUDGET_S = 90
+
+    def _probe_hosts(self, hosts: list[str]) -> dict[str, tuple[bool, str]]:
+        """worker_startable for every host, in parallel, under PROBE_BUDGET_S."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        pending = [h for h in hosts if h not in self._ssh_cache]
+        if pending:
+            with ThreadPoolExecutor(max_workers=min(16, len(pending))) as pool:
+                futures = {h: pool.submit(self.worker_startable, h) for h in pending}
+                deadline = time.monotonic() + self.PROBE_BUDGET_S
+                for host, future in futures.items():
+                    try:
+                        future.result(timeout=max(1, deadline - time.monotonic()))
+                    except Exception as e:
+                        # setdefault: worker_startable writes the cache itself,
+                        # so a result that lands late still wins.
+                        self._ssh_cache.setdefault(
+                            host, (False, f"probe failed: {type(e).__name__}: {e}"))
+        return {h: self._ssh_cache.get(h, (False, "not probed")) for h in hosts}
+
     def plan_topology(self) -> dict:
         """Decide which hosts COMPSs is told about, and how many slots each has.
 
-        EVERY host -- including this one -- is declared as a <ComputeNode> by
-        FQDN, and <MasterNode/> is always left BARE.
+        TWO SHAPES, and which one applies is decided by the allocation:
 
-        There is deliberately no "master only" mode any more. An earlier
-        version fell back to a bare <MasterNode> with computing units when the
-        SSH probe failed, on the theory that tasks would then run in the
-        master's own slots. That configuration does not work: COMPSs schedules
-        onto resources from resources.xml, a bare master contributes none, and
-        the run hangs with an empty jobs/ directory and no error. The verified
-        working shape is a ComputeNode for the local node, reached over ssh to
-        its FQDN -- which is exactly what a one-node allocation gets here.
+        master_only -- ONE node. <MasterNode> carries <ComputingUnits> and
+            <ResourcesList> is empty, so the master process runs the tasks
+            itself. This is COMPSs' own shipped local configuration
+            (runtime/config/xml/{projects,resources}/examples/local/) and it
+            needs NO ssh, no NIO ports, no JAVA_HOME on a worker and no
+            InstallDir -- which is exactly the set of things that fails on a
+            laptop, in a container, and on a single compute node.
+
+            A PREVIOUS VERSION OF THIS DOCSTRING SAID THIS SHAPE DOES NOT WORK,
+            on the theory that a master contributes no resources. That is true
+            only of a BARE <MasterNode/> with no <Processor>. With computing
+            units declared it is the documented single-process topology.
+
+        multi_node -- MORE THAN ONE node. <MasterNode/> is left bare and every
+            allocated host is a <ComputeNode> reached over ssh by FQDN, which
+            is why the probe exists. Giving the master units as well would
+            double-count the node its JVM is already on.
 
         Returns the plan rather than the XML, so get_resources can report it
-        and the agent can size @mpi(processes=N) against slots that exist
-        instead of discovering the limit as "not enough slots available".
+        and the agent can size @mpi(processes=N) against slots that exist.
         """
         import socket
 
@@ -313,10 +355,11 @@ class PyCompssServer(Server):
         raw_hosts = [h for h in (info.get("nodelist") or "").split(",") if h]
         units = max(1, int(info.get("ranks_per_node") or 1))
 
-        # Outside PBS, or with an unreadable nodefile, the one host there is is
-        # this one. Still a ComputeNode, still by FQDN.
-        if not raw_hosts:
-            raw_hosts = [socket.getfqdn()]
+        # Off a scheduler PBS reports nothing, so ranks_per_node is 1 and the
+        # master would run one task at a time on a machine with 8 cores. The
+        # core count is the honest answer there; inside PBS the allocation wins.
+        if not info.get("in_pbs"):
+            units = max(units, os.cpu_count() or 1)
 
         hosts = []
         for host in raw_hosts:
@@ -324,14 +367,37 @@ class PyCompssServer(Server):
             if name not in hosts:
                 hosts.append(name)
 
+        # One node (or none named) -> master_only, and the probe is SKIPPED
+        # entirely: there is no remote worker to reach, so a failing `ssh` to
+        # our own FQDN would reject a topology that does not use ssh at all.
+        if len(hosts) <= 1:
+            return {
+                "mode": "master_only",
+                "hosts": hosts or [socket.getfqdn()],
+                "units_per_host": units,
+                "total_slots": units,
+                "unusable_hosts": [],
+                "probe": {},
+                "env_script": "",
+                "reason": (
+                    f"One node, so the master runs the tasks itself with "
+                    f"{units} computing unit(s) and ResourcesList is empty. No "
+                    f"ssh, no worker start-up."
+                ),
+            }
+
+        # Probed concurrently and under one budget. Serially at ~40s a host,
+        # a wide allocation of unreachable nodes outlasts the explorer's
+        # per-tool-call ceiling and get_resources never answers at all.
         usable, unusable, reasons = [], [], {}
+        results = self._probe_hosts(hosts)
         for host in hosts:
-            ok, why = self.worker_startable(host)
+            ok, why = results[host]
             reasons[host] = why
             (usable if ok else unusable).append(host)
 
         plan = {
-            "mode": "multi_node" if len(usable) > 1 else "single_node",
+            "mode": "multi_node",
             "hosts": usable,
             "units_per_host": units,
             "total_slots": units * len(usable),
@@ -341,8 +407,6 @@ class PyCompssServer(Server):
         }
 
         if not usable:
-            # Nothing can run. Say so loudly rather than emitting an XML that
-            # produces a silent hang.
             plan["reason"] = (
                 "NO host can start a COMPSs worker, so no task can execute. "
                 + "; ".join(f"{h}: {reasons[h]}" for h in unusable)
@@ -350,6 +414,15 @@ class PyCompssServer(Server):
                 "from the workflow file."
             )
             plan["total_slots"] = 0
+        elif len(usable) == 1:
+            # Every remote host failed but ours answered. One usable node is a
+            # master_only run, not a one-ComputeNode run.
+            plan["mode"] = "master_only"
+            plan["reason"] = (
+                f"Only 1 of {len(hosts)} allocated host(s) can start a worker, "
+                f"so this falls back to the master running tasks itself with "
+                f"{units} computing unit(s). Unusable: {', '.join(unusable)}"
+            )
         else:
             plan["reason"] = (
                 f"{len(usable)} of {len(hosts)} allocated host(s) can start a "
@@ -361,11 +434,13 @@ class PyCompssServer(Server):
     def build_topology_xml(self, plan: dict) -> tuple[str, str]:
         """Render (project.xml, resources.xml) for a plan from plan_topology.
 
-        Multi-node layout: MasterNode is declared BARE, with no <Processor>, and
-        every allocated host -- the master's own included -- appears as a
-        ComputeNode. Giving the master computing units as well would double-count
-        the node the JVM is already on, so COMPSs would believe in slots that do
-        not exist and schedule into them.
+        master_only: <MasterNode> carries the computing units and
+        <ResourcesList> is empty -- COMPSs' own shipped local topology.
+
+        multi_node: <MasterNode/> is bare and every allocated host is a
+        ComputeNode. Giving the master units as well would double-count the node
+        its JVM is already on, so COMPSs would schedule into slots that are
+        already busy.
         """
         head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         units = plan["units_per_host"]
@@ -373,6 +448,18 @@ class PyCompssServer(Server):
         ports = os.environ.get("MAW_COMPSS_PORTS", "43001-43100")
         min_port, _, max_port = ports.partition("-")
         install = self.compss_install_dir
+
+        if plan.get("mode") == "master_only":
+            project = (
+                f"{head}<Project>\n"
+                "    <MasterNode>\n"
+                '        <Processor Name="MainProcessor">\n'
+                f"            <ComputingUnits>{units}</ComputingUnits>\n"
+                "        </Processor>\n"
+                "    </MasterNode>\n"
+                "</Project>\n"
+            )
+            return project, f"{head}<ResourcesList>\n</ResourcesList>\n"
 
         # COMPSs starts each remote worker over SSH, and a NON-INTERACTIVE ssh
         # session inherits none of the master's environment. The worker then runs
@@ -387,15 +474,11 @@ class PyCompssServer(Server):
         #
         # <EnvironmentScript> is COMPSs' own answer: a path it sources on the
         # worker before starting it (project_schema.xsd -> ApplicationType, read
-        # by WorkerStarter.getEnvScriptPaht). Pointing it at setup_hpc.sh keeps
-        # the environment defined in exactly one place for the master, the
-        # Parsl worker_init and the COMPSs workers alike -- rather than in a
-        # ~/.bashrc that is per-user, per-machine and usually guarded against
-        # non-interactive shells anyway.
-        #
-        # The script must be on a filesystem every node can see. It is, GPFS.
-        # Resolved by the worker_env_script property, so the SSH probe and the
-        # generated XML can never disagree about which script the worker gets.
+        # by WorkerStarter.getEnvScriptPaht). Resolved by the worker_env_script
+        # property, so the SSH probe and the generated XML cannot disagree about
+        # which script the worker gets. It has to sit on a filesystem every node
+        # can see -- which the work directory is, on a cluster with a shared
+        # home or project space, and is not on a node-local scratch.
         env_script = self.worker_env_script
         app_block = ""
         if env_script and os.path.isfile(env_script):
@@ -478,16 +561,39 @@ class PyCompssServer(Server):
     # __ Hooks _________________________________________________________________
 
     def prepare_run(self, workflow_path: str) -> dict:
-        """Generate the topology immediately before the run.
+        """Generate the topology, then refuse the run if it has no resources.
 
-        Here rather than in __init__ because the allocation is read from the
-        environment at call time: the server may outlive one PBS job, and a
-        stale nodelist is worse than none.
+        Generated here, not in __init__, because the allocation is read from the
+        environment at call time.
+
+        THE REFUSAL IS THE POINT. COMPSs schedules onto resources.xml; with no
+        ComputeNode it comes up, schedules nothing, and sits there with an empty
+        jobs/ directory and no error until the timeout. Launching into that
+        burns an allocation to learn nothing, so -- like the Wilkins and ADIOS
+        MPMD servers -- this raises instead.
         """
         if os.environ.get("MAW_COMPSS_AUTO_XML", "1") == "0":
             return {"compss_topology": {"mode": "not generated (MAW_COMPSS_AUTO_XML=0)"}}
+        if not self.compss_install_dir:
+            raise RuntimeError(
+                "pycompss is not importable by the interpreter that runs "
+                f"workflows ({self.python}), so there is no COMPSs runtime to "
+                "launch. Confirm with check_package('pycompss'); pip cannot fix "
+                "this mid-run -- it is an environment gap."
+            )
+
         force = os.environ.get("MAW_COMPSS_AUTO_XML") == "force"
-        return {"compss_topology": self.generate_topology(force=force)}
+        plan = self.generate_topology(force=force)
+
+        if not plan.get("hosts") and not any(plan.get("xml_kept_from_write_xml", [])):
+            raise RuntimeError(
+                f"{plan.get('reason', 'No host can start a COMPSs worker.')}\n"
+                f"  COMPSs would come up, schedule nothing and hang with an "
+                f"empty jobs/ directory.\n"
+                f"  Fix the SSH path between these hosts, or set "
+                f"MAW_COMPSS_SSH_PROBE=0 to declare them unchecked."
+            )
+        return {"compss_topology": plan}
 
     def workflow_notes(self, code: str) -> list[str]:
         """Inherited checks, plus the ones that fire on PRESENCE.
@@ -497,11 +603,7 @@ class PyCompssServer(Server):
         and they quietly invalidate the run. Warning beats rejecting -- a false
         rejection leaves the agent with no way forward -- but these need saying.
         """
-        notes = [
-            message for alternatives, message in self.WORKFLOW_CHECKS
-            if message is not None
-            and not any(alternative in code for alternative in alternatives)
-        ]
+        notes = super().workflow_notes(code)
 
         # The expensive one. COMPSs 3.4's mpi.py assigns `processes` to the
         # task's NODE reservation and defaults processes_per_node to 1, so
@@ -551,10 +653,10 @@ class PyCompssServer(Server):
             notes.append(
                 "This file writes or invokes a shell script. It is not needed "
                 "and not allowed: @mpi spans nodes on its own, rank placement "
-                "goes in flags=, the environment is pre-exported by "
-                "setup_hpc.sh, and filtering belongs in a downstream @task. The "
-                "deliverables are the two generated XML files and this one "
-                "Python file."
+                "goes in flags=, the environment comes from the activated Spack "
+                "environment, and filtering belongs in a downstream @task. The "
+                "deliverable is this one Python file; the server generates the "
+                "XML."
             )
 
         if "@multinode" in code:
@@ -570,22 +672,49 @@ class PyCompssServer(Server):
                 "COMPSS_MPIRUN_TYPE is set inside the file. The JVM copied its "
                 "environment before this module was imported, so a setdefault "
                 "here does not reach the runtime or the mpirun it spawns. It "
-                "belongs in setup_hpc.sh / launch_env()."
+                "belongs in the launching environment / launch_env()."
             )
 
         return notes
 
+    #: COMPSs loads <install>/Runtime/configuration/mpi/<type>.properties. The
+    #: shipped files are impi, openmpi and slurm -- there is NO ompi.properties,
+    #: so the value the 3.4 docs give ("ompi") logs "Can't load MPIRUN type" and
+    #: silently uses defaults. COMPSs' own tests export openmpi.
+    DEFAULT_MPIRUN_TYPE = "openmpi"
+
     def launch_env(self) -> dict:
-        """Inherited environment, plus the MPI dialect COMPSs builds args for.
+        """Inherited environment, plus the MPI dialect and the resolved launcher.
 
         Set here and not in the generated file: by the time the application
-        module is imported the JVM already has its copy of the environment, so
-        an os.environ assignment in the workflow arrives too late to affect the
-        mpirun COMPSs spawns.
+        module is imported the JVM already has its copy of the environment.
+
+        COMPSS_MPIRUN is exported because @mpi's `runner=` has to be an ABSOLUTE
+        path -- a bare "mpirun" resolves off the worker's own thin PATH and a
+        miss there is exit 127, three resubmissions and a TOTALLY FAILED task.
+        The skill tells the agent to read this variable, so something has to
+        put it there.
         """
         env = super().launch_env()
-        env.setdefault("COMPSS_MPIRUN_TYPE", os.environ.get("COMPSS_MPIRUN_TYPE", "ompi"))
+        env.setdefault("COMPSS_MPIRUN_TYPE",
+                       os.environ.get("COMPSS_MPIRUN_TYPE", self.DEFAULT_MPIRUN_TYPE))
+        runner = self.mpi_runner()
+        if runner:
+            env.setdefault("COMPSS_MPIRUN", runner)
         return env
+
+    def mpi_runner(self) -> str:
+        """Absolute path of the launcher for @mpi(runner=...), or "".
+
+        MAW_COMPSS_MPIRUN wins; otherwise the launcher name is resolved on PATH
+        here, in the master, where the environment is the one the operator
+        built. "" means it was not found, which is worth reporting rather than
+        papering over with a bare name that fails on the worker.
+        """
+        explicit = os.environ.get("MAW_COMPSS_MPIRUN", "")
+        if explicit:
+            return explicit
+        return shutil.which(self.mpi_launcher) or ""
 
     def resource_info(self) -> dict:
         """Report the launcher, the XML state and the topology COMPSs will see.
@@ -595,8 +724,12 @@ class PyCompssServer(Server):
         the first call rather than after a failed run.
         """
         plan = self._topology or self.plan_topology()
+        runner = self.mpi_runner()
         return {
             "launcher": f"{self.python} -m pycompss",
+            # What @mpi(runner=...) must be given. "" means the launcher was not
+            # found on PATH -- report that; a bare name fails on the worker.
+            "mpi_runner": runner,
             "compss_install_dir": self.compss_install_dir,
             "compss_xml": {
                 kind: {
@@ -608,14 +741,18 @@ class PyCompssServer(Server):
             },
             "compss_topology": plan,
             "note": (
-                "The topology XML is generated from PBS_NODEFILE plus an SSH "
-                "probe before every run -- do not write it by hand. "
-                f"compss_topology.total_slots ({plan.get('total_slots')}) is the "
-                "ceiling for @mpi(processes=N); a larger N fails with 'not "
-                "enough slots available', and oversubscribing to get around that "
-                "wastes the allocation. Confirm the bindings with "
-                "check_package('pycompss'); install_package will not fix a "
-                "missing runtime mid-run."
+                f"The topology XML is generated before every run -- do not write "
+                f"it by hand. Mode is '{plan.get('mode')}': master_only means one "
+                f"node, where the master runs the tasks itself and no ssh is "
+                f"involved; multi_node declares each host as a ComputeNode "
+                f"reached over ssh. compss_topology.total_slots "
+                f"({plan.get('total_slots')}) is the ceiling for "
+                f"@mpi(processes=N), and processes_per_node must be "
+                f"{plan.get('units_per_host')} -- it defaults to 1, which makes "
+                f"`processes` a NODE count. Oversubscribing to get around 'not "
+                f"enough slots available' wastes the allocation. Confirm the "
+                f"bindings with check_package('pycompss'); install_package will "
+                f"not fix a missing runtime mid-run."
             ),
         }
 
@@ -623,7 +760,7 @@ class PyCompssServer(Server):
 
     def register_tools(self) -> None:
         """Add write_xml, which exists for this engine alone."""
-        self.mcp.tool(self.write_xml)
+        self.register_tool(self.write_xml)
 
     def write_xml(self, kind: str, content: str) -> str:
         """Override COMPSs's project.xml or resources.xml.

@@ -17,8 +17,8 @@ Repo directory tree -- the repo root is mapped to /app/ at runtime:
 |   |   +-- server.py                  <- base class: every shared MCP tool
 |   |   +-- parsl_server.py            <- subclasses of it, engine specifics only
 |   |   +-- pycompss_server.py
-|   |   +-- adios_sst.py               <- ADIOS2 serial build: SST over TCP
-|   |   +-- adios_mpmd.py              <- ADIOS2 MPI build: MPMD rank blocks
+|   |   +-- adios.py                  <- ADIOS2: serial (SST) or mpi (MPMD),
+|   |                                        two classes chosen by MAW_ADIOS
 |   |   +-- wilkins.py                 <- Wilkins: YAML config + LowFive
 |   +-- common/
 |   |   +-- consts.py                  <- PROJECT_DIR and every path derived from it
@@ -42,7 +42,7 @@ Repo directory tree -- the repo root is mapped to /app/ at runtime:
 +-- .env
 +-- inputs/                            <- EVERY input lives here
 |   +-- data/
-|   |   +-- in.watbox                  <- LAMMPS input script
+|   |   +-- in.watbox_0, in.watbox_1   <- LAMMPS input scripts
 |   |   +-- data.init                  <- LAMMPS initial atom positions
 |   |   +-- AW.tersoff                 <- LAMMPS force field parameters
 |   +-- literature/                    <- *.pdf

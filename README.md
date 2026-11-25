@@ -1,552 +1,334 @@
-# MAW — MCP Approach (Multi-Agent Workflow)
+# MAW — Multi-Agent Workflow
 
-## What This Project Is
+An agentic system that executes computational scientific workflows end to end and
+autonomously. A pipeline of LLM agents reads the user's description (and
+optionally a paper and a figure), decides what needs to be built, installs the
+packages, and then executes every step of the workflow itself — running the
+simulation, doing the analysis, generating the plots and renders — through real
+tool calls against a real workflow engine.
 
-This is an agentic system that handles end-to-end execution of computational scientific workflows described
-by the user, **end to end and autonomously**. A pipeline of LLM agents parses user input, decides what needs to be built, installs the required packages, and then
-executes every step of the workflow itself — running simulations, doing analysis,
-generating plots/renders — using real tool calls against a real workflow engine.
+The distinguishing design choice is **how** the workflow is executed. Rather than
+generating one standalone script and running it in one shot, this system exposes
+the workflow engine itself as an **MCP server**. The explorer agent calls that
+server's tools one step at a time — write a file, run the workflow, read the
+status, check a package, retry — the way you would drive a REPL. When a step
+fails, only that step is fixed and retried.
 
-The distinguishing design choice is **how the agent executes the workflow**: instead of
-generating one big standalone Python script and running it all at once (the "artifact"
-approach, developed in a separate sibling project), this system exposes the workflow
-engine itself (Parsl, PyCOMPSs, or ADIOS2) as an **MCP (Model Context Protocol) server**.
-The agent calls that server's tools one step at a time — submit a task, check its status,
-read its output, install a missing package, retry on failure — the same way you'd
-interactively drive a REPL. If one step fails, only that step gets fixed and retried;
-nothing needs to be regenerated or re-run from scratch.
+```
+Agent layer  (Academy agents, orchestrated by a LangGraph state machine)
+  orchestrator -> planner -> orchestrator -> installer
+    -> orchestrator -> installer (pass 2) -> explorer -> orchestrator -> end
+                                                |
+                                                | MCP (JSON-RPC over stdio)
+                                                v
+Engine layer (one MCP server per engine, all subclassing src/servers/server.py)
+  parsl_server.py | pycompss_server.py | adios.py | wilkins.py
+                                                |
+                                                v
+Execution     the Spack environment + venv3: the engine, the science packages,
+              and whatever modules a task loads in its own command string
+```
 
-Three scientific domains are currently supported out of the box (papers live in
-`Literature/`):
-
-| Domain | Paper | What gets reproduced |
-|---|---|---|
-| `molecular_nucleation` | `MOLECULAR.pdf` | LAMMPS MD simulation of nucleation + OVITO analysis/rendering |
-| `cosmology` | `COSMOLOGY.pdf` | N-body-style particle simulation + density-field analysis |
-| `eddy_uv` | `eddy-nekrs.pdf` | Fluid dynamics (eddy/streamfunction) simulation + visualization |
-
-This repo is the **full multi-agent condition** (four specialized agents, "Condition B"
-in the ablation naming used throughout the CLI/skills). A sibling repo,
-`MCP_Approach_SINGLE`, implements the same MCP tool-calling approach but collapses all
-four roles into a single agent ("Condition C") — everything below about the workflow
-engine, MCP servers, environment setup, and HPC execution applies identically there;
-only the agent-layer role split differs.
-
-### Input Types
-
-Every run is built from up to four kinds of input. **Description is the only one every
-run needs** — Paper and Images are optional, gated by the required `--combination` flag
-(`a`=PDF+Image+Desc, `b`=PDF+Desc, `c`=Image+Desc, `d`=Desc only — see the
-[Flag Matrix](#flag-matrix--every-value-you-can-pass-on-hpc) below); Config/Data is
-always optional regardless of `--combination`.
-
-**Images:**
-- Workflow design images/sketches of the user-defined workflow.
-- Optional — pass a path with `--image`, or pick one interactively from `images/` at
-  startup (enter `0` to skip). Only used when `--combination` is `a` or `c`.
-
-**Description:**
-- Free-text goal describing the workflow to reproduce, passed with `--goal "..."`.
-- The one input every run needs, regardless of `--combination`.
-
-  Example (`molecular_nucleation`):
-  > I would like to have a 2-task workflow consisting of one producer and one consumer task. The producer runs a LAMMPS molecular dynamics simulation of crystallization and generates trajectory data. The consumer runs OVITO, which reads the resulting trajectory dump file, identifies diamond structures using the diamond structure identification modifier, renders each frame using the TachyonRenderer, and saves the output as PNG images.
-
-  The full goal text for every other use case (`cosmology`, `eddy_uv`, ...) lives in
-  [`inputs/usecase_descriptions/descriptions.py`](inputs/usecase_descriptions/descriptions.py)
-  rather than being duplicated here — open that file for the exact wording used per domain.
-
-**Paper:**
-- The PDF being reproduced, dropped into `Literature/` and selected with
-  `--paper <1-based index or path>`.
-- Optional — only used when `--combination` is `a` or `b`.
-
-**Config/Data:**
-- Static input files a workflow needs at runtime (LAMMPS input scripts, force fields,
-  etc.), placed in `data/`.
-- Optional — prompted for interactively at startup (press Enter to select all); if
-  `data/` is empty the run proceeds with no input data.
-
+The agent logic never touches engine logic. The explorer calls the same tool
+names whichever server is behind the session; only the constructs the generated
+file must use differ, and those come from the engine's skill files.
 
 ---
 
-## Architecture
-
-```
-Agent Layer (LangGraph state machine)
-  orchestrator -> planner -> installer -> explorer -> end
-                                            |
-                                            | MCP protocol (JSON-RPC over stdio)
-                                            v
-Workflow Engine Layer (MCP Server, one per engine)
-  servers/parsl_server.py     -- Parsl
-  servers/pycompss_server.py  -- PyCOMPSs
-  servers/adios_server.py     -- ADIOS2
-
-
-Execution Layer (Python venv)
-  LAMMPS, OVITO, Parsl, ADIOS2, numpy, matplotlib, astropy, camb, ase, etc.
-  (installed on demand — see "How Packages Get Installed" below)
-```
-
-The MCP server runs as a single long-lived subprocess started by the explorer agent.
-Communication is stdio-based JSON-RPC. This keeps the agent logic (LangGraph, LLM
-calls, retries) completely decoupled from the engine logic (how a task actually gets
-scheduled and run) — the explorer calls the same tool names (`write_workflow`,
-`run_workflow`, `get_task_status`, etc.) no matter which engine is behind the server.
-
-### Agent Roles
+## Agents
 
 | Agent | Responsibility |
 |---|---|
-| `orchestrator` | Supervisor. Reviews each agent's output after it runs and decides where to route next (retry, move forward, or end). Owns the two-phase installer approval flow. |
-| `planner` | Reads the paper (PDF text, optionally an image/figure) and produces: quantitative literature findings, the package list (`stack_decision`), and an ordered task list (10–15 tasks) the explorer will execute. |
-| `installer` | Phase 1: writes/regenerates `builds/requirements.txt` from the planner's `stack_decision` and asks the orchestrator to approve it. Phase 2 (after approval): `pip install`s those packages into the venv. |
-| `explorer` | Runs a ReAct loop, calling MCP server tools to execute each planner task: submitting code, checking status/output, installing anything missing, retrying failures. |
+| `orchestrator` | Reviews each agent's output. The forward route is fixed; what it chooses is whether to send an agent **back once** with feedback — the planner when the plan is wrong, the explorer when an expected output is missing. It corrects the installer's package list itself (`requirements_override`), since the installer has no model to revise with. |
+| `planner` | Reads the paper and goal; produces quantitative literature findings, the pip stack (`stack_decision`), the environment modules (`modules`), and an ordered task list. |
+| `installer` | Phase 1 writes `work/builds/requirements.txt` from the planner's stack and stops for approval. Phase 2 pip-installs the approved list, under `modules` when the domain names any. It has no language model. |
+| `explorer` | Runs a ReAct loop against the engine's MCP server: writes the workflow files, runs them, reads the output, installs what is missing, retries failures. |
 
-Flow: `orchestrator -> planner -> installer -> explorer -> end`, with the orchestrator
-able to route backward to `planner` (if tasks are vague/contradict the environment) or
-back to `explorer` (if critical tasks failed) rather than always moving forward linearly.
+The forward route is a fixed table in `src/agents.py`. Each agent may be sent
+back **at most once per run** (`MAW_MAX_REVISIONS`, default 1), and only with
+non-empty feedback — a revision with nothing to change regenerates the same
+output, so an empty one is refused and the run proceeds. The explorer is sent
+back only for a missing or wrong expected output; it already retries three times
+per problem inside its own loop, so anything it exhausted there will not improve
+on a second pass.
 
-### The Skills System (`skills/`)
+---
 
-Agent behavior is not hardcoded in Python — each agent's operating manual is a Markdown
-"skill" file, injected into its context at runtime. The system prompt in code is just
-the JSON schema contract; the skill file is the actual instructions.
+## Workflow engines
+
+Selected with `--engine`. Every server inherits the same tool surface from
+`src/servers/server.py`:
+
+`write_file` · `read_file` · `list_files` · `check_package` · `install_package`
+· `get_status` · `get_resources` · `run_workflow` · `cleanup`
+
+Execution is **generated-file only**: no tool takes a code string or a command
+string and runs it. Each engine adds the tools it alone needs, and the explorer
+binds only those (`_ENGINE_ONLY_TOOLS` in `src/mcp_explorer.py`):
+
+| Engine | Extra tools | What the agent generates |
+|---|---|---|
+| `parsl` | — | ONE self-contained driver that builds its own `Config`, calls `parsl.load()`, and schedules `@bash_app` / `@python_app` |
+| `pycompss` | `write_xml` | ONE application file of `@task` / `@binary` / `@mpi`. The **server generates the XML topology** from the allocation; `write_xml` is an override you should not need |
+| `adios` | depends on `MAW_ADIOS`, below | ONE FILE PER STAGE — a pipeline is several programs streaming to each other |
+| `wilkins` | `write_config`, `check_lowfive` | A YAML config (which *is* the workflow) plus each task's program |
+
+### The two ADIOS2 variants
+
+`--engine adios` starts one of two server classes in `src/servers/adios.py`,
+chosen by `MAW_ADIOS`. **The default, and the fallback for any unrecognised
+value, is `serial`.**
+
+| | `serial` (default) | `mpi` |
+|---|---|---|
+| Build | the PyPI wheel in `venv3` | `+mpi +python +sst`, built under `spack_mpi/` |
+| Launch tool | `run_pipeline` — stages as concurrent processes | `run_mpmd` — stages as rank blocks of one `mpirun` |
+| Also exposes | `write_bp`, `read_bp` | `write_stage` |
+| SST streaming | yes, over TCP | yes |
+| MPMD / collective parallel write | no | yes |
+| MPI binding | none, so it works with whatever MPI a domain names | bound to the one MPI it was built against |
+
+Both can be installed at once: `PYTHONPATH` precedes the venv's site-packages,
+so `module load adios2/<ver>-<mpi>` shadows the wheel and unloading restores it.
+`MAW_ADIOS` is normalised in one place (`common.consts.adios_variant`) and the
+canonical value is passed to the server, so the client's tool bindings cannot
+disagree with the server's class.
+
+### Adding an engine
+
+Subclass `Server` with `ENGINE`, `DESCRIPTION` and `launch_command()`; register
+any engine-only tools in `register_tools()`. Then add it to `ENGINE_SERVERS` and
+`_ENGINE_ONLY_TOOLS` in `src/mcp_explorer.py`, to `ENGINE_SKILLS` and
+`ENGINE_EXEC_PROMPTS` in `src/systemprompts/explorer.py`, to the `--engine`
+choices in `academy_agents.py`, and write `skills/systems/<engine>.SKILL.md` and
+`skills/knowledge/<ENGINE>.SKILL.md`. Nothing in the agent layer changes.
+
+---
+
+## The skills system
+
+Agent behaviour is not hardcoded. Each agent's operating manual is a Markdown
+skill file injected into its context at runtime; the system prompt in code is
+only the JSON schema contract.
 
 ```
 skills/
-├── agents/                        # one behavioral spec per agent role
-│   ├── orchestrator.SKILL.md
-│   ├── planner.SKILL.md
-│   ├── installer.SKILL.md
-│   └── explorer.SKILL.md
-├── knowledge/                     # environment knowledge, loaded based on --env
-│   ├── local.SKILL.md             # local machine constraints (no PBS, no MPI, single node)
-│   └── lcrc.SKILL.md              # LCRC/HPC constraints (PBS variables, mpirun, storage paths)
-├── systems/                       # one skill per workflow engine, loaded based on --engine
-│   ├── parsl.SKILL.md
-│   ├── pycompss.SKILL.md
-│   └── adios.SKILL.md
-└── use_cases/                     # one skill per domain, requested by the planner/explorer
-    ├── molecular_nucleation/
-    ├── cosmology/
-    └── eddy_uv/
-        ├── orchestrator.SKILL.md
-        ├── planner.SKILL.md
-        ├── installer.SKILL.md
-        └── explorer.SKILL.md
+├── agents/          one behavioural spec per role (orchestrator, planner,
+│                    installer, explorer) — loaded on every call
+├── knowledge/       local.SKILL.md / lcrc.SKILL.md, loaded from --env;
+│                    PARSL / PyCOMPSs / ADIOS / WILKINS API manuals, loaded
+│                    from --engine                        (<= 500 lines each)
+├── systems/         one per engine: the execution contract, the rank layouts,
+│                    and the pitfalls                      (<= 500 lines each)
+└── use_cases/<domain>/   domain knowledge, selected by --domain
 ```
 
-Agents request additional skills on their first tool call via a `skill_requests` field
-(e.g. `["use_cases/cosmology/explorer", "systems/parsl"]`); the relevant environment
-knowledge skill (`local` or `lcrc`) is loaded automatically based on `--env`.
+A `systems/<engine>` skill and its `knowledge/<ENGINE>` companion are
+concatenated into one prompt that is resent on every loop iteration, so they are
+written not to repeat each other. Absolute paths to anything outside the repo
+belong **only** in `use_cases/*`; everywhere else, use the `/app/` aliases the
+servers resolve.
 
-### Adding a New Use Case
+A domain folder may hold either one `domain.SKILL.md` for every agent or one file
+per agent (`planner.SKILL.md`, `explorer.SKILL.md`, ...). Both layouts work and
+both resolve in either direction.
 
-Use cases (domains) are auto-discovered from `skills/use_cases/` at runtime — there is
-no registry to edit in `agent_mcp.py` or `mcp_explorer.py`. To add one, using an
-existing domain (e.g. `cosmology`) as a template:
+### Adding a use case
 
-1. **Add the paper.** Drop the PDF into `Literature/`.
-2. **Add the goal text.** 
+1. Drop the PDF in `inputs/literature/`, any input files in `inputs/data/`, and
+   any figure in `inputs/images/`.
+2. Create `skills/use_cases/<name>/domain.SKILL.md` — copy an existing domain as
+   a template. The sections the post-run review writes against are **Tools**,
+   **Input Parameters**, **Outputs**, **Pitfalls** and **Guidelines**.
+3. Run with `--domain <name>`. The folder name is matched **exactly**; `--list-domains`
+   prints what is on disk. No code change is needed anywhere.
 
-Your description should include the following:
-
-Scientific goal— what should the workflow compute or produce?
-Method / software— which simulator and analysis tools should each task use?
-Input data— is input data provided, or generated by the workflow itself?
-Key parameters— size, steps, resolution, MPI ranks (or leave blank for defaults)?
-Expected outputs / success criteria— what outputs, and how do we know it worked?
-Environment & scale— local or HPC, and how many processes / ranks / nodes?
-
-
-EXAMPLES:
-   [`inputs/usecase_descriptions/descriptions.py`](inputs/usecase_descriptions/descriptions.py)
-   with the free-text description of the workflow — this is what you'll pass to
-   `--goal` (or paste in when prompted).
-
-   
-4. **(Optional) add a diagram.** Drop a workflow sketch/figure into
-   `inputs/input_images/` if you want to be able to run with `--combination a` or `c`.
-5. **Write the skill files.** Create `skills/use_cases/<name>/` with the same four
-   files every other use case has:
-   ```
-   skills/use_cases/<name>/
-   ├── orchestrator.SKILL.md
-   ├── planner.SKILL.md
-   ├── installer.SKILL.md
-   └── explorer.SKILL.md
-   ```
-   Copy an existing use case's files as a starting point and rewrite the
-   domain-specific parts (expected packages, task breakdown, engine quirks, etc.) —
-   keep the same section structure each file expects.
-6. **Run it.** Pass `--domain <name>` where `<name>` matches (or substring-matches)
-   the `skills/use_cases/<name>/` folder name — the orchestrator, planner, and
-   explorer each pick up the matching skill files automatically (`_list_skills` in
-   `agent_mcp.py` just lists what's on disk). No code changes are needed anywhere else.
-
-Optionally, add a row for the new domain to the table in
-["What This Project Is"](#what-this-project-is) above so it's discoverable at a glance.
+Your `--goal` should cover: what the workflow computes, which simulator and
+analysis tools each task uses, whether input data is provided or generated, the
+key parameters (size, steps, resolution, ranks), the expected outputs and how you
+would know it worked, and the environment and scale.
 
 ---
 
-## Repo Layout
+## Setup
 
+**Requirements:** a C/C++ compiler Spack can find, a JVM for PyCOMPSs, and — for
+HPC — an allocation on a PBS Pro cluster.
+
+```bash
+./bootstrap.sh                  # run ONCE per machine; --spack-root <path> optional
+spack env activate .            # from the repo root, before every run
 ```
-MCP_Approach/
-├── agent_mcp.py           # Entry point: CLI, LangGraph graph, orchestrator/planner/installer nodes
-├── mcp_explorer.py        # Explorer agent: ReAct loop, MCP client connection, engine dispatch
-├── run_archiver.py        # Snapshots work/run0 + trace.json after every run, then wipes run0
-├── trace_logger.py        # Per-run event tracing (LLM calls, tool calls, routing, timing)
-├── trace_schema.py        # Pydantic schema — single source of truth for trace.json's shape
-├── requirements.txt       # Agent-side deps only (LangGraph, MCP SDK, etc.) — see setup below
-├── setup_hpc.sh           # Source this before running on LCRC (Improv/Swing) — sets MPI lib paths
-├── .env                   # LLM API config (NOT committed — see Environment Setup)
-├── servers/
-│   ├── parsl_server.py       # Parsl MCP server
-│   ├── pycompss_server.py    # PyCOMPSs MCP server
-│   └── adios_server.py       # ADIOS2 MCP server
-├── skills/                # see "The Skills System" above
-├── Literature/             # source PDFs the planner reads (one per domain)
-├── data/                   # static input files (LAMMPS input scripts, force fields, etc.)
-├── images/                 # example output images used in docs
-├── SAMPLE RUNS/            # two complete real run archives (see "Run Output" below) —
-│                           #   browse these to see exactly what a finished run looks like
-├── builds/                 # generated at runtime — requirements.txt regenerated per run
-├── runs/                   # per-run JSONL logs (gitignored)
-├── work/                   # live scratch dir, work/run0 (gitignored, wiped/archived each run)
-└── venv3/                  # the project's Python venv (gitignored — you create this)
+
+`bootstrap.sh` does only what cannot bootstrap itself: install Spack, build the
+MPI-free core environment from `spack.yaml`, create `venv3` from that
+environment's Python, and `pip install -r requirements.txt`. Everything else —
+compiler, `JAVA_HOME`, `COMPSS_HOME`, `MAW_PYTHON`, `LD_LIBRARY_PATH`,
+`MODULEPATH`, and putting `venv3` on `PATH` — is done by `spack env activate`,
+which runs `spack_repo/maw/packages/env/package.py`. There is no activate script
+and no `setup_hpc.sh`.
+
+Do **not** run `venv3/bin/activate` after activating the environment: it restores
+the pre-venv `PATH` and drops `JAVA_HOME`'s bin, the compiler and `mpirun`.
+
+The MPI-linked engines (ADIOS2 `+mpi`, Wilkins/LowFive) live in a second
+environment under `spack_mpi/`, built by hand only if you need them:
+
+```bash
+module load <the MPI your domains use>
+cd spack_mpi && cp spack.yaml.in spack.yaml   # uncomment the specs you want
+spack -e . external find openmpi mpich intel-oneapi-mpi
+spack -e . install && spack -e . module lmod refresh -y
 ```
+
+### Configuration
+
+Copy `.env.example` to `.env` and fill in the LLM backend. Every variable is
+documented there. The agent talks to any OpenAI-compatible endpoint (built
+against Argonne's Argo gateway) via `langchain-openai`.
+
+Only `OPENAI_API_KEY`, `OPENAI_BASE_URL` and `MODEL_NAME` are required;
+`PBS_ACCOUNT` is required for `--env multi-node`. **Archiving is off unless you
+set `MAW_ARCHIVE_ROOT`** — a run that is not archived beats one archived into
+somebody's home directory by accident.
+
+### Scientific packages
+
+There is no hand-maintained list. The planner decides the stack from the paper,
+the installer writes it to `work/builds/requirements.txt` and installs it after
+the orchestrator approves, and the explorer calls `install_package` for anything
+still missing mid-run. The venv is persistent, so it only grows; the first run
+for a new domain takes noticeably longer.
 
 ---
 
-## Workflow Engines
+## Running
 
-All three engines expose the **same MCP tool interface**, so the explorer agent's logic
-is identical regardless of which one is selected with `--engine`. Each falls back to
-plain subprocess execution if the real engine library isn't installed, so the system
-still runs (just without that engine's scheduling/optimizations).
+```bash
+spack env activate .
 
-Every engine exposes the **same 11 tools**. Execution is generated-file only:
-the explorer writes ONE workflow file and the server runs it. No tool accepts a
-code string or command string to execute.
+python academy_agents.py --combination d --env local \
+  --domain new_molecular_nucleation \
+  --goal "Run a 2-task LAMMPS + OVITO workflow: simulate crystallization, then
+          identify diamond structures and render PNGs with TachyonRenderer."
+```
 
-| Tool | Parsl | PyCOMPSs | ADIOS2 | Description |
-|---|:---:|:---:|:---:|---|
-| `write_workflow` | ✓ | ✓ | ✓ | Write the single workflow file; validated and rejected if malformed |
-| `run_workflow` | ✓ | ✓ | ✓ | Execute that file through the engine |
-| `get_task_status` | ✓ | ✓ | ✓ | pending / running / completed / failed |
-| `get_task_result` | ✓ | ✓ | ✓ | Full stdout/stderr of a completed run |
-| `list_tasks` | ✓ | ✓ | ✓ | List all submitted runs and statuses |
-| `get_resources` | ✓ | ✓ | ✓ | PBS node/rank info — **explorer must call this first on HPC** |
-| `install_package` | ✓ | ✓ | ✓ | `pip install` into the venv, mid-run |
-| `check_package` | ✓ | ✓ | ✓ | Verify a package is importable |
-| `list_files` / `read_file` | ✓ | ✓ | ✓ | Inspect working directory contents |
-| `cleanup` | ✓ | ✓ | ✓ | Stop and clean up the MCP server process |
+`--combination` is the only required flag. `--env` defaults to `local` and
+`--engine` to `parsl`.
 
-What the generated file must contain differs per engine:
+### Flags
 
-| Engine | Python work | CLI work | MPI work |
+| Flag | Default | Values | Meaning |
 |---|---|---|---|
-| Parsl | `@python_app` | `@bash_app` returning the command string | `@bash_app` returning `mpirun -n N ...` |
-| PyCOMPSs | `@task` | `@binary(binary=...)` + `@task` | `@mpi(binary=..., processes=N)` + `@task` |
-| ADIOS2 | stage function | `subprocess` inside a stage body | `subprocess` inside a stage body |
+| `--combination` | **required** | `a` PDF+image+desc · `b` PDF+desc · `c` image+desc · `d` desc only | Which planner inputs are used. Data files are offered regardless |
+| `--env` | `local` | `local` · `hpc` · `multi-node` | See below |
+| `--engine` | `parsl` | `parsl` · `pycompss` · `adios` · `wilkins` | Which MCP server to start |
+| `--domain` | *(prompted)* | an exact folder name under `skills/use_cases/` | Selects the domain skill and labels the run |
+| `--list-domains` | — | — | Print the available domains and exit |
+| `--paper` | *(prompted)* | 1-based index into `inputs/literature/` | Only used for `--combination a`/`b` |
+| `--image` | *(prompted)* | a path, or a name in `inputs/images/` | Only used for `--combination a`/`c` |
+| `--goal` | *(prompted)* | free text | The workflow to reproduce |
+| `--condition` | `B` | `A` no skills · `B` full · `C` single-agent | Ablation condition |
+| `--trial` | `1` | int | Distinguishes repeated runs of the same configuration |
+| `--nodes` / `--ranks` | `0` | int | `--env multi-node` only, both required and >= 1 |
 
-ADIOS2 is an I/O library with no task decorator, so its workflow is a staged
-pipeline whose inter-stage arrays must move through `adios2.Stream` write/read
-round trips.
+### The three environments
 
-- **Parsl**: tasks run as real `@python_app`s on a `HighThroughputExecutor` (falls back to subprocess if not installed).
-- **PyCOMPSs**: tasks run under the real COMPSs runtime with `compss_wait_on()` dependency tracking when available; falls back to direct execution otherwise. Built by BSC.
-- **ADIOS2**: adds high-performance streaming I/O (BP file format, SST) between pipeline stages on top of the same task-execution model. Built by ORNL.
+**`--env local`** — one machine, no scheduler. Every agent runs in this process's
+event loop. `knowledge/local` is loaded, which forbids PBS, `mpirun`/`srun` and
+multi-node configs.
 
-To add a new engine: implement the same tool set in a new `servers/<engine>_server.py`,
-register it in `ENGINE_SERVERS` in `mcp_explorer.py`, and add the engine name to the
-`--engine` choices in `agent_mcp.py`. Nothing else in the agent layer needs to change.
+**`--env hpc`** — inside a PBS job you already hold. Everything still runs in one
+process; nothing is submitted. `PBS_JOBID` is checked at startup, because the
+only other thing that notices is the explorer's `get_resources` — by which point
+the planner and installer have each burned an LLM session for a run that cannot
+place a single rank.
+
+```bash
+qsub -I -A <allocation> -l select=1:ncpus=8:mpiprocs=8 -l walltime=01:00:00
+cd <repo> && spack env activate .
+python academy_agents.py --env hpc --engine parsl --combination b --paper 1 \
+  --domain cosmology --goal "Reproduce the density-field analysis"
+```
+
+**`--env multi-node`** — from a login node. The orchestrator, planner and
+installer stay in this process; the **explorer** runs on the first node of a
+PBS job this script submits, asking for `select=<nodes>:ncpus=<ranks>:mpiprocs=<ranks>`.
+The allocation is exactly `--nodes` wide, so `get_resources` reports the same
+shape the agent was told. The explorer's output goes to
+`runs/<run_id>_explorer.log` on the shared filesystem and is tailed into this
+terminal; its trace events go to a side-car JSONL and are merged back before the
+run trace is saved.
+
+The three LLM-latency-bound agents never go to a compute node in any mode — a
+node reserved for one of them is a node reserved to idle.
+
+### On HPC
+
+`get_resources` reports the allocation from `PBS_JOBID`, `PBS_NODEFILE`, `PBS_NP`
+and `PBS_NUM_PPN`. Generated workflows size their rank counts from it rather than
+hardcoding, and use **`mpirun`, not `srun`** — this is PBS, not SLURM.
+
+No MPI is configured for the run. Which MPI a workflow needs is a property of the
+domain's tools, stated in its skill file, and the agent writes that `module load`
+into the task's own command string. A module loaded in the worker environment
+would be inherited by every task, including the ones that want a different one.
+
+Task code and task lists always use `/app/...`, never a cluster path — the server
+resolves `/app/` to the repo, `/app/work/run0` to the work directory and
+`/app/inputs/data` to the data directory. Put the repo and venv on persistent
+project storage, never on node-local scratch.
+
+Compute nodes are headless: rendering needs `LIBGL_ALWAYS_SOFTWARE=1` and
+`PYOPENGL_PLATFORM=osmesa`, and `matplotlib.use("Agg")` inside the task.
 
 ---
 
-## Environment Setup
+## Output
 
-**Requirements:** Python 3.11, and (for HPC) an LCRC account with access to Improv, Swing, or Bebop.
-
-### 1. Create the venv
-
-There is one combined venv for both the agent framework and the scientific workflow
-packages — despite the historical naming split between `requirements.txt` (agent) and
-`builds/requirements.txt` (workflow), everything installs into the same environment.
-
-```bash
-cd MCP_Approach
-python3 -m venv venv3
-source venv3/bin/activate
-pip install -r requirements.txt
+```
+runs/<run_id>.jsonl                       orchestrator routing decisions
+runs/<run_id>_trace.json                  every LLM call, tool call and routing
+                                          decision, with timings and tokens
+runs/<run_id>_skill_recommendations.md    written only if you report a failure
+work/run0/                                everything the run produced
+work/run0/<run_id>.out / .err             each run_workflow's live streams
+work/builds/requirements.txt              regenerated every run
 ```
 
-This installs only the **agent-side** dependencies: LangGraph, the `mcp` SDK,
-`langchain-openai`, `pypdf`, `rich`, etc. — enough to start the agent pipeline.
+`work/run0/` is a single fixed working directory shared by every run. Set
+`MAW_ROTATE_RUN0=1` to move a non-empty one aside instead of writing over it —
+worth doing, because a stale output left in place can make a `@bash_app` ending
+in `test -s <output>` report success without having run.
 
-### 2. How the scientific packages get installed
+When `MAW_ARCHIVE_ROOT` is set, each finished run is copied to
+`<root>/<date>__<domain>__<engine>__<condition>__<combination>__trial<n>/`, engine
+scratch pruned, on both the success and failure paths. `work/run0` is **not**
+cleared afterwards, so a bug in the archiver cannot lose both the copy and the
+original.
 
-You will **not** find a hand-maintained list of scientific packages (LAMMPS, OVITO,
-Parsl, ADIOS2, numpy, astropy, camb, ase, ...) to `pip install` up front — the `installer`
-agent generates and installs that list *itself*, per run, based on what the `planner`
-decides the specific paper needs (`stack_decision`). Concretely:
+At the end of a run the explorer asks whether the workflow executed properly. If
+you say no, it diagnoses the run against your description and proposes additions
+to the domain skill file, which it will apply for you on confirmation.
 
-1. Planner reads the paper, decides the package list.
-2. Installer writes that list to `builds/requirements.txt` and shows it to the
-   orchestrator for approval.
-3. Once approved, installer runs `pip install` on it, into the **same venv** the agent
-   itself is running in.
-4. If the explorer hits a missing package mid-execution anyway, it calls the
-   `install_package` MCP tool directly — no need to wait for another install phase.
-
-Because the venv is persistent across runs, packages accumulate — the venv only grows
-over time as new papers/domains are run against it. The first run for a new domain will
-take noticeably longer while it installs everything.
-
-### 3. Configure the LLM backend
-
-Create a `.env` file in the repo root (this file is gitignored — you must create your
-own):
-
-```bash
-OPENAI_API_KEY=<your key>
-OPENAI_BASE_URL=<your endpoint>
-MODEL_NAME=<model name>
-```
-
-The agent talks to an OpenAI-compatible endpoint (this project was built against
-Argonne's Argo API gateway) via `langchain-openai`. Any OpenAI-compatible
-`base_url`/`api_key`/model combination will work.
-
-### 4. Add papers
-
-Drop any PDF you want reproduced into `Literature/`. The CLI lists them by index at
-startup; `--paper 1` (etc.) selects by that index, or you can pass a direct path.
-
----
-
-## Running Locally
-
-```bash
-source venv3/bin/activate
-
-python agent_mcp.py \
-  --paper 1 \
-  --combination b \
-  --goal "Reproduce this workflow using LAMMPS and OVITO"
-```
-
-`--env` defaults to `local` and `--engine` defaults to `parsl`. On a local machine, the
-`knowledge/local` skill is loaded automatically, which forbids the agent from
-recommending PBS, MPI, `mpirun`/`srun`, or multi-node configs — everything runs
-single-process on one machine.
-
----
-
-## Testing a New Simulation Without Pre-Configuring a Use Case
-
-You don't need to go through the full [Adding a New Use Case](#adding-a-new-use-case)
-setup (paper, `descriptions.py` entry, skill files) just to try something new. Upload
-any supporting artifacts you have — a workflow diagram (`--image <path>`, or drop it
-in `inputs/input_images/`), input files in `data/` — skip `--paper`, and use
-`--combination d` (Desc only). Everything else comes from your `--goal`.
-
-Since the goal message is the only thing describing the simulation in this path,
-write one that covers these six considerations:
-
-| Consideration | Ask yourself |
-|---|---|
-| Scientific goal | What should the workflow compute or produce? |
-| Method / software | Which simulator and analysis tools should each task use? |
-| Input data | Is input data provided, or generated by the workflow itself? |
-| Key parameters | Size, steps, resolution, MPI ranks (or leave blank for defaults) |
-| Expected outputs / success criteria | What outputs, and how do we know it worked? |
-| Environment & scale | Local or HPC, and how many processes/ranks/nodes? |
-
-```bash
-python agent_mcp.py \
-  --combination d \
-  --goal "Run a 2-task LAMMPS + OVITO workflow: simulate crystallization, then \
-identify diamond structures and render PNGs with TachyonRenderer. Use 4 MPI ranks \
-locally; success = one PNG per frame showing colored diamond-structure atoms."
-```
-
----
-
-## Running on HPC (LCRC — Improv / Swing / Bebop)
-
-### One-time venv setup (on a login node — compute nodes may lack internet access)
-
-```bash
-cd /lcrc/project/<your-project>/MCP_Approach
-python3 -m venv venv3
-source venv3/bin/activate
-pip install -r requirements.txt
-```
-
-Store the repo and venv under `/lcrc/project/<project>/` (persistent, backed up) — not
-under `/scratch` (15 GB, node-local, wiped after the job ends).
-
-### Before every run: set MPI library paths
-
-```bash
-source setup_hpc.sh
-```
-
-`setup_hpc.sh` sets `LD_LIBRARY_PATH` to the Intel MPI shared libraries
-(`libmpi.so.12`, `libfabric.so.1`) that LAMMPS's Python bindings load at import time.
-Without it you'll hit:
-```
-OSError: libmpi.so.12: cannot open shared object file: No such file or directory
-```
-It also exports `VENV_PYTHON`, pointing the MCP servers at this venv's interpreter so
-every task subprocess uses the right Python (and MPI libs) automatically.
-
-### Run inside a PBS allocation
-
-The agent must be run **inside a PBS job** (interactive or batch) — the explorer's
-first tool call is always `get_resources`, and if that reports `in_pbs: false`, it will
-stop immediately rather than attempt any compute task on a login node.
-
-```bash
-qsub -I -A <allocation> -l select=1 -l walltime=01:00:00 -q <queue>   # example interactive job
-cd /lcrc/project/<project>/MCP_Approach
-source setup_hpc.sh
-source venv3/bin/activate
-
-python agent_mcp.py \
-  --env hpc \
-  --paper 1 \
-  --combination b \
-  --goal "Reproduce this workflow using LAMMPS and OVITO"
-```
-
-### Flag Matrix — Every Value You Can Pass on HPC
-
-| Flag | Required? | Values on HPC | Meaning |
-|---|---|---|---|
-| `--env` | yes, always `hpc` here | `hpc` | Loads `knowledge/lcrc`, enables PBS-aware MPI sizing |
-| `--engine` | no (default `parsl`) | `parsl` \| `pycompss` \| `adios` | Which MCP workflow-engine server to launch |
-| `--paper` | no, but needed to pick a paper | 1-based index into `Literature/` (e.g. `1`, `2`, `3`) or a direct PDF path | Which paper the agent reads |
-| `--image` | no | path to an image file | Optional figure/diagram to aid planning |
-| `--goal` | no, but should always be set | free text | Natural-language goal describing what to reproduce |
-| `--domain` | no | `molecular_nucleation` \| `cosmology` \| `eddy_uv` \| any free text \| `""` (default) | Label used in the archive folder name; also what you'll typically set to match the paper |
-| `--condition` | no (default `B`) | `A` (no skills) \| `B` (full multi-agent) \| `C` (single-agent) | Ablation condition — `B` is this repo's normal mode |
-| `--combination` | **yes** | `a` (PDF+Image+Desc) \| `b` (PDF+Desc) \| `c` (Image+Desc) \| `d` (Desc only) | Which planner inputs are actually used |
-| `--trial` | no (default `1`) | any integer | Distinguishes repeated runs of the same (paper, condition) pair |
-
-### Example Commands — One Per Engine
-
-```bash
-# Parsl engine, cosmology paper, full multi-agent (default condition B)
-python agent_mcp.py --env hpc --engine parsl \
-  --paper 1 --domain cosmology --combination b --trial 1 \
-  --goal "Reproduce the density-field analysis from this paper"
-
-# PyCOMPSs engine, molecular nucleation paper
-python agent_mcp.py --env hpc --engine pycompss \
-  --paper 2 --domain molecular_nucleation --combination b --trial 1 \
-  --goal "Reproduce this workflow using LAMMPS and OVITO"
-
-# ADIOS2 engine, eddy_uv paper, passing a figure image alongside the PDF
-python agent_mcp.py --env hpc --engine adios \
-  --paper 3 --image Literature/eddy_uv_diagram.png --domain eddy_uv --combination a --trial 1 \
-  --goal "Reproduce the eddy streamfunction visualization from this paper"
-
-# Same run again as a second trial, with the no-skills ablation condition
-python agent_mcp.py --env hpc --engine parsl \
-  --paper 1 --domain cosmology --condition A --combination b --trial 2 \
-  --goal "Reproduce the density-field analysis from this paper"
-```
-
-With `--env hpc`, the `knowledge/lcrc` skill is loaded. It reads these PBS variables to
-size MPI launches automatically:
-
-| Variable | Meaning |
-|---|---|
-| `PBS_JOBID` | Set when running inside a PBS job |
-| `PBS_NUM_NODES` | Number of allocated nodes |
-| `PBS_NP` | Total MPI ranks across all nodes |
-| `PBS_NUM_PPN` | Processors per node |
-| `PBS_NODEFILE` | Path to file listing allocated hostnames |
-
-`get_resources` reports `PBS_NP` so the generated workflow can size its rank
-count from the allocation rather than hardcoding it — and it must use
-**`mpirun`, not `srun`** (this is a PBS cluster, not SLURM).
-
-### Storage paths on LCRC
-
-| Path | Use for |
-|---|---|
-| `/lcrc/project/<project>/` | Repo, venv, results — persistent |
-| `/lcrc/globalscratch/<user>/` | Large intermediate output — shared, may be cleared |
-| `/scratch` | 15 GB node-local scratch — wiped after job ends, never put the venv here |
-
-Task code and planner task lists always use `/app/...` paths, never a hardcoded
-`/lcrc/...` path — the MCP server resolves `/app/` to the actual repo location on disk
-automatically.
-
-### Compute node notes
-
-- No display server: headless rendering requires `LIBGL_ALWAYS_SOFTWARE=1` and
-  `PYOPENGL_PLATFORM=osmesa` (already handled by the render tasks the agent generates).
-- No `module load` for Python — the venv is the only Python environment used.
-- Load system modules only for things that can't come from pip (vendor MPI, CUDA, etc.).
-
----
-
-## CLI Reference (`agent_mcp.py`)
-
-| Flag | Default | Choices | Meaning |
-|---|---|---|---|
-| `--paper` | — | PDF path or 1-based index into `Literature/` | Which paper to reproduce |
-| `--image` | — | path | Optional figure/diagram image to aid planning |
-| `--goal` | — | free text | The natural-language goal given to the agent |
-| `--engine` | `parsl` | `parsl`, `pycompss`, `adios` | Which workflow engine MCP server to launch |
-| `--env` | `local` | `local`, `hpc` | Execution environment — controls which knowledge skill loads |
-| `--condition` | `B` | `A`, `B`, `C` | Ablation condition: A = no skills, B = full multi-agent (default), C = single-agent |
-| `--combination` | — (required) | `a`, `b`, `c`, `d` | Planner input combination: a=PDF+Image+Desc, b=PDF+Desc, c=Image+Desc, d=Desc only |
-| `--domain` | `""` | free text | Optional domain label (e.g. `cosmology`) used in archive folder naming |
-| `--trial` | `1` | int | Trial number, for repeated (paper, condition) runs |
-
----
-
-## Run Output & Archiving
-
-`work/run0/` is a single fixed working directory, shared by every run — the next run
-overwrites whatever the previous one left there. Right after each run's trace is saved
-(success or failure), `run_archiver.py` automatically:
-
-1. Copies `work/run0/` and that run's `trace.json` into a permanent archive folder
-   **outside this repo's live scratch space**.
-2. Clears `run0` so the next run starts clean.
-
-Archive folders are named:
-```
-<date>__<usecase>__<engine>__<condition>__<combination>__trial<trial>
-```
-e.g. `20260709__cosmology__parsl__B__b__trial1`. Name collisions get a Windows-style
-` (2)`, ` (3)`, ... suffix rather than overwriting.
-
-**`SAMPLE RUNS/`** in this repo contains two complete real archived runs (cosmology and
-molecular nucleation, both Parsl/condition B) — browse them to see exactly what a
-finished run's directory structure, LAMMPS output, renders, and `trace.json` look like
-without having to execute anything yourself.
-
-`trace.json` (schema in `trace_schema.py`) records every LLM call, tool call, and
-routing decision with elapsed time and timestamps, letting a run be reconstructed or
-scored after the fact.
+`SAMPLE RUNS/` holds three complete archived runs (cosmology, molecular
+nucleation and eddy_uv, all Parsl, condition B) — browse those to see what a
+finished run looks like without executing anything.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Fix |
+| Symptom | Cause |
 |---|---|
-| `OSError: libmpi.so.12: cannot open shared object file` | You forgot to `source setup_hpc.sh` before running on HPC |
-| Explorer stops immediately, reports `in_pbs: false` | You're on a login node — start a PBS job first |
-| `No PDFs found in the Literature/ folder` | Add a PDF to `Literature/` before running |
-| `--combination` missing / argparse error | `--combination` is required (a/b/c/d) — see CLI Reference |
+| `--env hpc` refuses to start | `PBS_JOBID` is unset, so this is a login shell. Get an allocation, or use `--env multi-node` |
+| Explorer reports `in_pbs: false` | Same, from inside the run |
+| `No Spack environment is active` | `spack env activate .` from the repo root, before launching |
+| `JAVA_HOME is unset` / `MAW_PYTHON is unset` | The environment is active but `maw.env` did not run, or there is no venv. Re-run `bootstrap.sh` |
+| `pycompss is not installed` on a machine where it is | A half-activated environment — you ran `venv3/bin/activate` after `spack env activate` |
+| PyCOMPSs hangs with an empty `~/.COMPSs/*/jobs/` | A topology with no resources. Read `compss_topology` from `get_resources`; do not write the XML yourself |
+| `not enough slots available` | `@mpi(processes=N)` without `processes_per_node`, which defaults to 1 and makes `processes` a NODE count |
+| ADIOS2 `Cannot use MPI since ADIOS2 was built without MPI support` | A `comm=` argument against the serial wheel. Drop it, or use `MAW_ADIOS=mpi` |
+| A Wilkins run completes but writes real `.h5` files | LowFive was not the active VOL. Call `check_lowfive` first |
+| `No PDFs found in the inputs/literature/ folder` | Add a paper, or use `--combination c`/`d` |
+| `NameError` on a worker in a Parsl app | A module-level import or constant used inside an app body. Imports go **inside** the function |
