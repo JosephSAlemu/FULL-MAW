@@ -92,8 +92,18 @@ class WilkinsServer(Server):
     VOL_CONNECTOR_VAR = "HDF5_VOL_CONNECTOR"
     PLUGIN_PATH_VAR = "HDF5_PLUGIN_PATH"
 
-    #: Package name of the generated module for the MPI-linked build, produced
-    #: by `spack -e spack_mpi module lmod refresh`.
+    #: Generated modules this engine needs, in load order. Produced by
+    #: `spack -e spack_mpi module tcl refresh`.
+    #:
+    #: ALL THREE, not just wilkins. py-mpi4py and py-h5py are SIBLING root
+    #: specs, not dependencies of wilkins, so `autoload: direct` on the wilkins
+    #: module never brings them -- and wilkins-master.py does
+    #: `from mpi4py import MPI`, so the driver dies on import without it.
+    #: Missing ones are skipped, so a site that supplies them another way
+    #: (an MPI-built h5py already on PYTHONPATH) still works.
+    MODULE_PACKAGES = ("wilkins", "py-mpi4py", "py-h5py")
+
+    #: The one that decides whether this engine is available at all.
     MPI_MODULE_PACKAGE = "wilkins"
 
     def module_root(self) -> Optional[str]:
@@ -101,24 +111,29 @@ class WilkinsServer(Server):
         d = os.path.join(root, "spack_mpi", "modules")
         return d if os.path.isdir(d) else None
 
-    def mpi_module(self) -> Optional[str]:
-        """The generated wilkins module name, or None if it was never built.
+    def _module_for(self, package: str) -> Optional[str]:
+        """Newest generated module for `package`, or None.
 
         Read off the filesystem rather than rebuilt from spack.yaml's
         `projections` template, which would be a second implementation of it.
+        Handles lmod (.lua), tcl (.tcl) and extensionless tcl names.
         """
-        if os.environ.get("MAW_WILKINS_MODULE"):
-            return os.environ["MAW_WILKINS_MODULE"]
         root = self.module_root()
-        d = os.path.join(root or "", self.MPI_MODULE_PACKAGE)
+        d = os.path.join(root or "", package)
         if not root or not os.path.isdir(d):
             return None
         names = sorted(f[:-4] for f in os.listdir(d)
                        if f.endswith(".lua") or f.endswith(".tcl"))
         if not names:
             names = sorted(f for f in os.listdir(d)
-                           if os.path.isfile(os.path.join(d, f)))
-        return f"{self.MPI_MODULE_PACKAGE}/{names[-1]}" if names else None
+                           if os.path.isfile(os.path.join(d, f))
+                           and not f.startswith("."))
+        return f"{package}/{names[-1]}" if names else None
+
+    def mpi_module(self) -> Optional[str]:
+        """The generated wilkins module, or None if it was never built."""
+        return (os.environ.get("MAW_WILKINS_MODULE")
+                or self._module_for(self.MPI_MODULE_PACKAGE))
 
     def module_prelude(self) -> list[str]:
         """Shell commands that put Wilkins on this run's environment, or [].
@@ -127,14 +142,17 @@ class WilkinsServer(Server):
         the site MODULEPATH. maw.env prepends it at activation, but a task
         command that ran `module purge` has dropped it again.
         """
-        module = self.mpi_module()
-        if not module:
+        if not self.mpi_module():
             return []
         prelude = []
         root = self.module_root()
         if root:
             prelude.append(f"module use {root}")
-        prelude.append(f"module load {module}")
+        modules = [m for m in (self._module_for(p) for p in self.MODULE_PACKAGES)
+                   if m]
+        if os.environ.get("MAW_WILKINS_MODULE"):
+            modules = [os.environ["MAW_WILKINS_MODULE"]] + modules[1:]
+        prelude.append("module load " + " ".join(modules))
         return prelude
 
     def _lowfive_env(self) -> dict:
@@ -164,7 +182,7 @@ class WilkinsServer(Server):
         self._lowfive_cache = {
             self.VOL_CONNECTOR_VAR: lines[0].strip() if len(lines) > 0 else "",
             self.PLUGIN_PATH_VAR: lines[1].strip() if len(lines) > 1 else "",
-            "_module": prelude[-1].split()[-1],
+            "_module": " ".join(prelude[-1].split()[2:]),
             "_probe_error": result["stderr"][-300:] if result["exit_code"] else "",
         }
         return self._lowfive_cache
