@@ -30,17 +30,27 @@ In addition to the variables in src/servers/server.py:
     MAW_WILKINS_DRIVER   the driver script. Default: wilkins-master.py, which
                          Wilkins installs and expects to be on PATH or in the
                          work directory.
-    HDF5_VOL_CONNECTOR   set by `spack load wilkins`; LowFive's VOL name.
-    HDF5_PLUGIN_PATH     set by `spack load wilkins`; where the plugin lives.
+    MAW_WILKINS_MODULE   override the generated module name. Default: the
+                         newest under spack_mpi/modules/wilkins/.
+    HDF5_VOL_CONNECTOR   LowFive's VOL name. Normally set BY the module.
+    HDF5_PLUGIN_PATH     where the plugin lives. Normally set BY the module.
 
-Wilkins itself is NOT located by this server. It comes from the environment the
-operator built -- the wilkins Spack environment, whose generated module sets
-both HDF5 variables. `module load wilkins/<version>` in the task command is how
-a run reaches it.
+HOW WILKINS REACHES A RUN. Not from this process's environment: the server
+loads the generated module itself, in the `bash -lc` that launches the driver.
+That is what keeps the core Spack environment MPI-free -- Wilkins and its MPI
+exist only inside that one subshell, per run, so a parsl or pycompss run never
+carries them.
+
+Which means the LowFive check CANNOT read os.environ: this server starts before
+any task runs, so its own environment has neither variable on a run that is
+perfectly well configured. _lowfive_env probes them in the same subshell the
+launcher uses. With no generated module the server falls back to its own
+environment, which is the manual-install path.
 """
 
 import os
 import shutil
+from typing import Optional
 
 if __package__:
     from .server import Server
@@ -70,6 +80,10 @@ class WilkinsServer(Server):
 
     DEFAULT_CONFIG = "wilkins.yaml"
 
+    #: Result of the one subshell probe per server. The answer cannot change
+    #: inside a run, and the probe costs a login shell.
+    _lowfive_cache: Optional[dict] = None
+
     # __ LowFive ______________________________________________________________
 
     #: The two variables that decide whether this is an in situ workflow or a
@@ -77,6 +91,83 @@ class WilkinsServer(Server):
     #: a manual install requires setting them by hand.
     VOL_CONNECTOR_VAR = "HDF5_VOL_CONNECTOR"
     PLUGIN_PATH_VAR = "HDF5_PLUGIN_PATH"
+
+    #: Package name of the generated module for the MPI-linked build, produced
+    #: by `spack -e spack_mpi module lmod refresh`.
+    MPI_MODULE_PACKAGE = "wilkins"
+
+    def module_root(self) -> Optional[str]:
+        root = os.environ.get("MAW_REPO_ROOT", self.repo_root)
+        d = os.path.join(root, "spack_mpi", "modules")
+        return d if os.path.isdir(d) else None
+
+    def mpi_module(self) -> Optional[str]:
+        """The generated wilkins module name, or None if it was never built.
+
+        Read off the filesystem rather than rebuilt from spack.yaml's
+        `projections` template, which would be a second implementation of it.
+        """
+        if os.environ.get("MAW_WILKINS_MODULE"):
+            return os.environ["MAW_WILKINS_MODULE"]
+        root = self.module_root()
+        d = os.path.join(root or "", self.MPI_MODULE_PACKAGE)
+        if not root or not os.path.isdir(d):
+            return None
+        names = sorted(f[:-4] for f in os.listdir(d)
+                       if f.endswith(".lua") or f.endswith(".tcl"))
+        if not names:
+            names = sorted(f for f in os.listdir(d)
+                           if os.path.isfile(os.path.join(d, f)))
+        return f"{self.MPI_MODULE_PACKAGE}/{names[-1]}" if names else None
+
+    def module_prelude(self) -> list[str]:
+        """Shell commands that put Wilkins on this run's environment, or [].
+
+        `module use` first: the generated tree lives under spack_mpi/, not on
+        the site MODULEPATH. maw.env prepends it at activation, but a task
+        command that ran `module purge` has dropped it again.
+        """
+        module = self.mpi_module()
+        if not module:
+            return []
+        prelude = []
+        root = self.module_root()
+        if root:
+            prelude.append(f"module use {root}")
+        prelude.append(f"module load {module}")
+        return prelude
+
+    def _lowfive_env(self) -> dict:
+        """The two HDF5 variables AS THE LAUNCH WILL SEE THEM.
+
+        Not os.environ. This server starts before any task runs and the module
+        is loaded inside the launch subshell, so reading our own environment
+        reports what the SERVER sees -- which is nothing, on a run that is
+        perfectly well configured. Probed in the same `bash -lc` the launcher
+        uses, so the answer is about the environment the driver actually gets.
+
+        Falls back to our own environment when no module was built, which is
+        the manual-install path.
+        """
+        prelude = self.module_prelude()
+        if not prelude:
+            return {k: os.environ.get(k, "")
+                    for k in (self.VOL_CONNECTOR_VAR, self.PLUGIN_PATH_VAR)}
+        if self._lowfive_cache is not None:
+            return self._lowfive_cache
+
+        probe = (" && ".join(prelude) +
+                 f' && printf "%s\\n%s\\n" "${self.VOL_CONNECTOR_VAR}"'
+                 f' "${self.PLUGIN_PATH_VAR}"')
+        result = self._run(["bash", "-lc", probe], timeout=120)
+        lines = (result["stdout"] or "").splitlines()
+        self._lowfive_cache = {
+            self.VOL_CONNECTOR_VAR: lines[0].strip() if len(lines) > 0 else "",
+            self.PLUGIN_PATH_VAR: lines[1].strip() if len(lines) > 1 else "",
+            "_module": prelude[-1].split()[-1],
+            "_probe_error": result["stderr"][-300:] if result["exit_code"] else "",
+        }
+        return self._lowfive_cache
 
     def lowfive_state(self) -> dict:
         """Is LowFive actually the active HDF5 VOL? Reported, with evidence.
@@ -87,8 +178,9 @@ class WilkinsServer(Server):
         a real file, and the workflow completes having transported nothing in
         memory. Nothing in the output says so.
         """
-        connector = os.environ.get(self.VOL_CONNECTOR_VAR, "")
-        plugin_path = os.environ.get(self.PLUGIN_PATH_VAR, "")
+        probed = self._lowfive_env()
+        connector = probed.get(self.VOL_CONNECTOR_VAR, "")
+        plugin_path = probed.get(self.PLUGIN_PATH_VAR, "")
 
         problems = []
         if not connector:
@@ -133,12 +225,22 @@ class WilkinsServer(Server):
             self.VOL_CONNECTOR_VAR: connector or None,
             self.PLUGIN_PATH_VAR: plugin_path or None,
             "problems": problems,
+            "module": probed.get("_module"),
+            **({"probe_error": probed["_probe_error"]}
+               if probed.get("_probe_error") else {}),
             **({"fix": (
-                "Load the wilkins module, which sets both: "
-                "`module load wilkins/<version>`. With a manual Wilkins "
-                "install they have to be exported by hand -- see Wilkins' "
-                "README, which notes that a Spack install sets them "
-                "automatically and a manual one does not."
+                f"The generated module is {probed['_module']} and the launcher "
+                f"loads it, but it does not export these. Check with "
+                f"`module show {probed['_module']}`; if the variables are "
+                f"absent, add lowfive to `include:` in spack_mpi/spack.yaml and "
+                f"re-run `spack -e . module lmod refresh -y` -- LowFive is what "
+                f"sets them, and a module is only generated for packages that "
+                f"list is restricted to."
+            ) if probed.get("_module") else (
+                "No generated wilkins module was found under spack_mpi/modules, "
+                "so these must be exported by hand. Build the environment: "
+                "`cd spack_mpi && spack -e . install && "
+                "spack -e . module lmod refresh -y`."
             )} if problems else {}),
         }
 
@@ -429,8 +531,17 @@ class WilkinsServer(Server):
                 f"Could not determine a rank count from {workflow_path}. "
                 f"Every task needs an `nprocs`, or pass ranks explicitly."
             )
-        return [self.mpi_launcher, "-n", str(total), "-l",
-                self.python, "-u", self.driver, workflow_path, *args]
+        command = [self.mpi_launcher, "-n", str(total), "-l",
+                   self.python, "-u", self.driver, workflow_path, *args]
+
+        # The module load is shell and the launcher is argv, so they are joined
+        # through `bash -lc`. This is what keeps the core environment MPI-free:
+        # Wilkins and its MPI arrive here, per run, and nowhere else.
+        prelude = self.module_prelude()
+        if prelude:
+            return ["bash", "-lc",
+                    " && ".join(prelude) + " && " + " ".join(command)]
+        return command
 
     def prepare_run(self, workflow_path: str) -> dict:
         """Report the LowFive state, and refuse the run if it is wrong.
@@ -454,6 +565,7 @@ class WilkinsServer(Server):
             "lowfive": {k: state[k] for k in
                         ("lowfive_active", self.VOL_CONNECTOR_VAR,
                          self.PLUGIN_PATH_VAR)},
+            "wilkins_module": self.mpi_module(),
             "driver": self.driver,
             **({"config_tasks": len(parsed.get("tasks", [])),
                 "config_total_ranks": self.total_ranks(parsed)} if parsed else {}),
@@ -464,6 +576,7 @@ class WilkinsServer(Server):
         return {
             "driver": self.driver,
             "launcher": self.mpi_launcher,
+            "wilkins_module": self.mpi_module(),
             **self.lowfive_state(),
             "note": (
                 "The workflow is the YAML config, not a Python file: write it "

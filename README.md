@@ -90,9 +90,10 @@ value, is `serial`.**
 
 Both can be installed at once: `PYTHONPATH` precedes the venv's site-packages,
 so `module load adios2/<ver>-<mpi>` shadows the wheel and unloading restores it.
-`MAW_ADIOS` is normalised in one place (`common.consts.adios_variant`) and the
-canonical value is passed to the server, so the client's tool bindings cannot
-disagree with the server's class.
+The `mpi` server loads that module itself, in the subshell `run_mpmd` launches
+— see *The MPI-linked engines* below. `MAW_ADIOS` is normalised in one place
+(`common.consts.adios_variant`) and the canonical value is passed to the server,
+so the client's tool bindings cannot disagree with the server's class.
 
 ### Adding an engine
 
@@ -171,15 +172,52 @@ and no `setup_hpc.sh`.
 Do **not** run `venv3/bin/activate` after activating the environment: it restores
 the pre-venv `PATH` and drops `JAVA_HOME`'s bin, the compiler and `mpirun`.
 
-The MPI-linked engines (ADIOS2 `+mpi`, Wilkins/LowFive) live in a second
-environment under `spack_mpi/`, built by hand only if you need them:
+### The MPI-linked engines
+
+ADIOS2 `+mpi` and Wilkins/LowFive cannot be MPI-free, so they live in a
+**second** environment under `spack_mpi/`, built by hand only if you need them.
+It is kept separate on purpose: the root environment's view is on
+`LD_LIBRARY_PATH` for every run, so an MPI-linked library in it would reach a
+Parsl or PyCOMPSs task that loads a different MPI, and two implementations in
+one process hang rather than error.
+
+Instead, `spack_mpi/` is exposed **only as generated modules**. `maw.env`
+prepends `spack_mpi/modules` to `MODULEPATH` on activation — which loads
+nothing — and the engine's server loads its own module inside the subshell that
+launches the workflow. The codebase stays MPI-agnostic until that moment.
 
 ```bash
 module load <the MPI your domains use>
+```
+
+```bash
 cd spack_mpi && cp spack.yaml.in spack.yaml   # uncomment the specs you want
-spack -e . external find openmpi mpich intel-oneapi-mpi
+```
+
+```bash
+spack -e . external find mpich               # or openmpi, intel-oneapi-mpi
+```
+
+Mark every *other* provider `buildable: false` in `spack.yaml` so a dependency
+cannot pull in a second MPI, confirm with `spack -e . spec wilkins | grep -i mpi`,
+then:
+
+```bash
 spack -e . install && spack -e . module lmod refresh -y
 ```
+
+Verify the module exports what LowFive needs — `include:` restricts which
+packages get module files, and LowFive is what sets these:
+
+```bash
+module use spack_mpi/modules && module show wilkins/<version>
+```
+
+If `HDF5_VOL_CONNECTOR` is absent, add `lowfive` to `include:` and refresh
+again. Otherwise the module loads, LowFive stays inactive, and every task
+writes a real `.h5` with no error anywhere. `spack_mpi/spack.yaml` is
+gitignored: it holds your site's probed MPI external, which is why only the
+`.in` template is tracked.
 
 ### Configuration
 

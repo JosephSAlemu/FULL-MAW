@@ -13,5 +13,7 @@ SAMPLE RUNS/**/work/.parsl/
 profiler/
 /.spack-env
 spack.lock
+# Generated from spack.yaml.in; holds this site's probed MPI external.
+spack_mpi/spack.yaml
 .spack-env/
 .kilo/
