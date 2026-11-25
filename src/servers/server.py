@@ -198,10 +198,10 @@ class Server(ABC):
         """Register engine-only tools. Default: none.
 
         Override in a subclass to add tools that exist for that engine alone,
-        e.g. PyCOMPSs's write_xml:
+        going through register_tool so every generation of FastMCP accepts them:
 
             def register_tools(self):
-                self.mcp.tool(self.write_xml)
+                self.register_tool(self.write_xml)
         """
 
     # __ Hooks _________________________________________________________________
@@ -675,6 +675,7 @@ class Server(ABC):
     #: skipped when collecting logs.
     SCRATCH_DIRS = (
         "__pycache__", ".git", "runinfo", ".parsl", ".compss", "_task_scripts",
+        "_compss_config", "_bp_tasks",
     )
 
     #: Filenames matching these are tailed into a failed run's result.
@@ -802,6 +803,9 @@ class Server(ABC):
                 command,
                 stdout=out_fh or subprocess.PIPE,
                 stderr=err_fh or subprocess.PIPE,
+                # DEVNULL, not inherited: our stdin is the JSON-RPC pipe, and a
+                # child that reads it (ssh does) eats the client's messages.
+                stdin=subprocess.DEVNULL,
                 text=True,
                 cwd=self.work_dir,
                 env=env if env is not None else dict(os.environ),

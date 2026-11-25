@@ -104,6 +104,24 @@ SPACK_SETUP_PATH = os.environ.get("MAW_SPACK_SETUP", "")
 # which academy_agents.spack_env_dir() reads from SPACK_ENV.
 
 
+# __ ADIOS2 variant _____________________________________________________________
+
+ADIOS_DEFAULT_VARIANT = "serial"
+ADIOS_VARIANTS = ("serial", "mpi")
+
+
+def adios_variant(value: str | None = None) -> str:
+    """MAW_ADIOS as exactly "serial" (the default) or "mpi".
+
+    The one expression both sides of the MCP boundary use: the client binds the
+    engine-only tools from it and the server picks its class from it, so they
+    cannot disagree. Unrecognised falls back to serial, which runs everywhere.
+    """
+    raw = os.environ.get("MAW_ADIOS", "") if value is None else value
+    normalised = (raw or "").strip().lower()
+    return normalised if normalised in ADIOS_VARIANTS else ADIOS_DEFAULT_VARIANT
+
+
 # __ Skills _____________________________________________________________________
 
 ENV_KNOWLEDGE = {

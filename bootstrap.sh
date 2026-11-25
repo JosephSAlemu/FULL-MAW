@@ -161,8 +161,9 @@ venv3/bin/python3 -m pip install -r requirements.txt
 #   mpi     built +mpi in the spack_mpi/ engines environment. MPMD and collective
 #           writes, but bound to that one MPI, so adios becomes gated.
 #
-# src/servers/adios_sst.py and src/servers/adios_mpmd.py are the two servers;
-# mcp_explorer.py reads MAW_ADIOS to decide which one `--engine adios` starts.
+# Both server classes live in src/servers/adios.py; common.consts.adios_variant()
+# picks between them at run time. READ FROM THE SHELL, NOT .env -- this script
+# sources nothing, so export MAW_ADIOS here too. Unset is serial either way.
 case "${MAW_ADIOS:-serial}" in
     serial)
         note "MAW_ADIOS=serial -- adios2 from PyPI (SST, no MPI)"
@@ -183,7 +184,9 @@ case "${MAW_ADIOS:-serial}" in
         echo "        spack -e . install && spack -e . module lmod refresh -y"
         ;;
     *)
-        die "MAW_ADIOS must be 'serial' or 'mpi', got '${MAW_ADIOS}'"
+        die "MAW_ADIOS must be 'serial' or 'mpi', got '${MAW_ADIOS}'.
+       Unset it for the serial default. At run time an unrecognised value
+       falls back to serial, so this is the only place it is fatal."
         ;;
 esac
 

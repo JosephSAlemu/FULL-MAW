@@ -100,24 +100,28 @@ command string.
 """,
 
     "pycompss": EXEC_PROMPT_HEAD + """
-### Write the XML topology first (PyCOMPSs)
+### DO NOT write the XML topology (PyCOMPSs)
 
-PyCOMPSs is the one engine that needs configuration before the workflow. COMPSs
-reads the machine it runs on from two XML files, and its runtime will not start
-without them. Use `write_xml`, not `write_file`, so they land where the
-launcher looks:
+COMPSs reads the machine it runs on from project.xml and resources.xml, and
+**the server generates both from the real allocation before every run**. You do
+not write them, and you should not need `write_xml` at all.
 
-1. `write_xml(kind="project", content=...)` -- which hosts take work, the
-   COMPSs install directory and working directory on each, the task limit.
-2. `write_xml(kind="resources", content=...)` -- how to reach each host: its
-   processors and computing units, the communication adaptor and its port
-   range, any shared disks.
+Call `get_resources` first and read `compss_topology`:
 
-Call `get_resources` first and declare what is actually there. Off a scheduler
-(`in_pbs` false) there is one host: declare the master node's own computing
-units in project.xml and leave `<ResourcesList>` empty -- COMPSs then schedules
-tasks into the master's own slots, which is its documented single-process
-configuration.
+- `mode` is `master_only` (one node: the master runs the tasks itself, no ssh)
+  or `multi_node` (each host is a worker reached over ssh).
+- `total_slots` is the CEILING for `@mpi(processes=N)`. A larger N fails with
+  "not enough slots available", and setting an oversubscribe flag to silence
+  that stacks ranks onto slots they do not have and wastes the allocation.
+- `units_per_host` is what `processes_per_node` must be.
+- `total_slots` of 0 means no host can start a worker. The run is refused;
+  report it as an environment gap rather than working around it.
+
+`write_xml` exists only to correct a generated topology that is demonstrably
+wrong. Using it takes that file over for the rest of the session and the server
+stops regenerating it. Note that a **bare** `<MasterNode/>` with no `<Processor>`
+contributes no resources at all: COMPSs starts, schedules nothing, and hangs
+with no error.
 
 ### What the workflow file must contain (PyCOMPSs)
 
@@ -128,17 +132,23 @@ Every unit of work is a decorated function:
   The body is `pass`. Arguments come from the function signature plus `@task`
   parameter types (`FILE_IN`, `FILE_OUT`, `FILE_IN_STDIN`, `FILE_OUT_STDOUT`,
   `Prefix`), or from an `args` string with `{{name}}` placeholders.
-- `@mpi(binary="...", runner="mpirun", processes=N)` stacked above `@task` for
-  an MPI program on N ranks. Body is `pass`. This is how rank count is
-  expressed -- you never type `mpirun` yourself, and `ranks` on run_workflow is
-  not how you ask for ranks here.
+- `@mpi(binary="...", runner="mpirun", processes=N, processes_per_node=M)`
+  stacked above `@task` for an MPI program. Body is `pass`. This is how rank
+  count is expressed -- you never type `mpirun` yourself, and `ranks` on
+  run_workflow is not how you ask for ranks here.
+  **`processes_per_node` is not optional.** It defaults to 1, and `processes` is
+  then read as a number of NODES, so `@mpi(processes=8)` alone asks for eight
+  nodes at one rank each and fails with "not enough slots available". Set it
+  from `compss_topology.units_per_host`.
 
 Dependencies come from passing values between tasks and from FILE_IN/FILE_OUT
 parameters; call `compss_wait_on()` only where the driver needs a real value.
 
-The file is executed as a program by `runcompss`, which owns the runtime
-lifecycle: give it a `main()` and an `if __name__ == "__main__":` guard, and do
-NOT call `compss_start()` or `compss_stop()` yourself.
+The server runs the file as `<python> -m pycompss ... workflow.py`, which owns
+the runtime lifecycle: give it a `main()` and an `if __name__ == "__main__":`
+guard, and do NOT call `compss_start()` or `compss_stop()` yourself. Run as
+plain `python workflow.py` the same file would execute top to bottom with every
+decorator ignored and still exit 0 -- which is why you never launch it yourself.
 
 Do not use `subprocess`, `os.system` or `os.popen`.
 """,
