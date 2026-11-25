@@ -39,15 +39,18 @@ file must use differ, and those come from the engine's skill files.
 
 | Agent | Responsibility |
 |---|---|
-| `orchestrator` | Reviews each agent's output. **It never sends an agent back** — when it finds a problem it corrects it itself (`tasks_override`, `requirements_override`) and the corrected version goes forward on a fixed route. |
+| `orchestrator` | Reviews each agent's output. The forward route is fixed; what it chooses is whether to send an agent **back once** with feedback — the planner when the plan is wrong, the explorer when an expected output is missing. It corrects the installer's package list itself (`requirements_override`), since the installer has no model to revise with. |
 | `planner` | Reads the paper and goal; produces quantitative literature findings, the pip stack (`stack_decision`), the environment modules (`modules`), and an ordered task list. |
 | `installer` | Phase 1 writes `work/builds/requirements.txt` from the planner's stack and stops for approval. Phase 2 pip-installs the approved list, under `modules` when the domain names any. It has no language model. |
 | `explorer` | Runs a ReAct loop against the engine's MCP server: writes the workflow files, runs them, reads the output, installs what is missing, retries failures. |
 
-The route is a fixed table in `src/agents.py`; the orchestrator's `next` and
-`feedback` fields are ignored and blanked. Re-entering an agent costs a full LLM
-session — plus a PDF re-read for the planner — and was observed to return the
-same output, so the orchestrator corrects rather than re-asks.
+The forward route is a fixed table in `src/agents.py`. Each agent may be sent
+back **at most once per run** (`MAW_MAX_REVISIONS`, default 1), and only with
+non-empty feedback — a revision with nothing to change regenerates the same
+output, so an empty one is refused and the run proceeds. The explorer is sent
+back only for a missing or wrong expected output; it already retries three times
+per problem inside its own loop, so anything it exhausted there will not improve
+on a second pass.
 
 ---
 

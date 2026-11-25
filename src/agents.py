@@ -47,6 +47,11 @@ _PDF_TEXT_CACHE: dict[tuple, str] = {}
 
 PDF_MAX_CHARS = int(os.getenv("MAW_PDF_MAX_CHARS", "120000"))
 
+#: How many times the orchestrator may send ONE agent back. Per agent, per run.
+#: Only the planner and the explorer are revisable; the installer is corrected
+#: with a list instead, having no model to revise with.
+MAX_REVISIONS = int(os.getenv("MAW_MAX_REVISIONS", "1"))
+
 
 def _extract_pdf_text(pdf_path: str) -> str:
     """Extract and cache a paper's text, keyed on (path, mtime, size).
@@ -695,9 +700,15 @@ class Orchestrator(Agent):
         # orchestrator reviewed the plan with no idea which engine it was for
         # and took its cue from the systems/ skill index instead.
         _engine = state.get("engine", "parsl")
+        # .value, not the member: AgentSteps is a str Enum, and f-string
+        # formatting of one yields "AgentSteps.PLANNER_COMPLETE" rather than
+        # "planner_complete" -- so the prompt that tells the orchestrator to
+        # compare current_step against a literal string never matched.
+        _step_now = state.get("current_step", "")
+        _step_now = getattr(_step_now, "value", _step_now)
         parts = [
             f"Goal: {state['goal']}",
-            f"Current step: {state['current_step']}",
+            f"Current step: {_step_now}",
             f"Workflow engine for this run: {_engine} (fixed by --engine -- review "
             f"every task against THIS engine and no other)",
         ]
@@ -800,50 +811,82 @@ class Orchestrator(Agent):
                     HumanMessage(content=_human),
                 ], "orchestrator")
 
-        # ---- ROUTING IS DETERMINISTIC. THE MODEL DOES NOT CHOOSE. -----
-        #
-        # The pipeline is fixed:
+        # ---- ROUTING: FORWARD BY DEFAULT, ONE REVISION EACH ------------
         #
         #   orchestrator -> planner -> orchestrator -> installer
         #     -> orchestrator -> installer (pass 2) -> explorer
         #     -> orchestrator -> end
         #
-        # The orchestrator is a MESSENGER, with exactly one exception: the
-        # installer's package list, which it corrects ITSELF via
-        # requirements_override. It does not direct the planner, it does not
-        # direct the explorer, and it never sends an agent back.
+        # The forward route is a property of the step, so the model is not
+        # asked for it. What the model MAY ask for is a revision, and each
+        # agent gets AT MOST ONE per run:
         #
-        # WHATEVER THE PLANNER PRODUCES STANDS, EVEN IF IT IS WRONG. The
-        # planner owns the plan; the explorer reports what happened. Routing
-        # back to either costs a full LLM session (plus a PDF re-read for the
-        # planner) and, observed repeatedly, returns the same output.
+        #   planner  -- the plan is wrong. Feedback says what to change.
+        #   explorer -- an EXPECTED OUTPUT IS MISSING OR WRONG. Nothing else:
+        #               the explorer already retries inside its own ReAct loop,
+        #               three attempts per problem, so sending it back over
+        #               something it already exhausted re-does that work and
+        #               ends the same way. A deliverable that never appeared is
+        #               the one thing a second pass can actually change.
         #
-        # `result.next` is therefore IGNORED. Earlier versions honoured it
-        # and policed it afterwards -- first with a revision cap, then with a
-        # vacuous-reason guard. Both were treating the symptom: if the route
-        # is a property of the step, the model should not be asked for it.
-        _ROUTE = {
+        # The cap is the point. Re-entering the planner costs a full LLM
+        # session plus a PDF re-read, and an uncapped version of this was
+        # observed looping on the same objection; one round catches a genuinely
+        # bad result without letting a stubborn model stall the run.
+        _FORWARD = {
             AgentSteps.START: "planner",
             AgentSteps.PLANNER_COMPLETE: "installer",
             AgentSteps.INSTALLER_REQUIREMENTS_PENDING_APPROVAL: "installer",
             AgentSteps.INSTALLER_COMPLETE: "explorer",
             AgentSteps.EXPLORER_COMPLETE: "end",
         }
+        #: step -> (agent it may be sent back to, the counter that caps it)
+        _REVISABLE = {
+            AgentSteps.PLANNER_COMPLETE:  ("planner",  "planner_revisions"),
+            AgentSteps.EXPLORER_COMPLETE: ("explorer", "explorer_revisions"),
+        }
+
         _step = state.get("current_step")
         _asked = result.next
-        result.next = _ROUTE.get(_step, "end")
-        if _asked != result.next:
+        _forward = _FORWARD.get(_step, "end")
+        result.next = _forward
+        revision_update: dict = {}
+
+        _back, _counter = _REVISABLE.get(_step, (None, None))
+        if _back and _asked == _back:
+            _used = state.get(_counter, 0) or 0
+            if _used >= MAX_REVISIONS:
+                console.print(
+                    f"[yellow][orchestrator] asked to revise {_back} again; "
+                    f"already used its {MAX_REVISIONS} revision(s), so the run "
+                    f"proceeds to {_forward}[/yellow]"
+                )
+            elif not result.feedback.strip():
+                # A revision with nothing to change regenerates the same
+                # output. The feedback IS the instruction, so without one
+                # there is no revision to make.
+                console.print(
+                    f"[yellow][orchestrator] asked to revise {_back} with no "
+                    f"feedback; a revision with nothing to change returns the "
+                    f"same output, so the run proceeds to {_forward}[/yellow]"
+                )
+            else:
+                result.next = _back
+                revision_update[_counter] = _used + 1
+                console.print(
+                    f"[yellow][orchestrator] sending {_back} back "
+                    f"({_used + 1}/{MAX_REVISIONS})[/yellow]"
+                )
+        elif _asked != result.next:
             console.print(
-                f"[dim yellow][orchestrator] asked for {_asked}; the route from "
-                f"{_step} is {result.next}[/dim yellow]"
+                f"[dim yellow][orchestrator] asked for {_asked}; the route "
+                f"from {_step_now} is {result.next}[/dim yellow]"
             )
 
-        # THE TWO EXCEPTIONS. The orchestrator never sends an agent back, so the
-        # only way it can act on an objection is to fix the thing itself and let
-        # the fixed version travel forward on the normal route.
+        # The installer is the one agent that cannot act on prose: it has no
+        # language model, so a different LIST is the only thing that changes
+        # what it installs.
         if _step == AgentSteps.INSTALLER_REQUIREMENTS_PENDING_APPROVAL:
-            # The installer has no language model, so a different list is the
-            # only thing that changes the outcome.
             if result.requirements_override:
                 console.print(
                     "[yellow][orchestrator] correcting requirements.txt to: "
@@ -851,23 +894,11 @@ class Orchestrator(Agent):
                 )
             result.requirements_approved = True
 
-        tasks_update: dict = {}
-        if _step == AgentSteps.PLANNER_COMPLETE and result.tasks_override:
-            # The corrected plan goes forward to the installer on the fixed
-            # route; the planner is not re-entered.
-            tasks_update["tasks"] = result.tasks_override
-            console.print(
-                f"[yellow][orchestrator] replacing the planner's "
-                f"{len(state.get('tasks', []))} task(s) with "
-                f"{len(result.tasks_override)} corrected task(s)[/yellow]"
-            )
-
-        # FEEDBACK GOES NOWHERE. The installer is corrected with a list, not
-        # with prose, and no other agent is ever revised -- so there is no
-        # recipient for a feedback string. Blanked rather than merely ignored,
-        # so it cannot reach a prompt by some later edit. `reasoning` is kept:
-        # it goes to the run log and the console, for the operator.
-        result.feedback = ""
+        # Feedback reaches the agent being revised, and nobody else: on a
+        # forward step there is no recipient, and leaving a stale string in
+        # state would put it in front of the next agent to read it.
+        if not revision_update:
+            result.feedback = ""
 
         panel_body = f"[bold]Routing to:[/bold] [green]{result.next}[/green]\n\n[bold]Reasoning:[/bold]\n{result.reasoning}"
         if result.feedback:
@@ -886,11 +917,6 @@ class Orchestrator(Agent):
                     "reasoning":  result.reasoning[:500],
                 }) + "\n")
 
-        # NO REVISION COUNTERS. No agent is re-entered, so nothing can be a
-        # revision. The counters stay in AgentState for trace compatibility
-        # and are never incremented.
-        revision_update = {}
-
         state_update = {
             "next":                  result.next,
             "orchestrator_feedback": result.feedback,
@@ -898,7 +924,6 @@ class Orchestrator(Agent):
             "requirements_approved": result.requirements_approved,
             "requirements_override": result.requirements_override,
             "current_step":          f"orchestrator_routed_to_{result.next}",
-            **tasks_update,
             **revision_update,
         }
 

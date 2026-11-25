@@ -40,9 +40,9 @@ class AgentState(TypedDict):
     current_step:          str
     orchestrator_feedback: str
     next:                  str
-    #: ALWAYS 0. No agent is ever re-entered, so nothing can be a revision.
-    #: Kept so an archived trace from when the orchestrator could send agents
-    #: back still deserializes, and so the dashboard's columns do not move.
+    #: Revisions used, each capped at MAX_REVISIONS. installer_revisions is
+    #: always 0: the installer has no model, so it is corrected with
+    #: requirements_override rather than revised.
     planner_revisions:     int
     installer_revisions:   int
     explorer_revisions:    int
@@ -68,30 +68,17 @@ class OrchestratorOutput(BaseModel):
     #: the installer receives a list.
     reasoning:             str
 
-    #: IGNORED. The route is a property of current_step, looked up in
-    #: Orchestrator.action's _ROUTE table:
-    #:
-    #:   start                                   -> planner
-    #:   planner_complete                        -> installer
-    #:   installer_requirements_pending_approval -> installer   (pass 2)
-    #:   installer_complete                      -> explorer
-    #:   explorer_complete                       -> end
-    #:
-    #: Kept in the schema because the model fills it in and the trace records
-    #: what it asked for, which is worth seeing when it disagrees. Earlier
-    #: versions honoured it and policed the result afterwards -- a revision
-    #: cap, then a vacuous-reason guard. Both treated the symptom: if the
-    #: route follows from the step, the model should not be asked for it.
+    #: The FORWARD route is a property of current_step and is not read from
+    #: here. What IS read is a revision request: "planner" at planner_complete,
+    #: or "explorer" at explorer_complete when an expected output is missing.
+    #: Each is honoured at most MAX_REVISIONS times and only with non-empty
+    #: feedback; any other value is replaced by the forward route and logged.
     next:                  Literal["planner", "installer", "explorer", "end"]
 
-    #: IGNORED AND BLANKED before the state update. There is no recipient:
-    #: the installer is corrected with a list rather than with prose, and no
-    #: other agent is ever re-entered.
-    #:
-    #: WHATEVER THE PLANNER PRODUCES STANDS, EVEN IF IT IS WRONG. The planner
-    #: owns the plan and the explorer reports what happened; sending either
-    #: back costs a full LLM session, plus a PDF re-read for the planner, and
-    #: returns the same output.
+    #: What the agent being revised must change. REQUIRED for a revision --
+    #: a revision with nothing to change regenerates the same output, so an
+    #: empty one is refused and the run proceeds forward instead. Blanked on
+    #: a forward step, where there is no recipient.
     feedback:              str
 
     #: Whether the pending requirements.txt installs as written. The code sets
@@ -104,13 +91,6 @@ class OrchestratorOutput(BaseModel):
     #: list to disk and runs pip -- so a different list is the only thing that
     #: alters the outcome, and the orchestrator supplies it itself.
     requirements_override: list[str] = []
-
-    #: The corrected TASK list, when the orchestrator finds a problem in the
-    #: planner's output. Same principle as requirements_override: the
-    #: orchestrator fixes it rather than sending it back, because the planner
-    #: owns the plan and re-entering it costs a full LLM session plus a PDF
-    #: re-read, observed to return the same output. Empty means no correction.
-    tasks_override:        list[str] = []
 
     #: First call only.
     skill_requests:        list[str] = []

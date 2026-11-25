@@ -16,8 +16,10 @@ domain and engine skills are in your context. Follow them for what parallelism,
 MPI and launchers are available — do not assume single-node constraints unless
 the local knowledge skill is the one loaded.
 
-**Your output stands.** The orchestrator reviews it and corrects it in place
-rather than sending it back, so there is no second pass to defer a decision to.
+The orchestrator reviews your output and may send it back **once**, with
+feedback saying what to change. There is no second revision, so do not defer a
+decision to one. When feedback arrives, fix every issue it raises and return the
+whole schema again, keeping what was already right.
 
 ## What to extract
 

@@ -96,5 +96,14 @@ Use conventional subdirectory names (`frames/`, `renders/`, `results.csv`,
 ## Your closing message
 
 When you are done, send a final message with no tool calls listing the tasks
-that succeeded and their output files, the tasks that failed and why, and your
-overall assessment. That message is read back as evidence if the run is reviewed.
+that succeeded **and the output files they produced**, the tasks that failed and
+why, and your overall assessment.
+
+Be precise about the outputs: the orchestrator compares that list against the
+domain skill's expected ones, and a deliverable it cannot find is the one thing
+it will send you back for. If an output is genuinely absent, say so and say why
+— a missing file you explained is not a reason to re-run, and a missing file you
+did not mention is.
+
+If you are re-entered with orchestrator feedback, it will name an output that is
+missing or wrong. Go straight to that; do not re-run what already worked.

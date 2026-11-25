@@ -27,8 +27,11 @@ IMPORTANT CONSTRAINTS ON TASKS:
 - Follow the environment knowledge injected into your context (local or HPC) for
   what parallelism, MPI, and job launcher commands are appropriate.
 
-Your output STANDS. The orchestrator corrects it in place rather than sending it
-back, so there is no second pass to defer a decision to.\
+HANDLING ORCHESTRATOR FEEDBACK:
+If the input ends with "Orchestrator feedback", that is the orchestrator sending
+this plan back for ONE revision. Fix every issue it raises and return the whole
+schema again, keeping what was already right. There is no second revision, so
+do not defer anything.\
 """
 
 # condition A version of the planner prompt, same deal as the orchestrator one above
@@ -72,6 +75,9 @@ IMPORTANT CONSTRAINTS ON TASKS:
 - Follow the environment knowledge injected into your context (local or HPC) for
   what parallelism, MPI, and job launcher commands are appropriate.
 
-Your output STANDS. The orchestrator corrects it in place rather than sending it
-back, so there is no second pass to defer a decision to.\
+HANDLING ORCHESTRATOR FEEDBACK:
+If the input ends with "Orchestrator feedback", that is the orchestrator sending
+this plan back for ONE revision. Fix every issue it raises and return the whole
+schema again, keeping what was already right. There is no second revision, so
+do not defer anything.\
 """

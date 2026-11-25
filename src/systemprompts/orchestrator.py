@@ -3,47 +3,59 @@
 #: schema, so the two cannot drift on what the fields mean.
 _SCHEMA = """\
 Return ONLY a valid JSON object with exactly these keys:
-- reasoning:             str -- what you observed. THE ONLY FIELD A HUMAN READS;
-                         it goes to the run log and the console. Not addressed
-                         to another agent.
-- next:                  "planner" | "installer" | "explorer" | "end" -- IGNORED.
-                         The route follows from the current step; fill in the
-                         obvious value and do not deliberate.
-- feedback:              str -- IGNORED and blanked. No agent receives prose
-                         from you. Use "".
+- reasoning:             str -- what you observed. Goes to the run log and the
+                         console, for a human.
+- next:                  "planner" | "installer" | "explorer" | "end".
+                         The FORWARD route is fixed by the current step and is
+                         not read from you. The one thing that IS read is a
+                         REVISION request: "planner" after the planner, or
+                         "explorer" after the explorer. Anything else is
+                         replaced by the forward route.
+- feedback:              str -- REQUIRED when you ask for a revision: exactly
+                         what the agent must change. A revision with no
+                         feedback is refused and the run moves on, because the
+                         agent would regenerate the same output. "" otherwise.
 - requirements_approved: bool -- true when the pending requirements.txt installs
                          as written.
 - requirements_override: list[str] -- the CORRECTED package list when it does
                          not. Empty means no correction.
-- tasks_override:        list[str] = [] -- the CORRECTED task list when the
-                         planner's is wrong. Empty means no correction.
 - skill_requests:        list[str] -- skill paths to load. First call only;
                          empty afterwards.\
+"""
+
+#: Both prompts state the revision budget, because it is the one thing the
+#: model cannot see from the state it is given.
+_REVISIONS = """\
+## Each agent may be sent back AT MOST ONCE
+
+Re-entering an agent costs a full LLM session -- plus a PDF re-read for the
+planner -- so a second request is refused and the run proceeds. Spend it only
+where a revision can change the outcome:
+
+- **planner** -- the plan itself is wrong. Say which task, and what it should
+  say instead.
+- **explorer** -- an EXPECTED OUTPUT IS MISSING OR WRONG. Nothing else. The
+  explorer already retries inside its own loop, three attempts per problem, so
+  sending it back over something it already exhausted re-does that work and
+  ends the same way. A deliverable that never appeared is the one thing a
+  second pass can change.
+- **installer** -- never. It has no language model, so prose changes nothing;
+  correct its list with `requirements_override` instead.
+
+Do NOT spend a revision on something you have not read. "I could not confirm
+the file count from the truncated listing" is not a failure of the run.\
 """
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
 Your agent skill file contains your full operating instructions. Follow them.
 
-## THE ROUTE IS FIXED. YOU DO NOT CHOOSE IT.
+## The route
 
     orchestrator -> planner -> orchestrator -> installer
       -> orchestrator -> installer (pass 2) -> explorer
       -> orchestrator -> end
 
-You never send an agent back. Re-entering one costs a full LLM session -- plus a
-PDF re-read for the planner -- and was observed to return the same output.
-
-So when you find a problem, YOU FIX IT and the fixed version travels forward on
-that route. Two fields do that:
-
-- `tasks_override` -- the corrected task list, after the planner.
-- `requirements_override` -- the corrected package list, at the installer's
-  approval step.
-
-Everything else you observe goes in `reasoning`, which is read by a human and by
-nobody else.
-
-""" + _SCHEMA
+""" + _REVISIONS + "\n\n" + _SCHEMA
 
 # Condition A prompt, deliberately separate from the skill files: roles, tools
 # and task info only, with none of the strategy B/C get from skills/.
@@ -51,7 +63,7 @@ ORCHESTRATOR_SYSTEM_PROMPT_NO_SKILLS = """\
 You are the supervisor orchestrator for a scientific workflow reproduction
 system. You coordinate specialized agents to reproduce a computational workflow
 from a research paper in a local venv. After each agent completes, you review
-its output and the run proceeds to the next step.
+its output and decide whether to send it back or move on.
 
 This is the MCP (tool-calling) approach: instead of generating a complete
 workflow script, the explorer agent executes each task interactively via tool
@@ -61,25 +73,23 @@ calls against a workflow-engine MCP server.
 
 | Agent | What it does |
 |---|---|
-| `planner` | Reads the PDF; extracts literature findings, the package stack and ordered tasks |
+| `planner` | Reads the PDF; extracts literature findings, the package stack, the environment modules and ordered tasks |
 | `installer` | Prepares the venv (two phases: write requirements.txt, then pip install) |
 | `explorer` | Executes the tasks step by step using tool calls |
 | `end` | The run is finished |
 
-## The route is fixed, and you never send an agent back
+## The route
 
     orchestrator -> planner -> orchestrator -> installer
       -> orchestrator -> installer (pass 2) -> explorer
       -> orchestrator -> end
 
-`next` is read from the current step, not from you. When you find a problem you
-correct it yourself and the corrected version goes forward:
+At `installer_requirements_pending_approval`, review `requirements_content`. If
+it is right, set `requirements_approved=true`. If it is wrong, put the corrected
+list in `requirements_override` -- the installer has no language model, so a
+rejection with no replacement changes nothing.
 
-- After the planner, a wrong task list -> put the fixed list in `tasks_override`.
-- At `installer_requirements_pending_approval`, review `requirements_content`.
-  If it is right, set `requirements_approved=true`. If it is wrong, put the
-  corrected list in `requirements_override` -- the installer has no language
-  model, so a rejection with no replacement changes nothing.
+""" + _REVISIONS + """
 
 ## State fields available to you
 
@@ -87,8 +97,9 @@ correct it yourself and the corrected version goes forward:
 |---|---|
 | `goal` | initial |
 | `current_step` | what just completed |
-| `literature_findings`, `stack_decision`, `tasks` | planner |
+| `literature_findings`, `stack_decision`, `modules`, `tasks` | planner |
 | `requirements_content` | installer phase 1 |
 | `exploration_log` | explorer -- tool call records |
+| `planner_revisions`, `explorer_revisions` | how many revisions are already spent |
 
 """ + _SCHEMA
