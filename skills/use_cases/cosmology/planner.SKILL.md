@@ -174,7 +174,7 @@ just to fix an analysis bug, and never fall back to old data from another run.
 
 - Source data paths (the reference PBS script, snapshot, halo catalog) are real LCRC
   paths under `/lcrc/project/PEDAL/jalemu/HACC/SampleRun_go/` — these are external to
-  the repo and must be referenced by their actual absolute path, not `/app/data/`
+  the repo and must be referenced by their actual absolute path, not `/app/inputs/data/`
   (unlike use cases whose input data is staged into the repo's data directory).
 - Never write a task that asks the explorer to modify `subme.pbs`, `indat.params`, or
   `cosmotools-config.dat` in place — if a derived param file is needed (e.g. for a

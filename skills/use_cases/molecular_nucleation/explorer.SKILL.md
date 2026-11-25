@@ -65,7 +65,7 @@ import os, shutil
 os.makedirs("/app/work/run0/frames", exist_ok=True)
 os.makedirs("/app/work/run0/renders", exist_ok=True)
 for f in ("AW.tersoff", "data.init", "in.watbox"):
-    shutil.copy2(f"/app/data/{f}", f"/app/work/run0/{f}")
+    shutil.copy2(f"/app/inputs/data/{f}", f"/app/work/run0/{f}")
 ```
 
 Copy all three fresh on every run — the user may have edited `in.watbox`.
@@ -381,6 +381,6 @@ that the trace checks this against.
 
 ## Input Files
 
-- `/app/data/in.watbox` -- LAMMPS input script. Parameters: `run 9000`, `timestep 0.01`, `variable T equal 180`, `variable P equal 1.0`. DO NOT modify.
-- `/app/data/data.init` -- initial atom positions
-- `/app/data/AW.tersoff` -- Tersoff force field for water
+- `/app/inputs/data/in.watbox` -- LAMMPS input script. Parameters: `run 9000`, `timestep 0.01`, `variable T equal 180`, `variable P equal 1.0`. DO NOT modify.
+- `/app/inputs/data/data.init` -- initial atom positions
+- `/app/inputs/data/AW.tersoff` -- Tersoff force field for water

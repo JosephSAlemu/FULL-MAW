@@ -22,7 +22,7 @@ from rich.panel import Panel
 
 import mcp_explorer
 from mcp_explorer import _explorer_async
-from trace_logger import tracer, extract_usage, message_to_dict
+from tracing.trace_logger import tracer, extract_usage, message_to_dict
 import warnings
 
 from pypdf import PdfReader
@@ -33,8 +33,8 @@ from pypdf import PdfReader
 # as an import side effect of this module importing that one. It belongs
 # beside the PdfReader it is for.
 warnings.filterwarnings("ignore", module="pypdf")
-from src.states import PlannerOutput, InstallerOutput, OrchestratorOutput, AgentState, AgentSteps
-from src.utility import (_list_skills, _env_knowledge, _invoke_structured,
+from states import PlannerOutput, InstallerOutput, OrchestratorOutput, AgentState, AgentSteps
+from utility import (_list_skills, _env_knowledge, _invoke_structured,
                          _read_skill, _resolve_use_case_skill)
 from common.consts import BUILDS_PATH
 from systemprompts.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_SYSTEM_PROMPT_NO_SKILLS
@@ -202,7 +202,7 @@ class Planner(RemoteLoggingAgent):
                 _sys_prompt = (PLANNER_PROMPT_NO_SKILLS + _env_section + _domain_section
                                + "\n\n" + PROJECT_LAYOUT)
             _data_files = state.get("selected_data_files", [])
-            _data_section = (f"\n\nAvailable input data files (in /app/data/):\n" +
+            _data_section = (f"\n\nAvailable input data files (in /app/inputs/data/):\n" +
                              "\n".join(f"  - {f}" for f in _data_files)) if _data_files else ""
             # State the engine in the message too, not just the skill index: the
             # tasks this returns have to be expressible in it, and the
@@ -362,50 +362,105 @@ class Installer(RemoteLoggingAgent):
 
     @action
     async def installer(self, state: AgentState) -> dict:
-        """Write requirements.txt from stack_decision, then install it. ONE pass.
+        """Two-phase: write requirements.txt, wait for approval, then install.
 
-        This used to be TWO passes gated on `requirements_approved`: write the
-        file, return INSTALLER_REQUIREMENTS_PENDING_APPROVAL, wait for the
-        orchestrator to approve, then run again to pip install. That made the
-        routing path
+            pass 1  write the file, return INSTALLER_REQUIREMENTS_PENDING_APPROVAL
+            pass 2  (requirements_approved) pip install it
 
-            ... -> installer -> orchestrator -> installer -> orchestrator -> ...
+        so the routing path is
 
-        and the gate never worked as intended, because this agent has no
-        language model: it writes `stack_decision` to disk and nothing else. A
-        rejection could not change what the next pass produced, so an
-        orchestrator that disliked a package regenerated the identical file
-        forever. The gate cost an extra round trip and bought nothing.
+            planner -> installer -> orchestrator -> installer -> orchestrator -> explorer
 
-        Now it writes and installs in one action, and the orchestrator reviews
-        the OUTCOME -- what was installed, whether pip succeeded, which MPI the
-        bindings linked -- which is something it can actually act on by routing
-        to planner (who owns stack_decision) or to explorer (to proceed).
+        WHAT THE GATE CAN AND CANNOT DO. This agent has no language model: it
+        writes `stack_decision` to disk and nothing else. So orchestrator
+        feedback CANNOT change what a second pass produces -- rejecting and
+        re-routing here regenerates a byte-identical file.
+
+        What the gate does buy, and the reason it is worth a round trip: the
+        orchestrator gets to see the package list BEFORE anything is installed,
+        and the fix for a list it dislikes is to route to `planner`, who owns
+        stack_decision. Rejecting into the installer is the dead end; rejecting
+        into the planner is the point.
+
+        Pass 1 therefore says so explicitly in its output, so an orchestrator
+        that rejects knows where to send the work. `installer_revisions` still
+        counts re-entries, and the orchestrator's revision cap stops a loop if
+        it ignores that.
         """
         try:
             tracer.log_agent_start("installer")
             # BUILDS_PATH, not __file__-relative: this module lives in src/, so
             # "the directory holding this file" would put requirements.txt in
             # src/builds/. Everything else -- the installer skills,
-            # PROJECT_LAYOUT, the README, the explorer resolving /app/builds/ --
-            # means the repo-root builds/.
+            # PROJECT_LAYOUT, the README, the explorer resolving /app/work/builds/ --
+            # means work/builds/.
             os.makedirs(BUILDS_PATH, exist_ok=True)
             requirements_path = os.path.join(BUILDS_PATH, "requirements.txt")
 
-            stack = [pkg for pkg in state.get("stack_decision", []) if pkg]
+            # requirements_override wins over stack_decision. It is the
+            # orchestrator's corrected list, and the orchestrator is the only
+            # agent that reviews the file -- see the gate in Orchestrator.
+            override = [pkg for pkg in state.get("requirements_override", []) if pkg]
+            stack = override or [pkg for pkg in state.get("stack_decision", []) if pkg]
 
-            # Always regenerate. A requirements.txt on disk is from a previous
-            # run -- possibly a different engine or domain -- and reusing it is
-            # how a stale package reaches the venv.
-            content = "\n".join(stack) + ("\n" if stack else "")
-            with open(requirements_path, "w") as f:
-                f.write(content)
+            # ---- PASS 1: write, then stop for approval --------------------
+            if not state.get("requirements_approved"):
+                # Always regenerate. A requirements.txt on disk is from a
+                # previous run -- possibly a different engine or domain -- and
+                # reusing it is how a stale package reaches the venv. This also
+                # means a re-entry produces the same bytes; see the docstring.
+                content = "\n".join(stack) + ("\n" if stack else "")
+                with open(requirements_path, "w") as f:
+                    f.write(content)
 
-            console.print(Panel(
-                content or "(empty)",
-                title="[bold cyan]requirements.txt[/bold cyan]",
-                border_style="cyan",
-            ))
+                console.print(Panel(
+                    content or "(empty)",
+                    title="[bold yellow]requirements.txt -- Pending Orchestrator "
+                          "Approval[/bold yellow]",
+                    border_style="yellow",
+                ))
+
+                _feedback = state.get("orchestrator_feedback", "")
+
+                console.print("[dim yellow][installer] waiting for orchestrator "
+                              "approval...[/dim yellow]")
+                tracer.log_agent_output("installer", {
+                    "status": "pending approval",
+                    "packages": content.strip(),
+                    "count": len(stack),
+                    "regenerated_identical": bool(_feedback),
+                })
+                tracer.log_agent_end("installer")
+                return {
+                    "requirements_content": content,
+                    "current_step": AgentSteps.INSTALLER_REQUIREMENTS_PENDING_APPROVAL,
+                }
+
+            # ---- PASS 2: approved, install --------------------------------
+            # An override means the orchestrator approved a DIFFERENT list from
+            # the one pass 1 wrote, so the file on disk is stale: rewrite it
+            # before reading it back, or pip installs the rejected set.
+            if override:
+                content = "\n".join(override) + "\n"
+                with open(requirements_path, "w") as f:
+                    f.write(content)
+                console.print(Panel(
+                    content,
+                    title="[bold cyan]requirements.txt -- corrected by the "
+                          "orchestrator[/bold cyan]",
+                    border_style="cyan",
+                ))
+
+            # Read back rather than rebuilding from stack_decision: the
+            # orchestrator approved the FILE, and rebuilding here would install
+            # something it never saw if stack_decision changed in between.
+            if os.path.isfile(requirements_path):
+                with open(requirements_path) as f:
+                    content = f.read()
+                stack = [ln.strip() for ln in content.splitlines()
+                         if ln.strip() and not ln.startswith("#")]
+            else:
+                content = "\n".join(stack) + ("\n" if stack else "")
 
             if not stack:
                 console.print("[dim cyan][installer] no packages to install[/dim cyan]")
@@ -749,53 +804,63 @@ class Orchestrator(Agent):
                     HumanMessage(content=_human),
                 ], "orchestrator")
 
-        # Hard overrides: lock routing at deterministic transition points.
+        # ---- ROUTING IS DETERMINISTIC. THE MODEL DOES NOT CHOOSE. -----
         #
-        # There is no INSTALLER_REQUIREMENTS_PENDING_APPROVAL case any more.
-        # The installer writes and installs in one action, so the only step it
-        # can report is INSTALLER_COMPLETE, and the path is
-        #     planner -> installer -> orchestrator -> explorer
-        # with exactly one orchestrator review of the install.
-        if state.get("current_step") == AgentSteps.INSTALLER_COMPLETE:
-            result.next = "explorer"
-        elif state.get("current_step") == AgentSteps.EXPLORER_COMPLETE:
-            # A VERIFICATION PASS IS NOT A REVISION. Once the explorer has run
-            # the workflow and its tool calls succeeded, the work is done --
-            # what remains is the orchestrator wanting to see more of it, and
-            # that is a reason to read the outputs, not to start the agent
-            # again. A second pass costs a full LLM session to re-list
-            # directories and re-read logs the first pass already wrote.
-            #
-            # So the route back is allowed only for something the explorer can
-            # actually fix:
-            #   * a failed tool call, or
-            #   * an ENGINE USAGE WARNING (the generated file did not exercise
-            #     the real engine).
-            # "I could not confirm X from the truncated output" is neither.
-            #
-            # Even then, one revision only.
-            log = state.get("exploration_log", [])
-            failures = [e for e in log if not e.get("succeeded", False)]
-            unverified = [e for e in log if e.get("engine_verified") is False]
-            explorer_revs = state.get("explorer_revisions", 0)
+        # The pipeline is fixed:
+        #
+        #   orchestrator -> planner -> orchestrator -> installer
+        #     -> orchestrator -> installer (pass 2) -> explorer
+        #     -> orchestrator -> end
+        #
+        # The orchestrator is a MESSENGER, with exactly one exception: the
+        # installer's package list, which it corrects ITSELF via
+        # requirements_override. It does not direct the planner, it does not
+        # direct the explorer, and it never sends an agent back.
+        #
+        # WHATEVER THE PLANNER PRODUCES STANDS, EVEN IF IT IS WRONG. The
+        # planner owns the plan; the explorer reports what happened. Routing
+        # back to either costs a full LLM session (plus a PDF re-read for the
+        # planner) and, observed repeatedly, returns the same output.
+        #
+        # `result.next` is therefore IGNORED. Earlier versions honoured it
+        # and policed it afterwards -- first with a revision cap, then with a
+        # vacuous-reason guard. Both were treating the symptom: if the route
+        # is a property of the step, the model should not be asked for it.
+        _ROUTE = {
+            AgentSteps.START: "planner",
+            AgentSteps.PLANNER_COMPLETE: "installer",
+            AgentSteps.INSTALLER_REQUIREMENTS_PENDING_APPROVAL: "installer",
+            AgentSteps.INSTALLER_COMPLETE: "explorer",
+            AgentSteps.EXPLORER_COMPLETE: "end",
+        }
+        _step = state.get("current_step")
+        _asked = result.next
+        result.next = _ROUTE.get(_step, "end")
+        if _asked != result.next:
+            console.print(
+                f"[dim yellow][orchestrator] asked for {_asked}; the route from "
+                f"{_step} is {result.next}[/dim yellow]"
+            )
 
-            if result.next == "explorer" and log:
-                if not failures and not unverified:
-                    console.print(
-                        f"[dim yellow][orchestrator] explorer completed with "
-                        f"{len(log)} tool call(s), none failed and no engine "
-                        f"warning -- ending instead of re-running for "
-                        f"verification[/dim yellow]"
-                    )
-                    result.next = "end"
-                    result.feedback = ""
-                elif explorer_revs >= 1:
-                    console.print(
-                        "[dim yellow][orchestrator] explorer already revised "
-                        "once -- ending[/dim yellow]"
-                    )
-                    result.next = "end"
-                    result.feedback = ""
+        # THE ONE EXCEPTION. At the approval step the orchestrator may replace
+        # the package list -- the installer has no language model, so a
+        # different list is the only thing that changes the outcome.
+        if _step == AgentSteps.INSTALLER_REQUIREMENTS_PENDING_APPROVAL:
+            if result.requirements_override:
+                result.requirements_approved = True
+                console.print(
+                    "[yellow][orchestrator] correcting requirements.txt to: "
+                    f"{', '.join(result.requirements_override)}[/yellow]"
+                )
+            else:
+                result.requirements_approved = True
+
+        # FEEDBACK GOES NOWHERE. The installer is corrected with a list, not
+        # with prose, and no other agent is ever revised -- so there is no
+        # recipient for a feedback string. Blanked rather than merely ignored,
+        # so it cannot reach a prompt by some later edit. `reasoning` is kept:
+        # it goes to the run log and the console, for the operator.
+        result.feedback = ""
 
         panel_body = f"[bold]Routing to:[/bold] [green]{result.next}[/green]\n\n[bold]Reasoning:[/bold]\n{result.reasoning}"
         if result.feedback:
@@ -814,24 +879,17 @@ class Orchestrator(Agent):
                     "reasoning":  result.reasoning[:500],
                 }) + "\n")
 
-        already_ran = {
-            "planner":   bool(state.get("literature_findings")),
-            "installer": bool(state.get("requirements_content")),
-            "explorer":  bool(state.get("exploration_log")),
-        }
+        # NO REVISION COUNTERS. No agent is re-entered, so nothing can be a
+        # revision. The counters stay in AgentState for trace compatibility
+        # and are never incremented.
         revision_update = {}
-        if result.next in already_ran and already_ran[result.next]:
-            key = f"{result.next}_revisions"
-            revision_update[key] = state.get(key, 0) + 1
-            console.print(f"[bold yellow][orchestrator] revision #{revision_update[key]} for {result.next}[/bold yellow]")
-            tracer.log_replan(result.next, revision_update[key])
 
         state_update = {
             "next":                  result.next,
             "orchestrator_feedback": result.feedback,
-            # Kept in state for the schema's sake; the installer no longer
-            # reads it, since there is no approval gate to pass.
+            # Live again: the installer's pass 2 is gated on this.
             "requirements_approved": result.requirements_approved,
+            "requirements_override": result.requirements_override,
             "current_step":          f"orchestrator_routed_to_{result.next}",
             **revision_update,
         }

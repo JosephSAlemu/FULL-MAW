@@ -100,7 +100,7 @@ a bash launcher, or a PBS script in a task.
 2. "Create the run directory structure: /app/work/run0/frames and
    /app/work/run0/renders."
 
-3. "Copy AW.tersoff, data.init, and in.watbox from /app/data/ into /app/work/run0/.
+3. "Copy AW.tersoff, data.init, and in.watbox from /app/inputs/data/ into /app/work/run0/.
    Always re-copy in.watbox fresh — the user may have edited it — and never modify it."
 
 4. "Delete any stale frames/*.lammpstrj in /app/work/run0/ before the simulation so
@@ -179,7 +179,7 @@ package per the Stack Decision rules above if a different engine was chosen
   "tasks": [
     "Check that ovito, numpy, matplotlib, pillow are installed.",
     "Create /app/work/run0/frames/ and /app/work/run0/renders/.",
-    "Copy AW.tersoff, data.init, in.watbox from /app/data/ to /app/work/run0/ — always re-copy in.watbox fresh, never modify it.",
+    "Copy AW.tersoff, data.init, in.watbox from /app/inputs/data/ to /app/work/run0/ — always re-copy in.watbox fresh, never modify it.",
     "Delete stale frames/*.lammpstrj in /app/work/run0/ before the run.",
     "Run LAMMPS on in.watbox with /app/work/run0 as working directory: under PBS with a launcher use the cluster module lammps/22Jul2025 in a login shell with PMI_SIZE/PMI_RANK/I_MPI_HYDRA_BOOTSTRAP unset before mpirun; otherwise use the Python API single-process with os.chdir('/app/work/run0') before creating the lammps instance. Exit 11 with frames written is success; exit 143 is MPI init failure.",
     "Verify .lammpstrj frames exist in /app/work/run0/frames/ before proceeding.",

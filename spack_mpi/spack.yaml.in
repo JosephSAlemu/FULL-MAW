@@ -1,0 +1,121 @@
+# =====================================================================
+#  The MPI-LINKED ENGINES environment.
+#
+#  A Spack environment, like spack.yaml at the repo root and the recipes in
+#  spack-packages/ -- not server code. The MCP servers that DRIVE what this
+#  builds (wilkins_server.py, adios_mpmd.py) are in src/servers/.
+#
+#  It holds wilkins, which cannot be anything but MPI-linked, and -- with
+#  MAW_ADIOS=mpi -- an MPI-built adios2 (see the commented spec below). Both
+#  are then bound to this environment's one MPI, which is what MPMD requires
+#  anyway, since every block of an MPMD launch shares one MPI_COMM_WORLD.
+#
+#  Copy this to spack.yaml, then let Spack fill in the MPI:
+#
+#      module load <the MPI your domains use>
+#      cp spack.yaml.in spack.yaml
+#      spack -e . external find openmpi mpich intel-oneapi-mpi mvapich2
+#      spack -e . install
+#      spack -e . module lmod refresh -y     # or `module tcl` on a tcl site
+#
+#  `spack external find` detects the loaded MPI correctly for
+#  implementations a hand-written probe would not recognise, and writes the
+#  external into this environment's own scope. Confirm what it picked:
+#
+#      spack -e . spec wilkins | grep -i mpi
+#
+#  Spack bakes the MPI's RPATH into libwilkins, so it resolves its MPI
+#  libraries at runtime without any module. The only thing a task needs
+#  from a module is `mpirun` on PATH, which the domain's own module load
+#  supplies.
+#
+#  WHY THIS IS THE ONLY MPI ENVIRONMENT
+#  parsl and pycompss link no MPI. adios2 comes from the pip wheel, which
+#  is a serial build that still has SST -- so it links no MPI either, and
+#  a task can load any MPI its domain names without conflicting with it.
+#  Wilkins cannot be done that way: it is C++ built against an MPI and
+#  dlopens LowFive as an HDF5 VOL plugin, so it is bound to one MPI at
+#  build time.
+#
+#  CONSEQUENCE: a domain whose tools use a different MPI than the one this
+#  was built against cannot use the wilkins engine: the task's
+#  `module load wilkins/<version>` pulls in this MPI, which conflicts with
+#  the domain's, and the task errors. Nothing checks it in advance -- the
+#  failed load is the signal. Rebuild against another MPI by loading that
+#  module and re-running the script with --force.
+#
+#  Nothing here names a cluster, a version, or a path. Every value below
+#  was probed from the module that was loaded when the script ran.
+# =====================================================================
+
+spack:
+  specs:
+  - wilkins
+  - py-h5py +mpi
+  - py-mpi4py
+  # Uncomment for MAW_ADIOS=mpi. Then bootstrap.sh removes the PyPI adios2 and
+  # `--engine adios` starts src/servers/adios_mpmd.py instead of adios_sst.py.
+  # Leave it commented for MAW_ADIOS=serial: two packages named adios2 means
+  # `import adios2` resolves by PYTHONPATH order, silently.
+  #- adios2 +mpi +python +sst ~fortran ~hdf5
+  # Must be the same minor as the root environment's python: the generated wilkins
+  # module puts this environment's site-packages on PYTHONPATH, and a
+  # different minor imports as nothing at all, silently. Check with:
+  #     spack -e ../maw location -i python   # then <that>/bin/python3 --version
+  - python@3.12
+
+  view: true
+
+  concretizer:
+    # unify: true, NOT when_possible. LowFive is dlopen'd as an HDF5 VOL
+    # plugin, so it and py-h5py must resolve the SAME libhdf5;
+    # when_possible may concretize two, and the failure mode is a plugin
+    # that silently does not load rather than a build error.
+    unify: true
+    reuse: true
+
+  repos:
+    wilkins: $env/deps/wilkins
+    lowfive: $env/deps/lowfive
+
+  modules:
+    default:
+      enable: [lmod]        # tcl on an Environment Modules site
+      roots:
+        lmod: $env/modules
+        tcl: $env/modules
+      arch_folder: false
+      lmod:                 # rename to tcl: if you changed the line above
+        hierarchical: false
+        hash_length: 0
+        hide_implicits: true
+        include: [wilkins, py-mpi4py, py-h5py]
+        all:
+          autoload: direct
+          environment:
+            set:
+              '{name}_ROOT': '{prefix}'
+        projections:
+          all: '{name}/{version}'
+
+  packages:
+    # `spack external find` writes the MPI external here. Do not hand-write
+    # it: a module name is an opaque site-chosen string, and a prefix that
+    # points somewhere other than the module builds and launches cleanly,
+    # then hangs in MPI_Init.
+    #
+    # After running it, every OTHER provider should be marked unbuildable so
+    # a dependency cannot quietly pull in a second MPI. Uncomment the ones
+    # that are not yours:
+    #
+    # openmpi:
+    #   buildable: false
+    # mpich:
+    #   buildable: false
+    # intel-oneapi-mpi:
+    #   buildable: false
+    # mvapich2:
+    #   buildable: false
+
+    hdf5:
+      require: ["+mpi"]

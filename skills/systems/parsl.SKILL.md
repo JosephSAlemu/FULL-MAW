@@ -722,7 +722,7 @@ def main():
             futures.append(
                 simulate(
                     script=script,
-                    infile=f"/app/data/input_{i}",
+                    infile=f"/app/input/data/input_{i}",
                     nranks=RANKS_PER_TASK,
                     cores=f"{first}-{first + RANKS_PER_TASK - 1}",
                     rundir=rundir,

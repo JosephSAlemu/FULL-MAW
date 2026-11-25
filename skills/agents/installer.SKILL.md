@@ -32,7 +32,7 @@ The installer is a two-phase agent:
 
 ### Step 1 (Phase 1): Read or generate requirements.txt
 
-Reads `builds/requirements.txt` from disk if it exists, otherwise generates one from `stack_decision`.
+Reads `work/builds/requirements.txt` from disk if it exists, otherwise generates one from `stack_decision`.
 
 Returns:
 ```python

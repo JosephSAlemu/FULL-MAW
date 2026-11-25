@@ -76,7 +76,7 @@ If your environment knowledge is `knowledge/lcrc` (HPC mode):
 
 After the PBS check (or immediately, for local env):
 1. Check that required packages are installed (`check_package`)
-2. Verify input data files exist (`list_files` on /app/data/)
+2. Verify input data files exist (`list_files` on /app/inputs/data/)
 3. Directory creation is part of the work you hand to the engine, not a separate shell call you make
 
 ### Phase 2: Task Execution
@@ -136,7 +136,7 @@ After execution completes:
 ## Python Code Guidelines
 
 When writing the Python code you hand to the engine:
-- Use absolute paths (/app/data/, /app/work/run0/) — these are resolved to local paths by the server
+- Use absolute paths (/app/inputs/data/, /app/work/run0/) — these are resolved to local paths by the server
 - Always create output directories before writing files
 - Print results to stdout so you can observe them
 - Handle errors gracefully with try/except and informative error messages
@@ -165,7 +165,7 @@ Check the `warning` field in the response:
 ## Key Constraints
 
 - Your environment knowledge (local or HPC) is injected into your context — follow it
-- All input data is at /app/data/
+- All input data is at /app/inputs/data/
 - All output should go to /app/work/run0/
 - The venv has the packages listed in stack_decision from the planner
 - Do NOT modify input data files
@@ -174,10 +174,8 @@ Check the `warning` field in the response:
   Every CLI command is expressed to the workflow engine using that engine's own
   construct (see the engine reference in your context).
 - NEVER invoke the CLI yourself. The engine runs it.
-- NEVER type `mpirun`/`srun` as something you launch. Rank count is expressed
-  through the engine.
-- NEVER write Python that runs outside the engine. Every function that does
-  work lives in the generated workflow file.
+- NEVER type `mpirun`/`srun` as something you launch unless using the adios2 mpmd server or the wilkins server through the engine.
+- NEVER write Python that runs outside the engine. Every function that does work lives in the generated workflow file.
 
 ---
 
@@ -190,11 +188,3 @@ summary message (no tool calls) listing:
 - Overall assessment of the workflow reproduction
 
 ---
-
-## Run LAMMPS (IMPORTANT)
-
-LAMMPS is a CLI step in the generated workflow file like any other, expressed
-with this engine's own construct. Follow the use-case skill for the exact
-command, module loads, and rank count.
-
-Never modify in.watbox.

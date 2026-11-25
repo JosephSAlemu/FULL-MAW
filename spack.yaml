@@ -1,61 +1,156 @@
+# =====================================================================
+#  MAW core environment -- MPI-FREE, BY CONSTRUCTION
+#
+#  Replaces setup_hpc.sh sections 1-9. What that script computed in bash,
+#  spack_repo/maw/packages/env/package.py now computes in
+#  setup_run_environment, so that `spack env activate` is the whole setup step.
+#
+#  Build:   ./bootstrap.sh          (or: spack -e . install, from the repo root)
+#  Use:     spack env activate .    (from the repo root)
+#
+#  THE INVARIANT THIS FILE EXISTS TO HOLD: nothing installed here links MPI.
+#  setup_hpc.sh section 8c published MAW_LD_BASE as "every library directory
+#  this environment provides, with no MPI in it", and warned if any entry
+#  shipped libmpi. The `buildable: false` block at the bottom is what makes
+#  that warning unreachable rather than merely unlikely -- with no MPI
+#  provider available, a spec that needs MPI fails to concretize here
+#  instead of quietly pulling one in.
+#
+#  adios2 and wilkins are therefore NOT in this file. The serial adios2 comes
+#  from the PyPI wheel in requirements.txt; the +mpi one and wilkins live in
+#  spack_mpi/, a SEPARATE environment built against whichever MPI the operator
+#  loads. See the note at the bottom for why that cannot be a variant here.
+# =====================================================================
+
 spack:
   specs:
-  - boost
-  - openjdk@21
   - python@3.12
+  - boost
+  - libxml2
+  - papi
+  - openjdk@21
   - graphviz
-  - libtool
-  - automake
-  - autoconf
+
   - bison
   - flex
   - pkgconf
-  - libxml2
-  - papi
+  - libtool
+  - automake
+  - autoconf
+
+  - env
+  - compss@3.3.3 ~tracing ~c_binding +pycompss
+
+  # TRUE, not false, and not a dict with `exclude`.
+  #
+  # The view is a merged symlink tree. maw.env adds its lib directory to
+  # LD_LIBRARY_PATH, which is what resolves libiconv for libxml2's own probes
+  # -- `view: false` removes that along with the tree, and anything relying on
+  # a transitive library then has to find it by rpath alone.
+  #
+  # THE JAVA_HOME PROBLEM IS NOT SOLVED HERE. With a view, Spack substitutes
+  # the view root for any environment value matching a store prefix, so
+  # JAVA_HOME comes out as <env>/.spack-env/view -- and COMPSs checks for the
+  # JVM with `find "$JAVA_HOME"/lib/ -name libjvm.so`, which does not descend
+  # into a symlinked directory. Three in-file fixes were tried and all failed:
+  # excluding openjdk from the view, reading the prefix via
+  # spack.store.path_for_spec, and using a differently-named variable.
+  #
+  # What works is `spack load openjdk` AFTER activating -- it computes
+  # modifications per spec with no view, and gives the real prefix. Verified
+  # on Improv. make_worker_init should carry that line for the PBS workers.
+  view: true
 
   concretizer:
     unify: when_possible
+    reuse: true
+
+  repos:
+    # repo.yaml lives in spack_repo/maw/ -- Package API v2 requires the path to
+    # contain `spack_repo/` and derives the namespace from the directories
+    # under it, so the packages are at packages/<name>/package.py beneath it.
+    maw: $env/spack_repo/maw
+
+  env_vars:
+    set:
+      # Headless rendering -- setup_hpc.sh section 9. Literals, so they belong
+      # here rather than in package.py.
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      PYOPENGL_PLATFORM: osmesa
+      MPLBACKEND: Agg
+      OVITO_GUI_MODE: "0"
+      # The login-node knem warning from the lammps module. Harmless on compute
+      # nodes where /dev/knem exists, so setting it unconditionally costs
+      # nothing and keeps the warning out of the stderr field the agent reads.
+      OMPI_MCA_smsc: ^knem
+
+  config:
+    deprecated: true
+    # Node-local staging. ~600 small object and dependency files per
+    # package, and parallel-filesystem metadata latency dominates a
+    # parallel build -- routinely 2-3x. Configuration, not a script.
+    build_stage: [$tempdir/spack-stage-$user, $user_cache_path/stage]
 
   packages:
-    gcc:
-      externals:
-      - spec: gcc@13.2.0 languages='c,c++,fortran'
-        prefix: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-x86_64/gcc-8.5.0/gcc-13.2.0-iyqxotb
-        extra_attributes:
-          compilers:
-            c: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-x86_64/gcc-8.5.0/gcc-13.2.0-iyqxotb/bin/gcc
-            cxx: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-x86_64/gcc-8.5.0/gcc-13.2.0-iyqxotb/bin/g++
-            fortran: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-x86_64/gcc-8.5.0/gcc-13.2.0-iyqxotb/bin/gfortran
-      - spec: gcc@8.5.0 languages='c,c++,fortran'
-        prefix: /usr
-        extra_attributes:
-          compilers:
-            c: /usr/bin/gcc
-            cxx: /usr/bin/g++
-            fortran: /usr/bin/gfortran
+    # ---------------------------------------------------------------
+    #  THE COMPILER -- discovered, not declared here.
+    #
+    #  No compiler version and no prefix is written in this file. Run
+    #
+    #      spack compiler find
+    #
+    #  once per machine; it writes ~/.spack/packages.yaml (or
+    #  ~/.spack/compilers.yaml on older Spack) with whatever this site has.
+    #  If a domain's tools need a specific compiler -- a module that
+    #  announces "requires gcc/X and will unload others" -- set it per
+    #  machine, outside this file:
+    #
+    #      spack config --scope site add 'packages:c:require:gcc@X'
+    #
+    #  WHY IT MATTERS HERE: maw.env exports
+    #  LD_PRELOAD=<the active gcc>/libstdc++.so.6, and every child process
+    #  inherits it -- including a task that has just module-loaded a tool
+    #  built by a different compiler. libstdc++ is only backward
+    #  compatible, so the preload must come from a compiler no newer than
+    #  the one those tools were built with. Set MAW_NO_LIBSTDCXX_PRELOAD=1
+    #  to turn the preload off if that cannot be arranged.
+    # ---------------------------------------------------------------
+    llvm:
+      buildable: false
+    nvhpc:
+      buildable: false
 
-    c:
-      require:
-      - gcc@13.2.0
-    cxx:
-      require:
-      - gcc@13.2.0
-    fortran:
-      require:
-      - gcc@13.2.0
-
-    openjdk:
-      buildable: true
-      require: "@21.0.0_35"
-      externals:
-      - spec: openjdk@21.0.0_35
-        prefix: /gpfs/fs1/soft/improv/software/spack-built/linux-rhel8-zen3/gcc-12.3.0/openjdk-21.0.0_35-23zksi2
-
+    # ---------------------------------------------------------------
+    #  NO MPI PROVIDER EXISTS HERE.
+    #
+    #  Not "prefer the site MPI" -- "MPI is unavailable", which is correct
+    #  for this environment. A spec that needs MPI fails to concretize with
+    #  a message naming the provider it wanted, instead of installing fine
+    #  and putting libmpi on LD_LIBRARY_PATH.
+    #
+    #  Do not add an MPI external here to "make something work" -- that ends
+    #  the per-task MPI choice for every domain at once. The MPI-linked
+    #  engines go in spack_mpi/.
+    # ---------------------------------------------------------------
     openmpi:
       buildable: false
     mpich:
       buildable: false
+    cray-mpich:
+      buildable: false
+    cray-mvapich2:
+      buildable: false
     intel-oneapi-mpi:
+      buildable: false
+    mvapich:
       buildable: false
     mvapich2:
       buildable: false
+
+    # Forced serial so a transitive dependency cannot smuggle in an MPI
+    # requirement and turn the block above into an error for an unrelated
+    # spec.
+    hdf5:
+      require: ["~mpi"]
+    py-h5py:
+      require: ["~mpi"]

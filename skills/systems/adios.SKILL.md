@@ -478,10 +478,10 @@ the workflow that was asked for.
 ## Running with ADIOS2
 
 ```bash
-python agent_mcp.py --engine adios --paper 1 --goal "..."
+python academy_agents.py --engine adios --paper 1 --goal "..."
 ```
 
-`adios_server.py` sets the needed env vars itself, so no module loading is
+`adios_sst.py / adios_mpmd.py` sets the needed env vars itself, so no module loading is
 required before running the agent.
 
 ### The MPI build (required for MPMD)

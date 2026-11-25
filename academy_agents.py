@@ -11,7 +11,8 @@ Pipeline:
 Environments
 ------------
 Every --env is started the same way, with the Python CLI. On LCRC, source
-setup_hpc.sh first; it sets MAW_PYTHON and the non-MPI library paths. It
+`spack env activate .` first, from the repo root; it sets MAW_PYTHON and the non-MPI
+library paths. It
 configures no MPI: a task loads the module its own tool needs.
 
     --env local       every agent in this process's event loop, on this
@@ -42,7 +43,7 @@ is a node reserved to idle.
 Why there is no MPIExecutor
 ---------------------------
 The Explorer never submits tasks to a Parsl executor. It talks to a server
-under servers/ over MCP stdio, and that server's whole job is to write the
+under src/servers/ over MCP stdio, and that server's whole job is to write the
 files the Explorer generates and then launch the workflow file once. Under
 --engine parsl the workflow file builds its own Config and calls parsl.load()
 itself, and its MPI ranks come from the mpirun string inside a @bash_app in
@@ -96,6 +97,36 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime
+
+# ---------------------------------------------------------------------
+#  src/ on sys.path, BEFORE any local import below.
+#
+#  Python puts the main script's own directory on sys.path -- the repo root
+#  for this file -- but not src/. So `from agents import ...` fails here
+#  unless something else already exported PYTHONPATH.
+#
+#  maw.env does export it on `spack env activate`, and make_worker_init
+#  exports it for the PBS workers. Relying on either would make the entry
+#  point refuse to start outside an activated environment, so it is done
+#  here as well; sys.path entries are deduplicated by the check below.
+#
+#  WHY NOT `from src.agents import ...` instead. Because the modules inside
+#  src/ import each other WITHOUT the prefix (`from states import`,
+#  `from tracing.trace_logger import tracer`), and mixing the two spellings
+#  makes `src.tracing.trace_logger` and `tracing.trace_logger` two distinct
+#  module objects with two `tracer` singletons. That is not a hypothetical:
+#  this file used the `src.` prefix for the tracer while the agents used the
+#  bare one, so the agents logged into one object while reset(), start_run(),
+#  get_summary() and save() ran against another -- and every run summary came
+#  out with no agents, no routing path and zero tool calls. `mcp_explorer`
+#  has the same shape, with `_mcp_session` as a module global.
+#
+#  One spelling everywhere, and the path set up to make it resolve.
+# ---------------------------------------------------------------------
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from pathlib import Path
 
 import parsl
@@ -113,17 +144,18 @@ from rich.console import Console
 from rich.panel import Panel
 
 from common.consts import (
-    LITERATURE_PATH, RUN_PATH, IMAGE_PATH,
-    DEFAULT_WALLTIME, HPC_MODULES, PROJECT_DIR, SRC_DIR, SETUP_SCRIPT_PATH,
+    LITERATURE_PATH, RUN_PATH, IMAGE_PATH, DATA_PATH,
+    DEFAULT_WALLTIME, HPC_MODULES, PROJECT_DIR, SRC_DIR, SPACK_ENV_PATH,
+    SPACK_SETUP_PATH,
     WORK_DIR, SKILLS_PATH,
 )
 from common.exceptions import exception_message
 from mcp_explorer import post_run_review
-from merge_explorer_trace import merge_into_tracer
-from run_archiver import archive_run
-from trace_logger import tracer
-from src.agents import Planner, Installer, Explorer, Orchestrator
-from src.states import AgentState, AgentSteps, UserInput
+from tracing.merge_explorer_trace import merge_into_tracer
+from tracing.run_archiver import archive_run
+from tracing.trace_logger import tracer
+from agents import Planner, Installer, Explorer, Orchestrator
+from states import AgentState, AgentSteps, UserInput
 
 load_dotenv()
 
@@ -267,74 +299,96 @@ def make_run_dir(work_dir: Path) -> Path:
     return run0
 
 
-def venv_dir() -> Path:
-    """The virtualenv the PBS workers should activate.
+def spack_env_dir() -> Path:
+    """The Spack environment the PBS workers activate.
 
-    Not a constant and not a search: it is the venv this process is
-    already running in. You activate it before launching, so sys.prefix
-    is exactly the environment that has parsl and academy installed --
-    which is necessarily the right one, since this code could not have
+    Not a constant and not a search: it is the environment this process is
+    already running under. You activate it before launching, so the
+    interpreter on PATH is exactly the one that has parsl and academy
+    installed -- necessarily the right one, since this code could not have
     imported them otherwise.
 
-    sys.prefix differs from sys.base_prefix precisely when the
-    interpreter is inside a venv, so that comparison is the whole test.
+    SPACK_ENV is set by `spack env activate` and is the whole test. The old
+    sys.prefix/sys.base_prefix comparison is gone: maw.env activates the
+    venv itself, and the workers activate the Spack environment rather than
+    the venv, so what matters is whether the environment is live and its
+    hook ran -- not whether this interpreter happens to be inside a venv.
 
-    Raising here is deliberate. `source` on a wrong path fails inside the
-    PBS submit script, where the only symptom is `process_worker_pool.py:
-    command not found` and a job marked MISSING a minute later. Failing
-    at startup costs nothing and says what is actually wrong.
+    Raising here is deliberate. Activating a wrong path fails inside the PBS
+    submit script, where the only symptom is `process_worker_pool.py:
+    command not found` and a job marked MISSING a minute later. Failing at
+    startup costs nothing and says what is actually wrong.
     """
-    if sys.prefix == sys.base_prefix:
+    active = os.environ.get("SPACK_ENV")
+    if not active:
         raise RuntimeError(
-            "Not running inside a virtualenv, so the PBS workers have no "
-            "environment to activate. Activate the project venv first:\n"
-            f"    source {PROJECT_DIR}/venv3/bin/activate"
+            "No Spack environment is active, so the PBS workers have "
+            "nothing to activate. Activate it first:\n"
+            f"    spack env activate {PROJECT_DIR}"
         )
 
-    prefix = Path(sys.prefix)
-    activate = prefix / "bin" / "activate"
-    if not activate.is_file():
+    prefix = Path(active)
+    if not (prefix / ".spack-env").is_dir():
         raise RuntimeError(
-            f"{activate} does not exist, so the workers cannot activate "
-            f"this environment. If it is a conda env rather than a venv, "
-            f"the submit script needs a `conda activate` prelude instead."
+            f"SPACK_ENV points at {prefix}, which has no .spack-env -- it is "
+            f"not an installed environment. Build it:\n"
+            f"    spack -e {prefix} install"
         )
+
+    if not os.environ.get("JAVA_HOME"):
+        raise RuntimeError(
+            f"{prefix} is active but JAVA_HOME is unset, so maw.env's "
+            f"setup_run_environment did not run. The workers would get no "
+            f"compiler, no JAVA_HOME and no library paths. Check that the "
+            f"env package is installed in it:\n"
+            f"    spack find -e {prefix} maw.env"
+        )
+
+    if not os.environ.get("MAW_PYTHON"):
+        raise RuntimeError(
+            f"{prefix} is active and maw.env ran, but MAW_PYTHON is unset, "
+            f"which means it found no venv. The workers would have no parsl. "
+            f"Run bootstrap.sh."
+        )
+
     return prefix
 
 
 def make_worker_init(run_dir: Path, engine: str = "parsl") -> str:
     """Shell prelude for the Explorer's worker pool, run before the launcher.
 
-    It sources setup_hpc.sh, the same script you source before running this,
+    It activates the same Spack environment you activate before running this,
     so the Explorer's node has the same interpreter and non-MPI library paths
     as an --env hpc run. Neither that script nor this prelude configures an
     MPI -- the worker starts with `module purge`, and a task loads the module
     its own tool needs in its own command string. A module left loaded here
     would be inherited by every task, including the ones that want none. That node never saw your shell, so nothing you exported
-    there reaches it any other way. Sourcing is safe here only because the
-    script sets no shell options: a `set -u` left behind would abort this
-    submit script on the unset $PYTHONPATH two commands later.
+    there reaches it any other way. `spack env activate` sets no shell
+    options, so nothing it leaves behind can abort this submit script on the
+    unset $PYTHONPATH two commands later.
 
     PROJECT_DIR goes on PYTHONPATH as well as SRC_DIR: the repo root is
     only on sys.path automatically for the launching process, because
     Python adds the main script's directory. On a worker the main script
     is Parsl's process_worker_pool.py, so without this the root-level
-    modules (trace_logger, mcp_explorer, run_archiver) are not importable
+    modules (mcp_explorer, and academy_agents itself) are not importable
     and the Explorer fails to unpickle before any of our code runs.
+
+    SRC_DIR carries the rest: src/agents.py, src/utility.py and the
+    src/tracing/ package, which is why `from tracing.trace_logger import
+    tracer` resolves on a worker at all. The four tracing modules used to
+    sit at the repo root and be imported by bare name.
     """
-    # os.path.isfile, not SETUP_SCRIPT_PATH.is_file(): consts.py builds every
-    # path with an f-string, so this is a str and has no .is_file(). Calling it
-    # raised AttributeError here -- inside make_worker_init, which only runs
-    # under --env multi-node, which is why it went unnoticed.
-    if not os.path.isfile(SETUP_SCRIPT_PATH):
+    # os.path.isdir, not Path.is_dir(): consts.py builds every path as an
+    # f-string, so these are str and not Path.
+    if not os.path.isdir(os.path.join(SPACK_ENV_PATH, ".spack-env")):
         raise RuntimeError(
-            f"{SETUP_SCRIPT_PATH} not found. The multi-node Explorer sources it on "
-            f"its compute node for MAW_PYTHON and the non-MPI library paths."
+            f"{SPACK_ENV_PATH} is not an installed Spack environment. The "
+            f"multi-node Explorer activates it on its compute node for "
+            f"MAW_PYTHON and the non-MPI library paths. Build it first:\n"
+            f"    spack -e {SPACK_ENV_PATH} install"
         )
-    # `module` is a shell function, and a submit script has not necessarily
-    # sourced the file that defines it -- the same failure mode setup_hpc.sh
-    # documents for `spack`. Without this guard every module line below is a
-    # silent "command not found".
+
     prelude = ['[ -z "$(type -t module)" ] && source /etc/profile.d/modules.sh']
 
     # START WITH NOTHING LOADED. A module inherited from the submitting shell,
@@ -354,31 +408,49 @@ def make_worker_init(run_dir: Path, engine: str = "parsl") -> str:
         # An MPI never does.
         prelude.append(f"module load {HPC_MODULES}")
 
+    # `spack` is a shell function, like `module`, and the `module purge`
+    # above may have removed whatever defined it. Nothing inside Spack can
+    # source Spack, so this is the one line that has to be shell.
+    if SPACK_SETUP_PATH:
+        prelude.append(f"source {SPACK_SETUP_PATH}")
+
     prelude += [
-        f"source {venv_dir()}/bin/activate",
-        f"source {SETUP_SCRIPT_PATH}",
+        # `spack env activate` runs maw.env's setup_run_environment, which
+        # sets CC/CXX, JAVA_HOME, COMPSS_HOME, MAW_PYTHON,
+        # LD_LIBRARY_PATH, MODULEPATH and the PMI scrub. That is
+        # the whole of what an activate script would have done.
+        #
+        # No separate venv activation line: maw.env sets VIRTUAL_ENV and
+        # puts venv3/bin first on PATH, so activating the environment
+        # activates the venv too. A `source venv3/bin/activate` here would
+        # only fight it for PATH order.
+        f"spack env activate {SPACK_ENV_PATH}",
+        "spack load openjdk",
         f"cd {run_dir}",
         f"export PYTHONPATH={PROJECT_DIR}:{SRC_DIR}:$PYTHONPATH",
         # Where the MCP server writes and runs. Exported here rather than left
         # to setup_hpc.sh because run_dir is a per-run decision made in THIS
         # process (work/run0, possibly rotated aside first) -- the setup script
         # cannot know it, and the Explorer's node never saw the shell that did.
-        # Everything else the servers need (JAVA_HOME, MAW_LD_BASE, the
+        # Everything else the servers need (JAVA_HOME, LD_LIBRARY_PATH, the
         # headless rendering variables) is site knowledge and belongs in that
         # script. It exports no MPI launcher and no LD_LIBRARY_PATH. PyCOMPSs needs nothing
         # beyond the activated venv it was pip-installed into, which the
         # `source .../activate` two lines up provides.
         f"export MAW_REPO_ROOT={PROJECT_DIR}",
         f"export MAW_WORK_DIR={run_dir}",
-        f"export MAW_DATA_DIR={PROJECT_DIR}/data",
+        f"export MAW_DATA_DIR={DATA_PATH}",
     ]
 
     # No engine-specific tail, and `engine` is accepted only so the call sites
     # need not care. There used to be one branch per engine here, each exporting
     # a library path from a constant in common.consts; those constants are gone,
-    # and setup_hpc.sh -- sourced three lines up, on this node -- is now the
-    # single place the environment for any engine is built. One script that
-    # knows the machine beats three branches that each guessed at it.
+    # and the Spack environment -- activated three lines up, on this node --
+    # is now the single place the environment for any engine is built. The
+    # per-task MPI still is not built here: the agent writes the domain's
+    # `module load` into the task's own command string, per
+    # knowledge/lcrc.SKILL.md, which is why this prelude holds no MPI module
+    # and no LD_LIBRARY_PATH.
     return "; ".join(prelude)
 
 
@@ -388,14 +460,14 @@ def user_input():
     parser.add_argument("--image", type=str, help="Path to image file (diagram/figure) to use for planning")
     parser.add_argument("--goal", type=str, help="Goal for the workflow")
     parser.add_argument("--engine", type=str, default="parsl",
-                        choices=["parsl", "pycompss", "adios"],
+                        choices=["parsl", "pycompss", "adios", "wilkins"],
                         help="Workflow engine to use (default: parsl)")
     parser.add_argument("--env", type=str, default="local",
                         choices=["local", "hpc", "multi-node"],
                         help="local: this machine. hpc: inside a PBS job you already "
                              "hold (qsub -I), everything in one process. multi-node: "
                              "submit a separate PBS job for the Explorer. On LCRC, "
-                             "source setup_hpc.sh first")
+                             "spack env activate . first (from the repo root)")
     parser.add_argument("--condition", type=str, default="B",
                         choices=["A", "B", "C"],
                         help="Ablation condition: A=no-skills, B=full (default), C=single-agent")
@@ -436,6 +508,28 @@ def user_input():
         parser.error("--env multi-node needs --nodes and --ranks, both at least 1")
     if args.env == "multi-node" and not os.getenv("PBS_ACCOUNT"):
         parser.error("--env multi-node needs PBS_ACCOUNT set (in .env or the environment)")
+
+    # --env hpc asserts "I am already inside a PBS job". Checked here, because
+    # the only other thing that notices is the Explorer's get_resources -- and
+    # by then the planner and installer have each run a full LLM session and
+    # several minutes have passed, for a run that cannot place a single MPI
+    # rank. One observed run spent 455 seconds and three planner passes to
+    # arrive at "there is no allocation".
+    #
+    # PBS_JOBID and not PBS_ACCOUNT: the account says which project to charge,
+    # which a login shell has too. PBS_JOBID is set by PBS only inside a job.
+    if args.env == "hpc" and not os.getenv("PBS_JOBID"):
+        parser.error(
+            "--env hpc means 'inside a PBS job I already hold', but PBS_JOBID is "
+            "unset, so this is a login shell.\n\n"
+            "  Either get an allocation first and re-run in it:\n"
+            "      qsub -I -l select=1:ncpus=<ranks>:mpiprocs=<ranks> \\\n"
+            "           -l walltime=HH:MM:SS -A $PBS_ACCOUNT\n\n"
+            "  Or have the Explorer submit its own job, which is what you want\n"
+            "  from a login node:\n"
+            "      --env multi-node --nodes <N> --ranks <per-node>\n\n"
+            "  Use --env local only for a machine with no scheduler."
+        )
     return args
 
 
@@ -454,7 +548,7 @@ def collect_inputs(args) -> UserInput:
 
         pdfs_path = os.listdir(LITERATURE_PATH)
         if not pdfs_path:
-            exception_message("No PDFs found in the Literature/ folder. Add a paper and try again.")
+            exception_message("No PDFs found in the inputs/literature/ folder. Add a paper and try again.")
 
         console.print("\n[bold]Available papers:[/bold]")
         for pdf in pdfs_path:
@@ -494,7 +588,7 @@ def collect_inputs(args) -> UserInput:
 
             image_dir_entries = os.listdir(IMAGE_PATH)
             if not image_dir_entries:
-                exception_message("No Images found in the images/ folder. Add an image and try again.")
+                exception_message("No Images found in the inputs/images/ folder. Add an image and try again.")
 
             console.print("\n[bold]Available Images:[/bold]")
             for image in image_dir_entries:
@@ -503,7 +597,7 @@ def collect_inputs(args) -> UserInput:
                     console.print(f"{len(images_list)}. {image}")
 
             if not images_list:
-                exception_message("No Images found in the images/ folder. Add an image and try again.")
+                exception_message("No Images found in the inputs/images/ folder. Add an image and try again.")
 
             while inputs.image == "":
                 choice = input("\nSelect an image by number: ").strip()
@@ -519,8 +613,8 @@ def collect_inputs(args) -> UserInput:
             console.print(f"[dim]Selected: {os.path.basename(inputs.image)}[/dim]")
 
     # __ Data file selection __
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-    all_data_files = sorted(f for f in os.listdir(data_dir)
+    data_dir = DATA_PATH
+    all_data_files = sorted(f for f in os.listdir(DATA_PATH)
                             if os.path.isfile(os.path.join(data_dir, f))) if os.path.isdir(data_dir) else []
 
     if not all_data_files:
@@ -628,6 +722,7 @@ def make_state(args, inputs) -> AgentState:
         selected_data_files=inputs.data_files,
         requirements_content="",
         requirements_approved=False,
+        requirements_override=[],
         image_path=inputs.image,
         current_step=AgentSteps.START,
         orchestrator_feedback="",
@@ -779,7 +874,7 @@ async def run_multi_node(inputs, initial_state, run_log_path: str) -> dict:
     # make_run_dir returns work/run0 -- the whole run lives there now.
     run_dir = make_run_dir(Path(WORK_DIR))
     console.print(f"[dim]Project dir:    {PROJECT_DIR}[/dim]")
-    console.print(f"[dim]Venv:           {venv_dir()}[/dim]")
+    console.print(f"[dim]Spack env:      {spack_env_dir()}[/dim]")
     console.print(f"[dim]Run dir:        {run_dir}[/dim]")
     console.print(f"[dim]Parsl scratch:  {run_dir / 'runinfo'}[/dim]")
     console.print(f"[dim]Explorer log:   {explorer_log}[/dim]")

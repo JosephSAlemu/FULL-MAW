@@ -215,7 +215,7 @@ allocation are documented there.
 | Alias | Resolves to |
 |---|---|
 | `/app/` | repo root on disk (`MAW_REPO_ROOT`) |
-| `/app/data/` | input data files (`MAW_DATA_DIR`) |
+| `/app/inputs/data/` | input data files (`MAW_DATA_DIR`) |
 | `/app/work/run0/` | working directory for all run output (`MAW_WORK_DIR`) |
 
 The MCP server rewrites these prefixes when it writes or reads a file, so write

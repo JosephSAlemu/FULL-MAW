@@ -11,14 +11,28 @@ description: >
 
 # Molecular Nucleation (LAMMPS + OVITO) — Domain Skill
 
+# Modules
+
+`module load lammps/2Aug2023` provides both the LAMMPS executable and the MPI it was
+built against (OpenMPI), plus the matching compiler. It announces both on load
+and unloads any other versions of them.
+
+**The load goes in the command string of each task that launches ranks**, not in
+a shell beforehand. A module loaded in the agent's shell is inherited by every
+task, including OVITO, which needs no MPI at all.
+
+`-log` matters: without it the log lands wherever the process started rather
+than in this instance's directory, and two concurrent instances overwrite each
+other's.
+
+# Overview
+
 Reproduce a water crystallization nucleation result: run the existing LAMMPS
 simulation of a supercooled water box, then analyze its trajectory for ice-like
 structure and produce per-frame renders, an animation, and a nucleation
 timeseries. Applies whenever the work involves LAMMPS water crystallization,
 OVITO diamond structure identification, or the `in.watbox*` / `data.init` /
 `AW.tersoff` case files.
-
-## Workflow Overview
 
 The workflow has 3 main stages:
 1. **LAMMPS simulation** -- run MD simulation of water molecules, output trajectory frames
@@ -29,47 +43,7 @@ The workflow has 3 main stages:
 the same workflow with a different instance count, and the rank count per
 simulation is likewise a parameter. Nothing in this file assumes a number.
 
----
 
-# Running LAMMPS: the module, the binary, the launch
-
-`module load lammps` provides both the LAMMPS executable and the MPI it was
-built against (OpenMPI), plus the matching compiler. It announces both on load
-and unloads any other versions of them. Nothing else sets up MPI for this
-domain -- no library paths to compose, no vendor install to name.
-
-**The load goes in the command string of each task that launches ranks**, not in
-a shell beforehand. A module loaded in the agent's shell is inherited by every
-task, including OVITO, which needs no MPI at all.
-
-**The binary name varies.** The module may call it `lmp`, `lmp_mpi`, or
-`lmp_<compiler>_<mpi>`. Resolve it at run time rather than writing one in:
-
-```
-LMP=$(command -v lmp || command -v lmp_mpi || command -v lmp_g++_openmpi)
-```
-
-**The shape of the launch**, per instance:
-
-```
-module load lammps
-  -> resolve $LMP
-  -> cd into this instance's own directory
-  -> OMP_NUM_THREADS=1   (all the parallelism is in the ranks)
-  -> pin to this instance's cores
-  -> <launcher> -n <ranks> $LMP -in <this instance's script> -log log.lammps
-```
-
-`-log` matters: without it the log lands wherever the process started rather
-than in this instance's directory, and two concurrent instances overwrite each
-other's.
-
-After the module is loaded, the launcher it provides is the right one. There is
-no second MPI to confuse it with.
-
-**The ranks are the executable, not a Python program.** That is what keeps this
-workflow free of MPI bindings: nothing re-invokes the workflow file as a rank
-program, nothing needs a rank-mode flag, and nothing imports `mpi4py`.
 
 ---
 
@@ -193,7 +167,7 @@ Three numbers come from the goal, not from this file:
 | Quantity | Where it comes from |
 |---|---|
 | How many simulations | the goal, or the number of input scripts it names |
-| Which input script each uses | the goal, or discovered by pattern under `/app/data/` |
+| Which input script each uses | the goal, or discovered by pattern under `/app/inputs/data/` |
 | Ranks per simulation | the goal; if unstated, divide the allocation by the simulation count |
 
 Write the workflow so all three are variables. A file that hardcodes two
@@ -201,7 +175,7 @@ simulations cannot answer a goal asking for ten, and one that hardcodes ten
 wastes an allocation on a goal asking for one.
 
 **Discovering the inputs.** When the goal names scripts, use those. When it only
-says how many, glob `/app/data/in.watbox*` and take them in sorted order — never
+says how many, glob `/app/inputs/data/in.watbox*` and take them in sorted order — never
 invent a filename that is not on disk.
 
 **Naming the instances.** Each simulation gets its own directory under
@@ -230,15 +204,15 @@ only to its own simulation. One simulation failing must not stop the others.
 # Input Parameters
 
 All simulation settings are fixed in the case files and must be used as they are —
-do not invent, override, or edit them. The case files live in `/app/data/`:
+do not invent, override, or edit them. The case files live in `/app/inputs/data/`:
 
-- `/app/data/in.watbox*` — the LAMMPS input scripts, one per simulation. Each is
+- `/app/inputs/data/in.watbox*` — the LAMMPS input scripts, one per simulation. Each is
   the single source of truth for temperature, pressure, timestep, run length,
   ensemble, and output frequency for its simulation. They are user-controlled and
   must never be modified.
-- `/app/data/data.init` — the initial atom positions for the water box, shared by
+- `/app/inputs/data/data.init` — the initial atom positions for the water box, shared by
   all simulations.
-- `/app/data/AW.tersoff` — the Tersoff force-field parameter file for water,
+- `/app/inputs/data/AW.tersoff` — the Tersoff force-field parameter file for water,
   shared by all simulations.
 
 For each simulation, all three files must be copied into that simulation's run
@@ -266,6 +240,7 @@ simulations it dominates the run.
 **Paths.** Work happens under `/app/work/run0/`, with one subdirectory per
 simulation. Always use `/app/`-rooted paths for anything the run produces; never
 `/lcrc/project/`, `/gpfs/`, or `/scratch/`.
+- The case input files (in.watbox_0, in.watbox_1, data.init, AW.tersoff, indat.params) live in the project's inputs/data/ folder (seen as /app/inputs/data/). The machine path given in the goal (…/FULL-MAW/data) and the /app/inputs/data alias do NOT contain them. Read and copy inputs only from the folder where the directory listing actually showed them.
 
 ---
 
@@ -310,6 +285,7 @@ The frames and `log.lammps` are written relative to the directory the simulation
 started in, and a previous run's copies will satisfy a check that they exist.
 Delete each simulation's own frames and log at the start of that simulation so
 the analysis stage reads this run's output.
+- sim_<i>/log.lammps: the LAMMPS text log. It records the number of MPI tasks ('… with N MPI tasks x 1 OpenMP threads') and the processor grid, which together confirm the 4-rank layout. It also records the thermodynamic output every 100 steps.
 
 ---
 
@@ -332,7 +308,7 @@ the analysis stage reads this run's output.
 | Loading the module in a shell before the run instead of per task | Every task then inherits it, including OVITO, which needs no MPI at all |
 | Trusting a multi-rank run without checking `log.lammps` | It reports the task count and processor grid. One task when N were asked for means the launcher did not take, and the exit code is 0 either way |
 | Giving OVITO ranks, a launcher, or the module | It is single-process and reads files LAMMPS already wrote |
-| Inventing an input-script filename | Use the scripts the goal names, or glob `/app/data/in.watbox*` in sorted order |
+| Inventing an input-script filename | Use the scripts the goal names, or glob `/app/inputs/data/in.watbox*` in sorted order |
 | Assuming every simulation produces the same frame count | Each input script sets its own dump interval. Count frames per simulation |
 | Two concurrent simulations with no core separation | Both claim rank slots from the front of the same list. Give each a disjoint `taskset -c` range |
 | One simulation's failure stopping the others | They are independent. Wire each analysis stage only to its own simulation |
@@ -351,6 +327,8 @@ the analysis stage reads this run's output.
 | The animation step reports no frames found | Render the per-frame images before assembling the animation |
 | Re-running a simulation to fix an analysis or image problem | The trajectory already exists. Fix and re-run only the stage that failed |
 | Trying to make LAMMPS write an analysis-friendly format | It cannot; the trajectory format is fixed. Convert it afterwards instead |
+| Every instance fails within seconds at the setup stage, reporting that in.watbox_0 / in.watbox_1 cannot be found, and no simulation starts. | The workflow is pointing at the goal's literal data path instead of the real input folder. Before running, list the input folder and use the exact folder where the in.watbox files were found (inputs/data/). |
+| The final check reports a run as not using 4 MPI ranks, even though LAMMPS ran correctly and wrote all of its frames. | LAMMPS states the rank count in log.lammps on a line of the form '… with 4 MPI tasks x 1 OpenMP threads', followed by the processor grid (for example 2 by 2 by 1). Check for that wording instead of guessing a different phrasing, and do not relaunch the simulation because of this check. |
 
 ---
 
@@ -378,3 +356,8 @@ the analysis stage reads this run's output.
 - Simulations are independent of one another. Run as many concurrently as the
   allocation allows, and because OVITO's scene is shared within a process, never
   let two of them share one — see the engine skill for how to keep them apart.
+If a later stage (analysis, rendering, plotting or the final check) fails after sim_<i>/frames/step.*.lammpstrj and log.lammps already exist, keep those simulation outputs. Redo only the failed stage and the stages after it; never re-run LAMMPS to recover from a downstream or checking error.
+
+
+
+

@@ -11,10 +11,9 @@ description: >
 
 # Modules
 
-HACC is built with OpenMPI 4.1.7. is built with gcc-13.2.0.
-Order of loading modules:
+HACC is built with Openmpi4 C++ mpi bindings so load the following modules in this order:
 `module load gcc/13.2.0`
-`module load openmpi/4.1.7`
+`module load openmpi/4.1.6-gcc-13.2.0`
 
 # Tools
 **HACC** - a closed source binary. Do not recreate it using Python.

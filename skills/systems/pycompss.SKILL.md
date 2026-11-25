@@ -73,7 +73,7 @@ Not checked, and still forbidden:
   and the function becomes an ordinary one that does nothing
 
 A path that resolves outside the work directory is **rejected**, not relocated.
-`/app/work/run0` and `/app/data` are aliases the server rewrites on write, so
+`/app/work/run0` and `/app/inputs/data` are aliases the server rewrites on write, so
 writing those literal strings into generated code is correct and portable.
 
 ---

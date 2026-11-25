@@ -12,3 +12,6 @@ OLD RUNS/
 SAMPLE RUNS/**/work/.parsl/
 profiler/
 /.spack-env
+spack.lock
+.spack-env/
+.kilo/

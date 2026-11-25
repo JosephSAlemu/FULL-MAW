@@ -88,7 +88,7 @@ When the installer presents requirements.txt for approval, verify it contains:
 
 **LAMMPS exit 11, frames present:** explorer_complete, reported as failure -> `next="explorer"`, `feedback="Exit 11 is a cleanup SIGSEGV, not a run failure. frames/*.lammpstrj were written — continue to the OVITO analysis instead of retrying the simulation."`
 
-**Missing input file:** explorer_complete, copy failed -> `next="explorer"`, `feedback="Input file copy failed. Verify AW.tersoff, data.init, and in.watbox all exist in /app/data/."`
+**Missing input file:** explorer_complete, copy failed -> `next="explorer"`, `feedback="Input file copy failed. Verify AW.tersoff, data.init, and in.watbox all exist in /app/inputs/data/."`
 
 ---
 

@@ -62,13 +62,25 @@ The installer runs ONCE. It writes requirements.txt from `stack_decision` and
 pip-installs it in the same action, so the only step it reports is
 `installer_complete` and the route forward is locked to **explorer** in code.
 
-There is no approval gate to pass. There used to be -- the installer returned
-`installer_requirements_pending_approval` and waited for you -- and it was
-removed because it could not work: the installer has no language model. It
-writes `stack_decision` to disk and nothing else, so a rejection produced the
-identical file on the next pass however specific your feedback was.
+**You review the list, and if it is wrong YOU fix it.** Set
+`requirements_override` to the corrected package list. Do not route to the
+planner: the installer has no language model, so a rejection with no
+replacement changes nothing, and the planner returns the same
+`stack_decision` after a full session and a PDF re-read. An earlier version
+allowed that route and a run spent three passes producing a byte-identical
+six-line file.
 
-Review the OUTCOME instead, which you can act on:
+| You return | What happens |
+|---|---|
+| `requirements_approved=true`, no override | pass 2 installs the list as written |
+| `requirements_override=[...]` | the installer writes YOUR list and installs it |
+| `requirements_approved=false`, no override | approved as written, with a note that you gave no correction |
+
+The third row is not a rejection you can use. There is nobody to pass the
+problem to, so withholding approval without supplying a list only records a
+non-decision. If a package is wrong, return the list you want.
+
+Then review the OUTCOME, which you can also act on:
 - a package you believe is wrong for this run -> route to **planner**, who owns
   `stack_decision`. Do NOT route to installer; it cannot edit the list.
 - pip failed -> say so in your reasoning and route to **explorer** anyway. The
@@ -198,27 +210,42 @@ default for every use case that has not declared an exception.
 
 ---
 
-## The Installer Runs Once
+## The Installer Runs Twice, and You Own the List
 
-It used to run twice, with your sign-off in between: phase 1 wrote
-`requirements.txt` and reported
-`current_step == "installer_requirements_pending_approval"`, and phase 2 ran
-`pip install` only after you set `requirements_approved=true`.
+Pass 1 writes `requirements.txt` from `stack_decision` and reports
+`installer_requirements_pending_approval`. Pass 2 runs `pip install`. The
+route out of that step is **always back to the installer** -- never the
+planner, never the explorer.
 
-That is gone. The installer writes and installs in one action, reports
-`installer_complete`, and the route forward is locked to **explorer** in code.
+What you return decides which list gets installed:
 
-It was removed because the gate could not do what it looked like it did. The
-installer has no language model -- it writes `stack_decision` to disk and runs
-pip. A rejection could not change what the next pass produced, so an
-orchestrator that disliked a package regenerated the identical file on every
-pass. One observed run spent five rounds rejecting the same six-line file with
-increasingly emphatic feedback while nothing changed.
+- `requirements_override=[...]` -- the installer writes exactly that and
+  installs it. Approval is implied; you are not approving the file you were
+  shown, you are replacing it.
+- `requirements_approved=true` with no override -- install as written.
+- neither -- the code approves as written and logs that you gave no
+  correction. Nothing stalls, but nothing changes either.
 
-`requirements_approved` still exists in your output schema. Nothing reads it.
-Leave it `false`.
+**Why you and not the planner.** The installer writes a list to disk and runs
+pip; it has no model and cannot act on prose. The planner owns
+`stack_decision`, but sending it back there costs a full planner session plus
+a PDF re-read, and it returns the same list. You are the agent holding the
+objection, so you are the one who states the fix.
 
----
+## Revisions Must Say What To Change
+
+Routing to an agent that has already produced output counts as a revision and
+costs a full LLM session -- plus a PDF re-read for the planner. `feedback` is
+therefore **required** and must name the specific thing to change.
+
+A vague or empty `feedback` on a revision is not honoured: the code routes
+onward instead of spending the session, and prints what you said. Phrases like
+"re-examine", "please revise", "needs improvement" or "no specific objection"
+are rejected by name. So is anything under 40 characters.
+
+Say which task, which package, which value -- "task 7 launches hacc_tpm
+without sourcing the env file in the same invocation", not "the plan needs
+work".
 
 ## State Fields Available to You
 

@@ -1,0 +1,6 @@
+[submodule "spack_mpi/deps/lowfive"]
+	path = spack_mpi/deps/lowfive
+	url = https://github.com/diatomic/LowFive.git
+[submodule "spack_mpi/deps/wilkins"]
+	path = spack_mpi/deps/wilkins
+	url = https://github.com/orcunyildiz/wilkins.git

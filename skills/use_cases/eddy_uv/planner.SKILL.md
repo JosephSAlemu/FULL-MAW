@@ -120,7 +120,7 @@ task text, and never ask the explorer to build its own thread or process pool.
 
 - Source data paths are real LCRC paths under
   `/lcrc/project/PEDAL/jalemu/Nek5000/NekExamples-master/eddy_uv/` — external
-  to the repo, reference by actual absolute path, not `/app/data/`.
+  to the repo, reference by actual absolute path, not `/app/inputs/data/`.
 - Never write a task asking the explorer to modify `eddy_uv.rea`,
   `eddy_uv.usr`, `eddy_uv.map`, `SIZE`, `SESSION.NAME`, or `subeddy.pbs`.
   `subeddy.pbs` itself is read-only reference material now; nothing gets

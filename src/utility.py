@@ -21,7 +21,7 @@ from rich.console import Console
 from common.consts import (
     SKILLS_PATH, ENV_KNOWLEDGE, ENV_NOTES, USE_CASE_SKILL_REDIRECTS,
 )
-from trace_logger import tracer, extract_usage, message_to_dict
+from tracing.trace_logger import tracer, extract_usage, message_to_dict
 
 console = Console()
 
