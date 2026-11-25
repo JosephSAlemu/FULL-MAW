@@ -13,7 +13,7 @@ description: >
 
 # Modules
 
-`module load lammps/2Aug2023` provides both the LAMMPS executable and the MPI it was
+`module load lammps` provides both the LAMMPS executable and the MPI it was
 built against (OpenMPI), plus the matching compiler. It announces both on load
 and unloads any other versions of them.
 

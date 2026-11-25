@@ -17,3 +17,4 @@ spack.lock
 spack_mpi/spack.yaml
 .spack-env/
 .kilo/
+modules/
