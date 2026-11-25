@@ -35,9 +35,8 @@ Each entry is one concrete fact from the paper. Include:
 **Bad:** `"The paper uses molecular dynamics to simulate water"`
 
 ### `stack_decision` — packages to install into the venv
-Only include packages that are actually needed for the workflow. Never invent packages.
-Include MPI-related packages (`mpi4py`, etc.) only when the environment knowledge
-confirms MPI is available and appropriate.
+Include python packages that are actually needed for the workflow. Never invent packages.
+Also include the appropriate modules 
 
 ### `tasks` — MCP execution steps for the explorer
 
@@ -111,7 +110,7 @@ A complete task list must cover ALL of these phases:
 
 On your **first call**, request the skill file for the specific workflow type and
 `systems/<engine>`, where `<engine>` is the actual engine this run was started
-with (`parsl`/`pycompss`/`adios`) — not whichever engine happens to appear in an
+with (`parsl`/`pycompss`/`adios`/`wilkins`/`etc`) — not whichever engine happens to appear in an
 example below. Always match the real `--engine` value for this run.
 
 Example, for a run started with `--engine parsl`:
@@ -120,11 +119,6 @@ Example, for a run started with `--engine parsl`:
 If this run's engine were `adios` instead, the second entry would be
 `"systems/adios"`, not `"systems/parsl"`.
 
----
-
-## Handling Orchestrator Feedback
-
-If the input ends with "Orchestrator feedback", fix every issue. Do not repeat the same mistakes.
 
 ---
 

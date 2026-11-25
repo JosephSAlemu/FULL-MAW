@@ -24,7 +24,7 @@ Pair with the use-case installer skill for domain-specific package requirements.
 
 The installer is a two-phase agent:
 - **Phase 1:** Returns a requirements.txt to the orchestrator for review. Sets `current_step="installer_requirements_pending_approval"`.
-- **Phase 2:** Runs `pip install -r requirements.txt` only after the orchestrator sets `requirements_approved=True`. Skips install if all packages are already present in the venv.
+- **Phase 2:** Runs `pip install -r requirements.txt` only after the orchestrator sets `requirements_approved=True` or after the `requirements_override=[...]` with the orchestrators list of dependencies. If a 
 
 ---
 
@@ -41,7 +41,7 @@ Returns:
 
 ### Step 2: Orchestrator reviews and approves
 
-The orchestrator checks the requirements and sets `requirements_approved=True`. Installer is called again.
+The orchestrator checks the requirements and sets `requirements_approved=True` or gives you a modified list of dependencies `requirements_override=[...]`. Installer is called again.
 
 ### Step 3 (Phase 2): Install packages (or skip)
 
@@ -49,17 +49,15 @@ Check if all packages are already installed before running pip:
 ```bash
 pip show <package>
 ```
-If all present → skip install, return immediately.
+If all present → skip install, return immediately. Give `INSTALLER_COMPLETE` to the orchestrator, not the requirements.
 If any missing → run `pip install -r builds/requirements.txt`.
 
 ---
 
 ## Key Rules and Constraints
 
-- Never proceed to Phase 2 without `requirements_approved=True` in state
-- Always check for existing packages before installing — avoids unnecessary network calls
+- Never proceed to Phase 2 without `requirements_approved=True` or `requirements_override=[...]`in state.
+- Always check for existing packages before installing — avoids unnecessary network calls.
 - The installer only manages requirements.txt and pip installs into the venv -- no other build/runtime state is tracked
 
 ---
-
-## Notes

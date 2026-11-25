@@ -85,7 +85,7 @@ The planner's tasks are a description of the workflow, not a list of tool calls.
 Read **all** of them first, then express them to the engine together.
 
 1. Combine every task from the planner into **one** workflow file, using this
-   engine's constructs (see the engine reference in your context)
+   engine's constructs (see the engine reference in your context). The exceptions of one workflow file is when you are doing mpmd with adios2 or wilkins and need to separate your work across multiple python files.
 2. Express the ordering between steps the way that engine does it — not by
    running them one at a time yourself
 3. Write any configuration that workflow will read **first**, one

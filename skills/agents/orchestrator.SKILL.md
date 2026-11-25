@@ -20,7 +20,7 @@ This is the MCP (tool-calling) approach: instead of generating a complete workfl
 | Agent | What it does |
 |---|---|
 | `planner` | Reads the PDF, extracts literature findings, dependency stack, and ordered tasks |
-| `installer` | Sets up the local venv: writes requirements.txt from stack_decision and pip-installs it, in one pass |
+| `installer` | Sets up the local venv: writes requirements.txt from stack_decision, then passes it to you for you to verify the packages are correct. If they are, tell installer to install dependencies. If not, make changes to the requirements.txt. |
 | `explorer` | Executes workflow tasks step by step using tool calls in the local venv |
 | `end` | Signals successful completion |
 
@@ -39,50 +39,39 @@ Do not assume single-node constraints unless the local knowledge skill is loaded
 Every agent returns to you, so the full path is:
 
 ```
-orchestrator -> planner -> orchestrator -> installer -> orchestrator -> explorer -> orchestrator -> end
+orchestrator -> planner -> orchestrator -> installer -> orchestrator -> installer -> orchestrator -> explorer -> orchestrator -> end
 ```
 
-Four of your turns, one per agent plus the close. Each agent runs ONCE on a
-clean run; a second turn for any of them is a revision, and the sections below
-say when one is warranted. Follow this unless you have a specific reason to
-deviate.
-
+The installer gets the stack fix
 ---
 
 ## When to Route Each Direction
 
-### After planner -- route BACK if:
-- Tasks are vague (no specific function names, no parameters)
-- Simulation parameters are missing (temperature, timestep, run length, force field)
-- Tasks contradict the loaded environment knowledge (e.g. MPI steps when local, or no resource query when HPC)
+### After planner
+You may check the planner output to make sure it looks good. If not revise it **do not route back to the planner**
+and then, pass the stack to the installer to parse the specific requirements.txt
 
-### After installer -- always route to explorer
+### After installer pass 1 
+Once you receive the installer output of requirements.txt (`installer_requirements_pending_approval`) **You review it to check for conflicting packages or issues**
 
-The installer runs ONCE. It writes requirements.txt from `stack_decision` and
-pip-installs it in the same action, so the only step it reports is
-`installer_complete` and the route forward is locked to **explorer** in code.
+If the requirements.txt the installer generated from `stack_decision` is correct, return to the installer with the correct code letting the installer install the python packages. 
 
-**You review the list, and if it is wrong YOU fix it.** Set
-`requirements_override` to the corrected package list. Do not route to the
-planner: the installer has no language model, so a rejection with no
-replacement changes nothing, and the planner returns the same
-`stack_decision` after a full session and a PDF re-read. An earlier version
-allowed that route and a run spent three passes producing a byte-identical
-six-line file.
+**IF THE PACKAGES ARE WRONG OR HAVE ANY CONFLICT**, you must `requirements_override` and fix the requirements.txt yourself before returning to the installer and allowing it to install the packages.
+
+The installer has no language model, so a rejection with no
+replacement changes nothing. Your job to fix the issue.
+
+### After installer pass 2
+
+After the installer completes with `installer_complete` and the route forward is locked to **explorer** in code.
+
 
 | You return | What happens |
 |---|---|
 | `requirements_approved=true`, no override | pass 2 installs the list as written |
-| `requirements_override=[...]` | the installer writes YOUR list and installs it |
-| `requirements_approved=false`, no override | approved as written, with a note that you gave no correction |
+| `requirements_override=[...]` | you write the list of requirments and the installer installs YOUR list of dependencies |
 
-The third row is not a rejection you can use. There is nobody to pass the
-problem to, so withholding approval without supplying a list only records a
-non-decision. If a package is wrong, return the list you want.
 
-Then review the OUTCOME, which you can also act on:
-- a package you believe is wrong for this run -> route to **planner**, who owns
-  `stack_decision`. Do NOT route to installer; it cannot edit the list.
 - pip failed -> say so in your reasoning and route to **explorer** anyway. The
   explorer has `check_package` and can report what is actually importable,
   which is better evidence than pip's exit code.
@@ -92,13 +81,16 @@ Then review the OUTCOME, which you can also act on:
 ### After explorer -- route BACK ONLY if the explorer can fix it
 
 Route back for:
-- a tool call that actually failed
-- an `ENGINE USAGE WARNING`
-- an expected output file the explorer reported as missing
+- didn't get the proper output as outlined in the domain file. For example, an expected output file the explorer reported as missing
+- an `ENGINE USAGE WARNING`.
 
-Do NOT route back to verify. "I could not confirm the PNG count from the
-truncated listing", "that log excerpt stopped before the decomposition line",
-"the second instance's log was never read" -- none of these are things the
+Do NOT route back for:
+- "I could not confirm the PNG count from the
+truncated listing"
+- "that log excerpt stopped before the decomposition line"
+- "the second instance's log was never read" 
+
+none of these are things the
 explorer failed at. They are things YOU have not read. A second explorer pass
 costs a full LLM session to re-list directories and re-read files the first
 pass already produced, and it ends with the same uncertainty unless something
@@ -114,7 +106,7 @@ failed tool calls and no engine warning, a route to `explorer` is overridden to
 It means a call didn't demonstrably exercise the real workflow engine. Route to
 **explorer** with feedback naming the specific task.
 
-On every engine the explorer writes ONE workflow file via `write_file`
+On parsl, pycompss, and adios-sst every engine the explorer writes ONE workflow file via `write_file`
 and runs it via `run_workflow`; that file is *supposed* to contain the engine's
 own constructs. **The fix differs by engine -- don't give the wrong
 instruction:**
@@ -134,13 +126,13 @@ instruction:**
   explorer did wrong. Feedback should name the stage that must do the real
   `stream.write(...)`/`stream.read(...)` round trip.
 
-Route to **installer** ONLY if the explorer reports a missing package that needs
-to be added to requirements.txt.
+On adios with mpmd and wilkins with mpmd, there are multiple workflow files and things are not as straightforward.
 
 ### When to route forward:
-- Planner produced specific, implementable tasks -> installer (or explorer if image exists)
-- Installer built the image -> explorer
-- Explorer completed all tasks with expected outputs -> end
+- Planner: After receiving the output and verifying the output is good or modifying it -> Installer
+- Installer (Phase 1): once you confirm requirements.txt or modify it -> Installer
+- Installer (Phase 2): once the installer installs the packages -> explorer
+- Explorer: completed all tasks with expected outputs -> end
 
 ---
 
@@ -153,12 +145,10 @@ to be added to requirements.txt.
 - **Name what to change, do not restate the plan.** The agent you are routing to
   already has the domain and engine skills in its own context. Feedback that
   re-derives the whole design from those skills is longer than the correction and
-  buries it. Five bullets is plenty; if you need more, the problem is probably
-  that the task list itself is wrong, which is a route to `planner`.
+  buries it.
 - **A task that names the wrong engine is stale, not unsatisfiable.** If a task
-  asks for a construct this run's engine does not have, say the task is stale and
-  route to `planner`. Do not ask the explorer to satisfy it -- a check that cannot
-  pass is a loop.
+  asks for a construct this run's engine does not have, say the task is stale and modify the task.
+  Do not ask the explorer to satisfy it -- a check that cannot pass is a loop.
 
 ---
 
@@ -170,33 +160,14 @@ When reviewing the installer's `requirements.txt`:
   appears in this run's `stack_decision`, is approved. You are checking for
   packages nobody asked for -- not second-guessing ones the domain explicitly
   requires.
-- **Reject stale cross-use-case packages.** Packages that belong to a different use
+- **Remove stale cross-use-case packages.** Packages that belong to a different use
   case usually mean a `requirements.txt` leaked through from a previous run.
-- **Reject a package that would BUILD a tool from source** when the use-case skill
+- **Remove a package that would BUILD a tool from source** when the use-case skill
   says that tool comes from a module or is already installed. Installing a tool's
   Python bindings is not building the tool: a domain whose skill says to pip-install
   bindings after loading a module is describing the supported path, and rejecting it
   blocks the run.
-- **MPI bindings (`mpi4py`) are a normal pip install here.** They are compiled
-  against whatever MPI is loaded at install time, which is why the use-case skill
-  says to load the module first. Reject them only if the use-case skill says the
-  tasks import no MPI bindings at all.
 
-### The installer cannot edit the list
-
-This matters for how you reject. The installer has no language model: it writes
-`requirements.txt` from `stack_decision` and nothing else. Your feedback tells it
-*whether* to regenerate, never *what to change*. So rejecting a package the planner
-put in `stack_decision` produces a byte-identical file on the next pass, and the
-loop cannot terminate however precise the feedback gets.
-
-Therefore:
-- Reject only when the fix is something the installer can actually perform.
-- If a package must leave `stack_decision`, route to **planner**, not installer --
-  the planner owns that list.
-- If you have rejected the same `requirements.txt` twice and it came back unchanged,
-  stop rejecting it. Either approve and let the explorer surface the real problem, or
-  route to planner. A third identical rejection is a loop, not diligence.
 
 ---
 
@@ -210,43 +181,6 @@ default for every use case that has not declared an exception.
 
 ---
 
-## The Installer Runs Twice, and You Own the List
-
-Pass 1 writes `requirements.txt` from `stack_decision` and reports
-`installer_requirements_pending_approval`. Pass 2 runs `pip install`. The
-route out of that step is **always back to the installer** -- never the
-planner, never the explorer.
-
-What you return decides which list gets installed:
-
-- `requirements_override=[...]` -- the installer writes exactly that and
-  installs it. Approval is implied; you are not approving the file you were
-  shown, you are replacing it.
-- `requirements_approved=true` with no override -- install as written.
-- neither -- the code approves as written and logs that you gave no
-  correction. Nothing stalls, but nothing changes either.
-
-**Why you and not the planner.** The installer writes a list to disk and runs
-pip; it has no model and cannot act on prose. The planner owns
-`stack_decision`, but sending it back there costs a full planner session plus
-a PDF re-read, and it returns the same list. You are the agent holding the
-objection, so you are the one who states the fix.
-
-## Revisions Must Say What To Change
-
-Routing to an agent that has already produced output counts as a revision and
-costs a full LLM session -- plus a PDF re-read for the planner. `feedback` is
-therefore **required** and must name the specific thing to change.
-
-A vague or empty `feedback` on a revision is not honoured: the code routes
-onward instead of spending the session, and prints what you said. Phrases like
-"re-examine", "please revise", "needs improvement" or "no specific objection"
-are rejected by name. So is anything under 40 characters.
-
-Say which task, which package, which value -- "task 7 launches hacc_tpm
-without sourcing the env file in the same invocation", not "the plan needs
-work".
-
 ## State Fields Available to You
 
 | Field | Source | Notes |
@@ -258,17 +192,8 @@ work".
 | `tasks` | planner | Ordered implementation steps |
 | `requirements` | installer | requirements.txt content, as installed |
 | `exploration_log` | explorer | Tool call records (accumulated list of dicts) |
-| `planner_revisions` | orchestrator | How many times planner was retried |
 | `installer_revisions` | orchestrator | How many times installer was retried |
 | `explorer_revisions` | orchestrator | How many times explorer was retried |
-
----
-
-## Revision Count Guidance
-
-- 0-2 revisions: normal -- route back with specific feedback
-- 3-4 revisions: concerning -- escalate feedback specificity, check if the task description is the root cause
-- 5+ revisions: investigate whether routing back to planner to redefine tasks would break the loop
 
 ---
 
@@ -283,13 +208,3 @@ Only system (engine) skills are requestable, e.g.
 context when the node runs.
 
 ---
-
-## Examples
-
-**Clean forward pass:** planner_complete, tasks look specific -> `next="installer"`, `feedback=""`
-
-**Installer complete:** installer_complete, image built -> `next="explorer"`, `feedback=""`
-
-**Explorer success:** explorer_complete, all tasks done, output files present -> `next="end"`, `feedback=""`
-
-**Explorer partial failure:** explorer_complete, some tasks succeeded but others failed -> `next="explorer"`, `feedback="<failed task name> failed with <error type>. <specific fix>."`  See use-case orchestrator skill for domain-specific error patterns.
